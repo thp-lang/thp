@@ -1,0 +1,26 @@
+[package]
+name = "thp-cli"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "THP command-line compiler and interpreter"
+
+[[bin]]
+name = "thp"
+path = "src/main.rs"
+
+[dependencies]
+thp-bytecode = { path = "../bytecode" }
+thp-compiler = { path = "../compiler" }
+thp-jit = { path = "../jit" }
+thp-metrics = { path = "../metrics" }
+thp-opcache = { path = "../opcache" }
+thp-vm = { path = "../vm" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

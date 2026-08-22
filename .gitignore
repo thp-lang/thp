@@ -1,0 +1,9 @@
+/.idea/
+/target/
+/thp.local.toml
+/thp.lock
+/tests/phpt/php/
+/.thp-cache/
+/notes/
+
+/benchmarks/modules/php/vendor/

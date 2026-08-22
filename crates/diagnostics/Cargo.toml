@@ -1,0 +1,11 @@
+[package]
+name = "thp-diagnostics"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Structured source diagnostics shared by THP compiler phases"
+
+[lints]
+workspace = true

@@ -1,0 +1,60 @@
+title: THP Documentation
+description: A typed language for the PHP ecosystem.
+github: https://github.com/thp-lang/thp
+navigation:
+  - label: Learn
+    href: /learn/getting-started/
+  - label: Implemented Language
+    href: /language/overview/
+  - label: Runtime/API
+    href: /std/
+  - label: Design Proposals
+    href: /language/attributes/
+  - label: Internals
+    href: /internals/overview/
+modules:
+  standard-library:
+    name: Standard library
+    summary: Overview of THP's evolving standard-library contracts.
+    order: 0
+    typeGroup: Modules
+  async:
+    name: Async
+    summary: Concurrency primitives and asynchronous operations.
+    order: 10
+    typeGroup: Types
+  base-types:
+    name: Base types
+    summary: Fundamental types available to every THP program.
+    order: 20
+    typeGroup: Types
+  exceptions:
+    name: Exceptions
+    summary: PHP-inspired exception categories proposed for THP.
+    order: 30
+    typeGroup: Types
+  iterators:
+    name: Iterators
+    summary: Iterator adapters and recursive traversal.
+    order: 40
+    typeGroup: Types
+  filesystem:
+    name: Filesystem
+    summary: Object-oriented filesystem metadata, files, and temporary files.
+    order: 50
+    typeGroup: Types
+  data-structures:
+    name: Data structures
+    summary: Generic containers, observers, autoloading, and object utilities.
+    order: 60
+    typeGroup: Types
+  extensions:
+    name: Bundled extensions
+    summary: Design placeholders for optional PHP extensions.
+    order: 80
+    typeGroup: Extensions
+  streams:
+    name: Streams
+    summary: Stream resources, filters, and transport operations.
+    order: 70
+    typeGroup: Types

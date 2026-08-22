@@ -1,0 +1,19 @@
+[package]
+name = "thp-vm"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Reference THP bytecode interpreter"
+
+[dependencies]
+thp-bytecode = { path = "../bytecode" }
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+thp-mir = { path = "../mir" }
+thp-runtime = { path = "../runtime" }
+thp-syntax = { path = "../syntax" }
+
+[lints]
+workspace = true

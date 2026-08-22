@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    name: ${{ matrix.archive }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: linux-x86_64
+            extension: tar.gz
+            exe: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: macos-x86_64
+            extension: tar.gz
+            exe: ""
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: macos-arm64
+            extension: tar.gz
+            exe: ""
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: windows-x86_64
+            extension: zip
+            exe: .exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cargo-about
+      - name: Build native CLI
+        run: cargo build --locked --release --target ${{ matrix.target }} -p thp-cli
+      - name: Exercise native public interface
+        shell: pwsh
+        run: |
+          $thp = "target/${{ matrix.target }}/release/thp${{ matrix.exe }}"
+          $version = (& $thp --version) -join "`n"
+          if ($version -ne "thp $($env:GITHUB_REF_NAME.Substring(1))") { throw "tag/version mismatch: $version" }
+          & $thp --help
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+          & $thp check examples/hello.thp
+          if ($LASTEXITCODE -ne 0) { throw "check failed" }
+          & $thp run examples/hello.thp
+          if ($LASTEXITCODE -ne 0) { throw "example failed" }
+          & $thp check release/smoke-invalid.thp
+          if ($LASTEXITCODE -eq 0) { throw "invalid source unexpectedly passed" }
+          $global:LASTEXITCODE = 0
+      - name: Stage archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="thp-${GITHUB_REF_NAME#v}-${{ matrix.archive }}"
+          mkdir -p "$name/bin"
+          cp "target/${{ matrix.target }}/release/thp${{ matrix.exe }}" "$name/bin/"
+          cp LICENSE LICENSE-BINARY LICENSING.md NOTICE release/INSTALL.md "$name/"
+          cargo about generate about.hbs > "$name/THIRD-PARTY-NOTICES"
+          if [[ "${{ matrix.extension }}" == "zip" ]]; then
+            7z a "$name.zip" "$name"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+      - name: Verify extracted installation
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP "thp-install"
+          New-Item -ItemType Directory -Force $destination | Out-Null
+          $archive = Get-ChildItem "thp-*.${{ matrix.extension }}" | Select-Object -First 1
+          if ("${{ matrix.extension }}" -eq "zip") {
+            Expand-Archive $archive.FullName -DestinationPath $destination
+          } else {
+            tar -xzf $archive.FullName -C $destination
+            if ($LASTEXITCODE -ne 0) { throw "archive extraction failed" }
+          }
+          $installed = Get-ChildItem $destination -Recurse -File -Filter "thp${{ matrix.exe }}" | Select-Object -First 1
+          & $installed.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "installed --version failed" }
+          & $installed.FullName --help
+          if ($LASTEXITCODE -ne 0) { throw "installed --help failed" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.archive }}
+          path: thp-*.${{ matrix.extension }}
+          if-no-files-found: error
+
+  publish:
+    needs: archive
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum thp-* > SHA256SUMS
+      - uses: sigstore/cosign-installer@v4.1.2
+      - name: Sign checksums with GitHub OIDC
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - name: Verify checksum signature bundle
+        working-directory: dist
+        run: >-
+          cosign verify-blob
+          --bundle SHA256SUMS.sigstore.json
+          --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          SHA256SUMS
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/thp-*
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json

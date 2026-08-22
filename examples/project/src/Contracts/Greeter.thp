@@ -1,0 +1,9 @@
+<?thp
+
+namespace Example\Contracts;
+
+interface Greeter
+{
+
+    public function greet(string $name): string;
+}

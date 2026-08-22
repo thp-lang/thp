@@ -1,0 +1,19 @@
+[package]
+name = "thp-modules"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Static module discovery, interfaces, name resolution, and dependency graphs for THP"
+
+[dependencies]
+blake3.workspace = true
+thp-diagnostics = { path = "../diagnostics" }
+thp-syntax = { path = "../syntax" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

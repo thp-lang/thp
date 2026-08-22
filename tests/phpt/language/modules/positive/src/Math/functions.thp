@@ -1,0 +1,6 @@
+<?thp
+namespace App\Math;
+
+function square(int $value): int {
+    return $value * $value;
+}

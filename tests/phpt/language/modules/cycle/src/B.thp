@@ -1,0 +1,11 @@
+<?thp
+namespace App;
+
+use function App\a;
+
+function b(int $value): int {
+    if ($value === 0) {
+        return 0;
+    }
+    return a($value - 1);
+}

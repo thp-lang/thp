@@ -1,0 +1,11 @@
+<?php
+
+namespace Bench\Math;
+
+final class Calculator
+{
+    public static function calculate(int $value): int
+    {
+        return $value * 2;
+    }
+}

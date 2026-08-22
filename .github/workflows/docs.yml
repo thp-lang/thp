@@ -1,0 +1,77 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+    paths: ["doc/**", "README.md", "*.md", ".github/workflows/docs.yml"]
+  pull_request:
+    paths: ["doc/**", "README.md", "*.md", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: doc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.14.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: doc/pnpm-lock.yaml
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v6
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm lint
+      - run: pnpm check
+      - name: Build browser-test site
+        run: pnpm build
+      - name: Install browser
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Test browser behavior
+        run: pnpm test:browser
+      - name: Build static site
+        run: pnpm build
+        env:
+          SITE_URL: ${{ steps.pages.outputs.origin }}
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+      - name: Check external documentation links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --no-progress --max-retries 3
+            README.md SECURITY.md SUPPORT.md CONTRIBUTING.md
+            'doc/content/**/*.md'
+          fail: true
+      - name: Upload static output
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: doc/dist
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

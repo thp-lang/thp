@@ -1,0 +1,16 @@
+<?thp
+
+use Example\Contracts\Greeter;
+use Example\GreetingService;
+use Example\InvalidName;
+
+$greeter: Greeter = new GreetingService("Hello");
+$names: vector<string> = ["Ada", "Linus", ""];
+
+foreach ($names as $name) {
+    try {
+        echo $greeter->greet($name) . "\n";
+    } catch (InvalidName $error) {
+        echo "error: " . $error->getMessage() . "\n";
+    }
+}

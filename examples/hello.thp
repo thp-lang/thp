@@ -1,0 +1,13 @@
+<?thp
+
+function greet(string $name): string {
+    return "Hello, " . $name . "!\n";
+}
+
+$names: vector<string> = ["world", "THP"];
+$index: int = 0;
+
+while ($index < count($names)) {
+    echo greet($names[$index]);
+    $index = $index + 1;
+}

@@ -1,0 +1,25 @@
+<?thp
+
+namespace Example;
+
+use Example\Contracts\Greeter;
+
+final class GreetingService implements Greeter
+{
+
+    private string $prefix;
+
+    public function __construct(string $prefix)
+    {
+        $this->prefix = $prefix;
+    }
+
+    public function greet(string $name): string
+    {
+        if ($name === "") {
+            throw new InvalidName("name must not be empty");
+        }
+
+        return $this->prefix . ", " . $name . "!";
+    }
+}

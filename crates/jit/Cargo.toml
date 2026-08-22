@@ -1,0 +1,27 @@
+[package]
+name = "thp-jit"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Cranelift baseline JIT for verified THP bytecode"
+
+[dependencies]
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+thp-bytecode = { path = "../bytecode" }
+thp-hir = { path = "../hir" }
+thp-mir = { path = "../mir" }
+thp-runtime = { path = "../runtime" }
+thp-syntax = { path = "../syntax" }
+
+[dev-dependencies]
+thp-diagnostics = { path = "../diagnostics" }
+thp-vm = { path = "../vm" }
+
+[lints]
+workspace = true

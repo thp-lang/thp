@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "tests/**"
+      - "examples/**"
+      - "release/**"
+      - "deny.toml"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "tests/**"
+      - "examples/**"
+      - "release/**"
+      - "deny.toml"
+      - ".github/workflows/ci.yml"
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  minimum-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Run all native PHPT specifications
+        run: cargo run -p thp-test -- tests/phpt/language tests/phpt/resources
+
+  cross-platform-smoke:
+    name: Smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo test --locked -p thp-cli --test public_examples
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  repository-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject generated, dependency, cache, prototype, and import trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden=(
+            doc-old docs-new tests/phpt/php benchmarks/modules/php/vendor
+            doc/dist doc/node_modules target .thp-cache
+          )
+          for path in "${forbidden[@]}"; do
+            if [[ -e "$path" ]]; then
+              echo "forbidden publication path: $path" >&2
+              exit 1
+            fi
+          done
+
+  address-sanitizer:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly-2026-07-11
+        with:
+          components: rust-src
+      - name: Test request runtime under ASan and LSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+        run: >-
+          cargo test -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p thp-runtime -p thp-vm -p thp-embed -p thp-abi
+
+  miri:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly-2026-07-11
+        with:
+          components: miri, rust-src
+      - run: cargo miri setup
+      - name: Check request heap and collector with Miri
+        env:
+          MIRIFLAGS: -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation
+        run: cargo miri test -p thp-runtime

@@ -1,0 +1,26 @@
+---
+kind: interface
+id: std.streams.ReadableStream
+title: ReadableStream
+summary: Adds byte-oriented reading and end-of-stream inspection.
+name: ReadableStream
+module: streams
+typeParameters: []
+interfaces:
+  - id: std.streams.Stream
+constants: []
+properties: []
+status: experimental
+availability: partial
+notice:
+  The handle model, stream interfaces, factories, modes, and exceptions are a
+  design proposal. They are not implemented in this repository and may change as runtime
+  integration proceeds.
+version: "0.1"
+---
+
+Reads operate on arbitrary byte strings without UTF-8 validation or
+transcoding. `read(0)` returns an empty string, while `eof()` distinguishes an
+empty request from end of stream.
+
+`readAll()` preserves the cursor when a non-null byte limit would be exceeded.

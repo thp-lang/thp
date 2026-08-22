@@ -1,0 +1,7 @@
+dist/
+node_modules/
+coverage/
+.cache/
+.pagefind/
+test-results/
+playwright-report/

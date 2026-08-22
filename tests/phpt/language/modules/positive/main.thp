@@ -1,0 +1,4 @@
+<?thp
+use function App\Math\square;
+
+echo square(5) . "";

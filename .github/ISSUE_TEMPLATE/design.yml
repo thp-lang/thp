@@ -1,0 +1,35 @@
+name: Language design proposal
+description: Propose observable language or standard-library behavior
+title: "design: "
+labels: [design]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+    validations:
+      required: true
+  - type: textarea
+    id: syntax
+    attributes:
+      label: Accepted and rejected syntax
+      description: Include small `<?thp` examples.
+    validations:
+      required: true
+  - type: textarea
+    id: semantics
+    attributes:
+      label: Typing and runtime semantics
+      description: Include inference, ownership, cleanup, and interactions.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Failure behavior and diagnostic locations
+    validations:
+      required: true
+  - type: textarea
+    id: unresolved
+    attributes:
+      label: Unresolved decisions

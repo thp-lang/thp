@@ -1,0 +1,26 @@
+[package]
+name = "thp-compiler"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Measured orchestration of THP compiler phases"
+
+[dependencies]
+blake3.workspace = true
+thp-bytecode = { path = "../bytecode" }
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+thp-metrics = { path = "../metrics" }
+thp-mir = { path = "../mir" }
+thp-modules = { path = "../modules" }
+thp-opcache = { path = "../opcache" }
+thp-syntax = { path = "../syntax" }
+thp-config = { path = "../config" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "thp-bytecode"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Versioned verified register bytecode for THP"
+
+[dependencies]
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+thp-mir = { path = "../mir" }
+thp-syntax = { path = "../syntax" }
+
+[lints]
+workspace = true

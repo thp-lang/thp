@@ -1,0 +1,5 @@
+<?thp
+
+use Bench\Math\Calculator;
+
+echo Calculator::calculate(1000) . "";

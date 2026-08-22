@@ -1,0 +1,11 @@
+[package]
+name = "thp-metrics"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Stage timing and allocation metrics for THP"
+
+[lints]
+workspace = true

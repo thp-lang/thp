@@ -1,0 +1,19 @@
+[package]
+name = "thp-embed"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Safe embedding and SAPI boundary for the THP runtime"
+
+[dependencies]
+thp-compiler = { path = "../compiler" }
+thp-diagnostics = { path = "../diagnostics" }
+thp-metrics = { path = "../metrics" }
+thp-modules = { path = "../modules" }
+thp-runtime = { path = "../runtime" }
+thp-vm = { path = "../vm" }
+
+[lints]
+workspace = true

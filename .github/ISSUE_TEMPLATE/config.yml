@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and support
+    url: https://github.com/thp-lang/thp/discussions
+    about: Ask usage questions and discuss ideas.
+  - name: Private security report
+    url: https://github.com/thp-lang/thp/security/advisories/new
+    about: Report vulnerabilities without public disclosure.

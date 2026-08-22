@@ -1,0 +1,18 @@
+# Third-party notices
+
+This file is generated from the Cargo dependency graph for the official THP
+binary archive. THP's own licensing is described separately in `LICENSING.md`.
+
+{{#each licenses}}
+## {{name}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}
+{{/each}}
+
+```
+{{text}}
+```
+
+{{/each}}

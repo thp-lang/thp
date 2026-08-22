@@ -1,0 +1,4 @@
+<?thp
+use function App\a;
+
+echo a(3) . "";

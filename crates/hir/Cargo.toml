@@ -1,0 +1,15 @@
+[package]
+name = "thp-hir"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Resolved and typed high-level IR for THP"
+
+[dependencies]
+thp-diagnostics = { path = "../diagnostics" }
+thp-syntax = { path = "../syntax" }
+
+[lints]
+workspace = true

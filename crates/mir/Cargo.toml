@@ -1,0 +1,16 @@
+[package]
+name = "thp-mir"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Control-flow middle IR for THP"
+
+[dependencies]
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+thp-syntax = { path = "../syntax" }
+
+[lints]
+workspace = true

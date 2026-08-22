@@ -1,0 +1,22 @@
+[package]
+name = "thp-abi"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Versioned C embedding and extension ABI for THP"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+thp-compiler = { path = "../compiler" }
+thp-diagnostics = { path = "../diagnostics" }
+thp-embed = { path = "../embed" }
+thp-modules = { path = "../modules" }
+thp-runtime = { path = "../runtime" }
+thp-vm = { path = "../vm" }
+
+[lints]
+workspace = true

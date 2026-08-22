@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Project Benchmarks"
+  short_description: "Run reproducible THP performance benchmarks"
+  default_prompt: "Use $run-project-benchmarks to run the THP benchmark suite and report reproducible timing, RSS, and artifact-size results."

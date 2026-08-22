@@ -1,0 +1,4 @@
+<?thp
+namespace App;
+
+class Placeholder {}

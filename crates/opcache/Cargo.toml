@@ -1,0 +1,21 @@
+[package]
+name = "thp-opcache"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+tempfile.workspace = true
+thp-bytecode = { path = "../bytecode" }
+
+[dev-dependencies]
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+thp-mir = { path = "../mir" }
+thp-syntax = { path = "../syntax" }
+
+[lints]
+workspace = true

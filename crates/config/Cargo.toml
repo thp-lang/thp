@@ -1,0 +1,25 @@
+[package]
+name = "thp-config"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Project configuration and fast lock-file loading for THP"
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[[bench]]
+name = "lock_parser"
+harness = false
+
+[lints]
+workspace = true

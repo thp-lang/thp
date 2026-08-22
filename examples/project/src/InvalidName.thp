@@ -1,0 +1,7 @@
+<?thp
+
+namespace Example;
+
+class InvalidName extends \Exception
+{
+}

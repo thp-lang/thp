@@ -1,0 +1,16 @@
+[package]
+name = "thp-runtime"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "THP request values, reference counting, and runtime failures"
+
+[dependencies]
+tempfile.workspace = true
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+
+[lints]
+workspace = true

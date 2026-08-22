@@ -1,0 +1,7 @@
+<?thp
+
+function answer(): int {
+    return 42;
+}
+
+echo answer() . "\n";

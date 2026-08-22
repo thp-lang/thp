@@ -1,0 +1,38 @@
+<?thp
+
+class Scope implements Closeable
+{
+
+    private string $name;
+    private bool $closed = false;
+
+    public function __construct(string $name)
+    {
+        $this->name = $name;
+    }
+
+    public function close(): void
+    {
+        if (!$this->closed) {
+            $this->closed = true;
+            echo "closed " . $this->name . "\n";
+        }
+    }
+
+    public function isClosed(): bool
+    {
+        return $this->closed;
+    }
+}
+
+class Problem extends Exception
+{
+}
+
+try {
+    using ($scope = new Scope("demo")) {
+        throw new Problem("caught");
+    }
+} catch (Problem $problem) {
+    echo $problem->getMessage() . "\n";
+}

@@ -1,0 +1,23 @@
+[package]
+name = "thp-test"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "PHPT test runner for THP"
+
+[dependencies]
+thp-config = { path = "../config" }
+regex.workspace = true
+thp-compiler = { path = "../compiler" }
+thp-embed = { path = "../embed" }
+thp-modules = { path = "../modules" }
+thp-runtime = { path = "../runtime" }
+thp-vm = { path = "../vm" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

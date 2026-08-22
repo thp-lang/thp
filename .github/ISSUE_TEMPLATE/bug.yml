@@ -1,0 +1,43 @@
+name: Bug report
+description: Report reproducible incorrect implemented behavior
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        THP is experimental. Check the implementation status before reporting
+        behavior that may still be proposed.
+  - type: input
+    id: version
+    attributes:
+      label: THP version
+      placeholder: thp 0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the THP source and exact command.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and diagnostics
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, installation method, and Rust version if built from source.
+    validations:
+      required: true
