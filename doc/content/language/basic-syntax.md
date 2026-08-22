@@ -95,4 +95,4 @@ Comments have no runtime effect.
 - [Expressions](thp:guide.languageExpressions)
 - [Control structures](thp:guide.languageControlStructures)
 - [Implementation status](thp:guide.implementationStatus)
-- PHP migration
+- [THP for PHP developers](thp:guide.phpDevelopers)

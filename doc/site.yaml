@@ -4,12 +4,10 @@ github: https://github.com/thp-lang/thp
 navigation:
   - label: Learn
     href: /learn/getting-started/
-  - label: Implemented Language
+  - label: Language
     href: /language/overview/
   - label: Runtime/API
     href: /std/
-  - label: Design Proposals
-    href: /language/attributes/
   - label: Internals
     href: /internals/overview/
 modules:

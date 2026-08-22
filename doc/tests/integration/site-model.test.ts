@@ -320,7 +320,7 @@ describe("documentation site model", () => {
       basePath: "/",
       siteUrl: "https://example.github.io",
     });
-    expect(rootModel.pages).toHaveLength(491);
+    expect(rootModel.pages).toHaveLength(493);
     const subpathModel = await build({
       root,
       basePath: "/typed-php/",
@@ -547,7 +547,9 @@ describe("documentation site model", () => {
       (page) => page.source.data.id === "docs.home",
     )!;
     const homeHtml = renderPage(model, home);
-    expect(homeHtml).toContain('<h2 id="internals">Internals</h2>');
+    expect(homeHtml).toContain(
+      '<h2 id="choose-your-path">Choose your path</h2>',
+    );
     expect(homeHtml).toContain('href="/typed-php/internals/overview/"');
     expect(homeHtml).not.toContain('href="/typed-php/#project"');
   });

@@ -5,7 +5,7 @@ title: Project configuration
 summary: Define runtime limits, target overrides, and extension settings in project TOML.
 nav:
   section: learn
-  order: 20
+  order: 40
 status: experimental
 availability: implemented
 notice: >-
@@ -19,6 +19,45 @@ belong only to one checkout.
 The loader does not search for global or user configuration and does not read
 configuration overrides from the environment. The caller chooses the project
 root explicitly.
+
+If you are creating your first multi-file application, begin with
+[Start a project](thp:guide.startProject). Most projects initially need only an
+autoload mapping:
+
+```toml
+[autoload]
+"App\\" = "src/"
+```
+
+All runtime-limit tables are optional. An empty `thp.toml` is valid for a
+project that uses only its entry file, although a single-file command needs no
+project file at all.
+
+## Autoload mappings
+
+The `[autoload]` table maps a case-sensitive namespace prefix to one directory
+or an ordered list of directories:
+
+```toml
+[autoload]
+"App\\" = "src/"
+"Vendor\\Package\\" = ["vendor/package/src/", "../shared/"]
+```
+
+A non-empty prefix ends in `\` and contains valid THP name segments. The
+backslash is escaped inside a TOML basic string. Relative directories resolve
+from the selected project root.
+
+For a mapping from `App\` to `src/`, the path
+`src/Service/Client.thp` has module ID `App\Service\Client` and declares
+`namespace App\Service;`. The compiler discovers `.thp` files in mapped
+directories before type checking. This is not Composer or runtime autoloading:
+the mappings name source roots but do not download packages or invoke user
+callbacks.
+
+`thp.local.toml` may add mappings or replace a project mapping with the same
+prefix for that checkout. Discovery rejects ambiguous logical or physical
+module mappings.
 
 ## Project schema
 

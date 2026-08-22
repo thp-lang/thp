@@ -313,8 +313,47 @@ test("desktop class interactions and accessibility", async ({
   });
   await page.goto("/");
   await expect(
+    page.getByRole("heading", {
+      name: "A typed language with its own runtime.",
+    }),
+  ).toBeVisible();
+  await expect(page.locator(".code-window")).toContainText("thp run hello.thp");
+  await expect(page.locator(".code-window")).toContainText("Hello, world!");
+  await expect(
+    page.getByRole("heading", { name: "When to choose THP over PHP" }),
+  ).toBeVisible();
+  const comparison = page.locator(".home-prose .table-scroll").first();
+  await expect(comparison).toContainText("vector<T>");
+  await expect(comparison).toContainText("map<K, V>");
+  await expect(comparison).toContainText("Magic array-key conversion");
+  await expect(comparison).toContainText("Loose == type juggling");
+  await expect(comparison).toContainText("✅ Yes");
+  await expect(comparison).toContainText("❌ No");
+  await expect(
+    page.getByRole("heading", { name: "More than a syntax experiment" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "What runs today" }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".home-prose > ul").first().locator("li"),
+  ).toHaveCount(6);
+  await expect(
+    page.getByRole("link", { name: "See what works today" }),
+  ).toHaveAttribute("href", "/learn/implementation-status/");
+  await expect(
+    page.locator(".header-nav").getByRole("link", { name: "Language" }),
+  ).toHaveAttribute("href", "/language/overview/");
+  await expect(
+    page.locator(".header-nav").getByRole("link", {
+      name: "Design Proposals",
+    }),
+  ).toHaveCount(0);
+  await expect(
     page.locator(".header-nav").getByRole("link", { name: "Internals" }),
   ).toHaveAttribute("href", "/internals/overview/");
+  const homeAccessibility = await new AxeBuilder({ page }).analyze();
+  expect(homeAccessibility.violations).toEqual([]);
   await page.screenshot({
     path: testInfo.outputPath("home-desktop.png"),
     fullPage: true,
