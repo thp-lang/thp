@@ -1198,7 +1198,7 @@ impl TypeChecker {
 
         if current.kind != NominalKind::Interface {
             let (trait_properties, trait_initializers, trait_methods) =
-                self.compose_traits(&current, stack);
+                self.compose_traits(&current);
             for (property, initializer) in trait_properties.into_iter().zip(trait_initializers) {
                 if let Some(inherited) = properties
                     .iter()
@@ -1375,7 +1375,6 @@ impl TypeChecker {
     fn compose_traits(
         &mut self,
         consumer: &ClassSignature,
-        _stack: &mut Vec<String>,
     ) -> (
         Vec<Property>,
         Vec<Option<Expr>>,

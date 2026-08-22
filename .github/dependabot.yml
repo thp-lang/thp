@@ -7,6 +7,7 @@ updates:
     groups:
       rust-dependencies:
         patterns: ["*"]
+        update-types: [minor, patch]
   - package-ecosystem: npm
     directory: /doc
     schedule:
@@ -14,6 +15,10 @@ updates:
     groups:
       documentation-dependencies:
         patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: typescript
+        versions: ["7.x"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

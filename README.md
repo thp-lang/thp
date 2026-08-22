@@ -38,7 +38,7 @@ thp check hello.thp
 thp run hello.thp
 ```
 
-To build from source, install Rust 1.85 or newer and run:
+To build from source, install Rust 1.88 or newer and run:
 
 ```sh
 git clone https://github.com/thp-lang/thp.git

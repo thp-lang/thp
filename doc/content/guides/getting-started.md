@@ -40,7 +40,7 @@ thp check hello.thp
 thp run hello.thp
 ```
 
-When working from a source checkout with Rust 1.85 or newer, the equivalent
+When working from a source checkout with Rust 1.88 or newer, the equivalent
 development commands are:
 
 ```sh
