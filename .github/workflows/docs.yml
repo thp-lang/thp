@@ -55,7 +55,8 @@ jobs:
         uses: lycheeverse/lychee-action@v2
         with:
           args: >-
-            --no-progress --max-retries 3
+            --no-progress --max-retries 3 --exclude-loopback
+            --root-dir '${{ github.workspace }}/doc/dist'
             README.md SECURITY.md SUPPORT.md CONTRIBUTING.md
             'doc/content/**/*.md'
           fail: true
