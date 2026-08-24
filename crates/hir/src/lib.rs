@@ -1182,17 +1182,17 @@ impl TypeChecker {
         let mut initializers = Vec::new();
         let mut methods: BTreeMap<String, MethodSignature> = BTreeMap::new();
         let mut interfaces = current.interfaces.clone();
-        if let Some(parent_name) = &current.parent {
-            if let Some(parent) = self.classes.get(parent_name).filter(|parent| parent.linked) {
-                properties.clone_from(&parent.properties);
-                initializers.clone_from(&parent.property_initializers);
-                methods = parent.methods.clone();
-                if current.kind == NominalKind::Class {
-                    interfaces.extend(parent.interfaces.clone());
-                } else if current.kind == NominalKind::Interface {
-                    interfaces.push(parent.name.clone());
-                    interfaces.extend(parent.interfaces.clone());
-                }
+        if let Some(parent_name) = &current.parent
+            && let Some(parent) = self.classes.get(parent_name).filter(|parent| parent.linked)
+        {
+            properties.clone_from(&parent.properties);
+            initializers.clone_from(&parent.property_initializers);
+            methods = parent.methods.clone();
+            if current.kind == NominalKind::Class {
+                interfaces.extend(parent.interfaces.clone());
+            } else if current.kind == NominalKind::Interface {
+                interfaces.push(parent.name.clone());
+                interfaces.extend(parent.interfaces.clone());
             }
         }
 
@@ -1300,18 +1300,18 @@ impl TypeChecker {
             }
         } else if current.kind == NominalKind::Interface {
             for (name, requirement) in &current.declared_methods {
-                if let Some(previous) = methods.get(name) {
-                    if !method_contract_equal(requirement, previous) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "typing",
-                                "T0023",
-                                requirement.span,
-                                format!("conflicting interface requirement for `{name}`"),
-                            )
-                            .with_label(previous.span, "inherited requirement is here"),
-                        );
-                    }
+                if let Some(previous) = methods.get(name)
+                    && !method_contract_equal(requirement, previous)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "typing",
+                            "T0023",
+                            requirement.span,
+                            format!("conflicting interface requirement for `{name}`"),
+                        )
+                        .with_label(previous.span, "inherited requirement is here"),
+                    );
                 }
                 methods.insert(name.clone(), requirement.clone());
             }
@@ -1603,25 +1603,26 @@ impl TypeChecker {
             for (name, mut method) in selected {
                 method.declaring_class = consumer.id;
                 method.slot = self.method_slots[&name];
-                if consumer.kind == NominalKind::Class && !method.abstract_method {
-                    if let Some(source) = method.source.clone() {
-                        let id = self.allocate_function();
-                        method.signature.id = id;
-                        method.callee = Some(Callee::Function(id));
-                        self.pending_methods.push(PendingMethod {
-                            id,
-                            owner: consumer.id,
-                            declaration: MethodDecl {
-                                function: FunctionDecl {
-                                    name: name.clone(),
-                                    ..source.function.clone()
-                                },
-                                ..source
+                if consumer.kind == NominalKind::Class
+                    && !method.abstract_method
+                    && let Some(source) = method.source.clone()
+                {
+                    let id = self.allocate_function();
+                    method.signature.id = id;
+                    method.callee = Some(Callee::Function(id));
+                    self.pending_methods.push(PendingMethod {
+                        id,
+                        owner: consumer.id,
+                        declaration: MethodDecl {
+                            function: FunctionDecl {
+                                name: name.clone(),
+                                ..source.function.clone()
                             },
-                            signature: method.signature.clone(),
-                            span: method.span,
-                        });
-                    }
+                            ..source
+                        },
+                        signature: method.signature.clone(),
+                        span: method.span,
+                    });
                 }
                 if let Some(previous) = methods.get(&name) {
                     self.diagnostics.push(
@@ -3030,18 +3031,18 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         ),
                     ));
                 }
-                if let Some(key) = literal_key(&condition.kind) {
-                    if let Some(previous) = literal_conditions.insert(key, condition.span) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "typing",
-                                "T0703",
-                                condition.span,
-                                "duplicate literal match condition",
-                            )
-                            .with_label(previous, "first matching literal is here"),
-                        );
-                    }
+                if let Some(key) = literal_key(&condition.kind)
+                    && let Some(previous) = literal_conditions.insert(key, condition.span)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "typing",
+                            "T0703",
+                            condition.span,
+                            "duplicate literal match condition",
+                        )
+                        .with_label(previous, "first matching literal is here"),
+                    );
                 }
                 conditions.push(condition);
             }

@@ -7,7 +7,7 @@ THP is an experimental, statically typed, PHP-shaped language for greenfield
 programs. It has a standalone compiler, verified bytecode VM, persistent
 OPcache, and baseline Cranelift JIT.
 
-THP v0.1 is for command-line experiments. It is not production-ready, is not a
+THP v0.2.0 is for command-line experiments. It is not production-ready, is not a
 PHP-compatible replacement, does not run through the PHP engine, and is not yet
 a web backend. Familiar syntax never implies compatibility where THP has not
 defined behavior.
