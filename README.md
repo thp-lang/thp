@@ -137,8 +137,7 @@ pnpm test:browser
 - [Contributing](CONTRIBUTING.md)
 - [Compiler and runtime architecture](ARCHITECTURE.md)
 
-External code contributions remain paused until lawyer-reviewed contribution
-terms are published. Bug reports, design feedback, and discussions are welcome.
+Bug reports, design feedback, discussions, and code contributions are welcome.
 
 ## Licensing
 
