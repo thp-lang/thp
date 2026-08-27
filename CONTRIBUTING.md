@@ -10,12 +10,7 @@ for behavior that THP has not defined.
 
 ## Before you start
 
-The project is not yet accepting external code contributions. Apache-2.0
-source contributions and the separate MIT terms for official binaries require
-contribution terms reviewed by the project owner's lawyer before pull requests
-can be accepted. Until those terms are published, please use issues and
-Discussions for bug reports, design feedback, and proposals; maintainers will
-close unsolicited external code pull requests without merging them.
+Apache-2.0 source contributions are welcome. Official binaries are distributed under separate MIT terms. Please use issues and Discussions for bug reports, design feedback, and proposals, and feel free to submit pull requests for code contributions. By submitting a pull request, you agree that your contribution may be incorporated into the project under its applicable Apache-2.0 source license.
 
 - Search [issues](https://github.com/thp-lang/thp/issues) and pull requests to
   see whether the change is already being discussed.
@@ -52,8 +47,7 @@ fixtures are not kept in the main tree.
 
 ## Changing documentation
 
-The active documentation site is in `doc/`. Historical prototypes are not kept
-in the main tree; never edit generated `doc/dist/` files.
+The active documentation site is in `doc/`. Never edit generated `doc/dist/` files.
 
 Documentation sources are strict Markdown under `doc/content/`. Keep API facts
 in YAML frontmatter and behavioral explanations and examples in the Markdown
