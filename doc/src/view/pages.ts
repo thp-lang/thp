@@ -72,7 +72,7 @@ function articleBody(model: SiteModel, page: ResolvedPage): TrustedHtml {
 
 export function renderHome(model: SiteModel, page: ResolvedPage): string {
   const body =
-    trusted(`<div class="announcement"><span class="status-dot"></span> THP 0.1 is an experimental CLI release. <a href="${withBase(model.basePath, "/learn/implementation-status/")}">See what is implemented.</a></div>
+    trusted(`<div class="announcement"><span class="status-dot"></span> THP 0.2 is an experimental CLI release. <a href="${withBase(model.basePath, "/learn/implementation-status/")}">See what is implemented.</a></div>
   <section class="hero">
     <div class="hero-grid"><div class="hero-copy"><p class="eyebrow">Static types · Verified bytecode · Standalone runtime</p><h1>A typed language with <span>its own runtime.</span></h1><p class="hero-lead">${escapeHtml(page.source.data.summary)}</p>
       <div class="hero-actions"><a class="button button-primary" href="${withBase(model.basePath, "/learn/getting-started/")}">Start with THP →</a><a class="button" href="${withBase(model.basePath, "/learn/implementation-status/")}">See what works today</a></div>

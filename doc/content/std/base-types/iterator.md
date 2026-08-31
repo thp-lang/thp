@@ -12,6 +12,9 @@ typeParameters:
     description: The type of each current value.
 interfaces:
   - id: std.baseTypes.Traversable
+    arguments:
+      - K
+      - V
 constants: []
 properties: []
 status: experimental
@@ -20,7 +23,8 @@ notice: This THP-native contract is proposed and is not yet implemented in this 
 version: "0.1"
 ---
 
-`Iterator<K, V>` exposes a cursor over typed keys and values. It
+`Iterator<K, V>` invariantly extends `Traversable<K, V>` and exposes a cursor
+over typed keys and values. `K` has no additional constraint. The interface
 uses the familiar PHP iterator state model with explicit method names and does
 not allocate an entry or option object for each element.
 
@@ -53,6 +57,16 @@ fail when `rewind()` is called after it has advanced; consequently a second
 `foreach` over the same consumed one-shot iterator may fail. An aggregate
 avoids that reuse by returning a fresh iterator for each traversal.
 
+For direct iterator traversal, `foreach` calls `rewind()` and then repeats
+`valid() → value() → optional key() → body → advance()`. It calls `key()` only
+for a keyed loop. `continue` still reaches `advance()`; `break`, `return`, and a
+throw do not. Any throwable from the iterator propagates unchanged, after
+required `using` and `finally` cleanup.
+
+Mutation of an iterator object remains visible exactly as its methods expose
+it. This differs from native vectors and maps, whose direct traversal observes
+the COW snapshot captured when the source is evaluated.
+
 ## Collection keys
 
 A vector iterator implements `Iterator<int, T>` and uses zero-based offsets as
@@ -71,6 +85,9 @@ function printEntries<K, V>(Iterator<K, V> $iterator): void {
     }
 }
 ```
+
+The example invokes the proposed protocol directly. Passing the iterator to
+`foreach` remains proposed until iterator-object traversal is implemented.
 
 ## See also
 

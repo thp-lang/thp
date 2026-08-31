@@ -27,48 +27,73 @@ Cache lookup/publication and JIT compilation have separate metric stages.
 Project compilation additionally measures module discovery, interface
 extraction, incremental/cache work, linking, and prepared execution.
 
-## Executable core
+## Availability matrix
 
-The current parser, type checker, and VM support:
+`implemented` means the documented behavior is executable in this checkout.
+`partial` means only the limitation stated in the final column executes.
+`proposed` means the symbol is documentation-only and must be rejected by the
+compiler if used as though it were available.
 
-- the required `<?thp` opening tag, ASCII identifiers, comments, blocks, and
-  semicolon-terminated statements;
-- `int`, `float`, `bool`, arbitrary-byte runtime `string`, `null`, `void`,
-  `mixed`, `vector<T>`, `map<K, V>`, nullable types, and unions;
-- inferred or annotated variables, assignment, functions with typed parameters
-  and returns, constant defaults, named and variadic arguments, calls,
-  recursion, `return`, `echo`, `if`/`elseif`/`else`, `while`, full-clause
-  `for`, native-collection `foreach`, and level-one `break`/`continue`;
-- scalar arithmetic, comparison, boolean short-circuiting, concatenation, and
-  null coalescing; `echo` and concatenation share canonical output conversion
-  for `string`, `int`, `float`, and `bool`, while `null` requires an explicit
-  fallback;
-- vector and insertion-ordered map literals, typed indexing, nested
-  variable-rooted element assignment, direct native iteration, `count()`, and
-  `var_dump()`;
-- nominal classes and non-generic, methods-only interfaces with transitive
-  single inheritance, multiple implemented interfaces, strict overrides,
-  abstract/final validation, lexical visibility, flattened typed properties,
-  inherited and explicit parent constructors, virtual/interface dispatch,
-  direct `self::`/`parent::` calls, and late-static `static::` dispatch;
-- compile-time traits with nested use, properties, abstract/concrete
-  instance/static methods, conflict selection, aliases, visibility/finality
-  adaptation, and consumer-specialized bodies;
-- sealed `Throwable`, user-defined `Exception` descendants, subtype catches,
-  ordered handlers, `finally` unwinding and transfer replacement, common
-  message/code/previous/suppressed state, catchable `UnhandledMatchError`,
-  `match` expressions, and suppressed `using` cleanup failures;
-- semicolon-style namespaces, separate type/function imports, fully qualified
-  references, deterministic `[autoload]` project discovery, cross-file
-  functions and nominal declarations, legal declaration SCCs, frozen linked
-  programs, and reusable prepared projects;
-- binary-safe memory/temporary streams, shared cursor and close state,
-  capability `instanceof`, URI factories, read-only file opening, typed stream
-  failures, request-bound `thp:/input`, deterministic `using` cleanup, and
-  logical handle limits;
-- signed 64-bit checked integer arithmetic, structured compile diagnostics,
-  structured runtime failures, streamed host output, managed-heap/input/time/
-  stack/handle limits, and an optional VM instruction limit.
+| Symbol or syntax                                                                  | Availability | Executable boundary                                                                                              |
+| --------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `<?thp`, comments, blocks, statements                                             | implemented  | UTF-8 source and ASCII identifiers                                                                               |
+| `int`, `float`, `bool`, `string`, `null`, `void`, `mixed`, nullable types, unions | implemented  | `string` values are arbitrary bytes at runtime                                                                   |
+| `vector<T>`, `map<K, V>`                                                          | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                         |
+| Variables and functions                                                           | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                  |
+| `if`, `match`, `while`, `for`, `return`, `echo`                                   | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                  |
+| `foreach (vector<T>)`, `foreach (map<K, V>)`                                      | implemented  | Native collections only; the source is evaluated once and traversal uses its captured COW snapshot               |
+| `break`, `continue`                                                               | partial      | Level one only; numeric levels are rejected                                                                      |
+| Scalar operators                                                                  | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing |
+| Classes and interfaces                                                            | partial      | Nominal classes and non-generic, methods-only interfaces; generic interfaces remain proposed                     |
+| Traits                                                                            | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                        |
+| `Throwable`, `Exception`, `Error`, `UnhandledMatchError`                          | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures         |
+| `try`, `catch`, `finally`, `throw`, `using`                                       | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                  |
+| Namespaces, imports, and project autoload discovery                               | implemented  | Semicolon namespaces and deterministic configured source maps; no runtime include/autoload callbacks             |
+| OPcache, frozen projects, metrics, embedding, C ABI                               | implemented  | Cache/bytecode formats and C ABI remain version 1                                                                |
+| Cranelift JIT                                                                     | partial      | Safe scalar subset; automatic mode falls back to the VM                                                          |
+
+### Collection and iterator symbols
+
+| Symbol                                                                 | Availability | Input and cursor behavior                                                                         |
+| ---------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------- |
+| `count(string\|vector<T>\|map<K, V>): int`                             | implemented  | Reads the value's byte or collection length; it does not consume, move, or create traversal state |
+| `Traversable<K, V>`                                                    | proposed     | Invariant marker interface; `K` has no additional constraint                                      |
+| `Iterator<K, V>`                                                       | proposed     | Invariant cursor interface extending `Traversable<K, V>`                                          |
+| `IteratorAggregate<K, V>`                                              | proposed     | Invariant aggregate interface; `getIterator()` returns `Traversable<K, V>`                        |
+| `foreach (Traversable<K, V>)`                                          | proposed     | Iterator-object dispatch and execution are not implemented                                        |
+| `iterator_count<K, V>(Iterator<K, V>): int`                            | proposed     | Counts from the current cursor through exhaustion, advances it, and never rewinds                 |
+| `iterator_apply()`                                                     | proposed     | Callback-driven consuming traversal is not implemented                                            |
+| `iterator_to_vector()`, `iterator_to_map()`                            | proposed     | Consuming iterator conversions are not implemented                                                |
+| `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()` | proposed     | Native-vector transformations are not implemented                                                 |
+| `map_transform()`, `map_filter()`, `map_merge()`                       | proposed     | Native-map transformations are not implemented                                                    |
+| Iterator adapters and recursive iterators                              | proposed     | All classes and members in the iterator module are documentation-only                             |
+
+[`count()`](thp:std.baseTypes) and
+[`iterator_count()`](thp:std.spl.iterator_count) are separate functions, not
+aliases or overloads. The first inspects an existing native value without a
+cursor; the second is a future consuming operation on an explicit iterator.
+
+### Stream symbols
+
+| Symbol                                                      | Availability | Executable boundary                                                                                  |
+| ----------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------- |
+| `MemoryStream::open()`, `TempStream::open()`                | implemented  | Binary-safe memory streams and one-time temporary-file spill                                         |
+| `Files::openRead()`                                         | implemented  | Existing local files opened read-only                                                                |
+| `ReadableStream::read()`, `readAll()`, `eof()`              | implemented  | Includes argument, EOF, limit, and closed-handle behavior                                            |
+| `WritableStream::writeAll()`                                | implemented  | Memory and temporary streams only                                                                    |
+| `Closeable::close()`, `isClosed()`                          | implemented  | Shared, idempotent close state and deterministic `using` cleanup                                     |
+| `SeekableStream::tell()`                                    | implemented  | Current absolute byte position                                                                       |
+| `SeekableStream::seek()`                                    | partial      | One absolute position from the start; the executable form is `seek(int): void`                       |
+| `OpenMode`                                                  | partial      | Only `Read`, `Write`, and `ReadWrite` names exist; usable URI combinations are narrower              |
+| `Streams::open()`                                           | partial      | `php://memory`, `php://temp[/maxmemory:N]`, and read-only shared `thp:/input`; no paths or `file://` |
+| Stream exception classes                                    | implemented  | Runtime-produced typed stream failures                                                               |
+| `OpenStreamException::getTarget()`, `getSystemCode()`       | implemented  | Target and platform-code accessors                                                                   |
+| `OpenStreamException::__construct()`                        | partial      | Runtime construction is supported; the documented public four-argument constructor is not            |
+| `Stream::isReadable()`, `isWritable()`, `isSeekable()`      | proposed     | Capability inspection methods are not implemented; use `instanceof`                                  |
+| `WritableStream::write()`, `flush()`                        | proposed     | Partial writes and explicit flushing are not implemented                                             |
+| `SeekFrom`, relative/end seeking                            | proposed     | `Current` and `End` origins are not accepted by executable `seek()`                                  |
+| `Files::openWrite()`, `Files::openReadWrite()`, `WriteMode` | proposed     | Writing factories and modes are not implemented                                                      |
+| `WritableFileStream`, `ReadWriteFileStream`                 | proposed     | Writable and read-write file handles are not implemented                                             |
 
 Empty collection literals require an expected generic type:
 

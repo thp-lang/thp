@@ -89,8 +89,12 @@ Collection operations use global functions prefixed by their native input
 shape rather than methods or PHP's `array_*` names. The proposed vector family
 includes `vector_map()`, `vector_filter()`, `vector_slice()`, and
 `vector_concat()`. The proposed map family includes `map_transform()`,
-`map_filter()`, and `map_merge()`. These helpers are not implemented yet;
-`count()` is the only executable general collection function in this checkout.
+`map_filter()`, and `map_merge()`. These helpers are all proposed.
+`count(string|vector<T>|map<K, V>): int` is the only executable general
+collection function in this checkout and reads length without traversal state.
+It is distinct from proposed
+[`iterator_count()`](thp:std.spl.iterator_count), which consumes an explicit
+iterator from its current cursor without rewinding.
 The executable `foreach` implementation currently works with native vectors
 and maps, preserves single evaluation and keys, and supports `break` and
 `continue`. The proposed object protocol uses `Iterator<K, V>` for both vector

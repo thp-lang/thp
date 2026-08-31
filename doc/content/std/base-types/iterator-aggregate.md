@@ -12,6 +12,9 @@ typeParameters:
     description: The type of each iterator value.
 interfaces:
   - id: std.baseTypes.Traversable
+    arguments:
+      - K
+      - V
 constants: []
 properties: []
 status: experimental
@@ -20,14 +23,17 @@ notice: This THP contract is proposed and is not yet implemented in this reposit
 version: "0.1"
 ---
 
-`IteratorAggregate<K, V>` lets an object create a separate typed iterator for
-each traversal without storing the cursor on the aggregate itself.
+`IteratorAggregate<K, V>` invariantly extends `Traversable<K, V>` and lets an
+object create a separate typed traversal source without storing the cursor on
+the aggregate itself. `K` has no additional constraint.
 
 ## Contract
 
-`getIterator()` returns a fresh `Iterator<K, V>`. Each `foreach` operation asks
-the aggregate for a new iterator and then applies the normal cursor protocol,
-including its initial `rewind()`. Separate traversals do not share cursor state.
+`getIterator()` returns `Traversable<K, V>`. Each `foreach` operation calls it
+once for that aggregate layer. If it returns another aggregate, dispatch
+continues one layer at a time; when it reaches a direct `Iterator<K, V>`,
+`foreach` calls `rewind()` before `valid()`. Separate traversals normally return
+independent sources, but freshness is not part of the return type.
 
 ## Example
 
@@ -38,7 +44,7 @@ class Users implements IteratorAggregate<int, User>
     {
     }
 
-    public function getIterator(): Iterator<int, User>
+    public function getIterator(): Traversable<int, User>
     {
         return new MapIterator<int, User>($this->users);
     }

@@ -12,9 +12,8 @@ properties: []
 status: experimental
 availability: partial
 notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+  Files::openRead() is implemented. Writing factories, WriteMode, and writable
+  or read-write file handles remain proposed.
 version: "0.1"
 ---
 

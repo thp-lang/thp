@@ -28,8 +28,9 @@ related:
 status: experimental
 availability: partial
 notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  partially implemented experimental contract and may change as runtime integration proceeds.
+  Implements php://memory, php://temp[/maxmemory:N], and read-only thp:/input.
+  Local paths, file://, capability inspection, and complete OpenMode behavior
+  remain proposed.
 version: "0.1"
 owner: std.streams.Streams
 visibility: public

@@ -11,11 +11,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: proposed
+notice: This capability-inspection interface is proposed and is not implemented.
 version: "0.1"
 ---
 

@@ -42,12 +42,23 @@ All iterators expose typed keys and values through
 protocol does not construct an option or entry object during ordinary
 `foreach` traversal.
 
+The proposed object protocol evaluates the source once, calls `getIterator()`
+once per aggregate layer, then calls `rewind()` on the direct iterator. Each
+iteration is `valid() → value() → optional key() → body → advance()`.
+`continue` advances; `break`, `return`, and a throw do not. Iterator failures
+propagate unchanged through required `using` and `finally` cleanup. Native
+collections retain their captured COW snapshot, while mutation of a delegated
+iterator object remains visible according to that iterator's methods.
+
 ## Iterator functions
 
 [`iterator_apply()`](thp:std.spl.iterator_apply),
-[`iterator_count()`](thp:std.spl.iterator_count), and the proposed
-`iterator_to_vector()` and `iterator_to_map()` functions consume iterable
-values.
+[`iterator_count()`](thp:std.spl.iterator_count), `iterator_to_vector()`, and
+`iterator_to_map()` are all proposed consuming operations. None is available
+in this checkout. `iterator_count()` accepts an `Iterator<K, V>`, starts at its
+current cursor, advances through exhaustion, and never rewinds. It is separate
+from executable [`count()`](thp:std.baseTypes), which accepts only a string,
+vector, or map and reads its length without traversal state.
 
 The PHP-derived `ArrayIterator`, `RecursiveArrayIterator`, and
 `iterator_to_array()` pages remain migration-analysis placeholders. Their

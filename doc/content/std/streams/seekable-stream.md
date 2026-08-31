@@ -12,10 +12,10 @@ constants: []
 properties: []
 status: experimental
 availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+notice: >-
+  Memory and temporary streams execute seek(int): void from the start and tell():
+  int. SeekFrom, relative/end origins, and the documented returning seek signature
+  remain proposed.
 version: "0.1"
 ---
 

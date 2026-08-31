@@ -11,7 +11,7 @@ availability: implemented
 ---
 
 This guide takes you from an installed `thp` command to a checked and running
-program. THP 0.1 is intended for command-line experiments. It does not run
+program. THP 0.1.0 is intended for command-line experiments. It does not run
 through PHP, install into a PHP server, or provide a production web stack.
 
 ## Install a release archive

@@ -72,8 +72,10 @@ for ($left: int = 0, $right: int = 5;
 }
 ```
 
-`foreach` evaluates its source once and currently accepts only native
-`vector<T>` and insertion-ordered `map<K, V>` values.
+Executable `foreach` evaluates its source once and accepts native `vector<T>`
+and insertion-ordered `map<K, V>` values. The proposed object form additionally
+accepts every `Traversable<K, V>` object; ordinary object properties are never
+an implicit traversal source.
 
 ```thp
 foreach ($values as $key => $value) {
@@ -87,6 +89,9 @@ foreach ($values as $key => $value) {
 
 For a vector, the key type is `int` and keys are zero-based offsets. For a map,
 keys and values retain `K` and `V` and traversal follows insertion order.
+Native traversal captures the source collection's COW snapshot. Mutating an
+alias in the body detaches that alias and does not change the elements selected
+by the active loop.
 The plain form binds only the value:
 
 ```thp
@@ -97,12 +102,120 @@ foreach ($values as $value) {
 
 New key and value variables are scoped to the loop. A compatible existing
 local is reused and retains its final assigned value. Reusing an incompatible
-local, using the same variable for key and value, or iterating a string,
-object, or scalar is a compile error. Iterator-object traversal remains
-unimplemented. Its proposed lowering calls `rewind()` once, checks `valid()`
-before each iteration, reads `value()` and, only for a keyed loop, `key()`, then
-calls `advance()`. All five operations belong to the same `Iterator<K, V>`
-interface, so `foreach` does not test for a separate rewindable capability.
+local, using the same variable for key and value, or iterating a string or
+scalar is a compile error. In the proposed object form, loop bindings are the
+invariant `K` and `V` from `Traversable<K, V>`. Keys remain strict THP values;
+there is no PHP array-key coercion.
+
+### Proposed object traversal protocol
+
+Iterator-object traversal is not implemented. Its contract is:
+
+1. Evaluate the `foreach` source exactly once.
+2. For an `IteratorAggregate<K, V>`, call `getIterator()` exactly once at that
+   layer. Repeat only if the returned `Traversable<K, V>` is another aggregate.
+3. For the resulting direct `Iterator<K, V>`, call `rewind()` once.
+4. Repeat `valid() → value() → optional key() → body → advance()`.
+
+`value()` is called once per selected iteration and `key()` only for the keyed
+form. `continue` reaches `advance()`. `break`, `return`, and a throw leave
+without advancing. Iterator throwables propagate unchanged, while transfers
+still honor enclosing `using` and `finally` regions. A one-shot iterator or
+generator may reject `rewind()` after it has advanced, so a second traversal
+of the same cursor may fail.
+
+A direct iterator owns its cursor:
+
+```thp
+<?thp
+
+class PairIterator implements Iterator<string, int>
+{
+    private int $position = -1;
+
+    public function rewind(): void { $this->position = 0; }
+    public function valid(): bool { return $this->position < 2; }
+    public function key(): string { return $this->position === 0 ? "left" : "right"; }
+    public function value(): int { return $this->position + 10; }
+    public function advance(): void { $this->position = $this->position + 1; }
+}
+
+foreach (new PairIterator() as $key => $value) {
+    echo $key . "=" . $value . "\n";
+}
+```
+
+An aggregate delegates each layer exactly once and may return either strategy:
+
+```thp
+<?thp
+
+class Pairs implements IteratorAggregate<string, int>
+{
+    public function getIterator(): Traversable<string, int>
+    {
+        return new PairIterator();
+    }
+}
+```
+
+A concrete class may not implement `Traversable<K, V>` directly or implement
+both strategies. An abstract class may defer the choice to its concrete
+subclass:
+
+```thp
+<?thp
+
+class InvalidDirect implements Traversable<int, string> {}
+
+class InvalidDual
+    implements Iterator<int, string>, IteratorAggregate<int, string>
+{
+    // Compile error regardless of the methods supplied.
+}
+```
+
+One-shot rewind failure is observable:
+
+```thp
+<?thp
+
+$lines = readLinesOnce();
+foreach ($lines as $line) { break; }
+foreach ($lines as $line) { echo $line; } // rewind() may throw unchanged.
+```
+
+Mutation of a delegated iterator object remains visible according to its
+methods, unlike native collection snapshot traversal:
+
+```thp
+<?thp
+
+$iterator = new MutableIterator<int, string>(["first"]);
+foreach ($iterator as $value) {
+    $iterator->append("later"); // May be observed by a later valid()/value().
+}
+```
+
+Cleanup ordering is preserved when an iterator operation throws:
+
+```thp
+<?thp
+
+try {
+    using ($stream = MemoryStream::open()) {
+        foreach (new ThrowingIterator() as $value) {
+            echo $value;
+        }
+    } // close() runs while the iterator throwable remains primary.
+} finally {
+    echo "finally\n";
+}
+```
+
+The iterator throwable remains the pending primary failure while `close()` and
+the outer `finally` run, then propagates unchanged. If cleanup also fails, that
+failure is suppressed on the iterator throwable.
 
 `break` exits the innermost loop and `continue` starts its next iteration.
 Both are rejected outside a loop. Only level-one `break;` and `continue;` are

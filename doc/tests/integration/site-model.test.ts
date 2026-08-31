@@ -7,6 +7,33 @@ import { renderPage } from "../../src/view/pages.js";
 const root = path.resolve(import.meta.dirname, "../..");
 
 describe("documentation site model", () => {
+  it("marks every Throwable class hierarchy as an exception", async () => {
+    const model = await createModel({ root, basePath: "/typed-php/" });
+    const page = model.pages.find(
+      (item) => item.source.data.id === "std.baseTypes.Throwable",
+    )!;
+    const html = renderPage(model, page);
+    const sidebarLink = (route: string, name: string, kind: string) =>
+      `<a class="symbol-link" href="/typed-php${route}"><span class="symbol-kind-icon symbol-kind-${kind}" data-symbol-kind="${kind}" aria-hidden="true">${kind === "exception" ? "X" : "C"}</span><span class="sidebar-symbol-name">${name}</span></a>`;
+
+    expect(html).toContain(
+      sidebarLink("/std/base-types/exception/", "Exception", "exception"),
+    );
+    expect(html).toContain(
+      sidebarLink("/std/base-types/error/", "Error", "exception"),
+    );
+    expect(html).toContain(
+      sidebarLink(
+        "/std/base-types/unhandled-match-error/",
+        "UnhandledMatchError",
+        "exception",
+      ),
+    );
+    expect(html).toContain(
+      sidebarLink("/std/base-types/trace-line/", "TraceLine", "class"),
+    );
+  });
+
   it("resolves the complete SplQueue synopsis to canonical owners", async () => {
     const model = await createModel({ root });
     const queue = model.types.get("std.spl.SplQueue")!;
