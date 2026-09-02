@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, condcodes::IntCC, types};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use thp_bytecode::{Function, InstructionKind, Program, Terminator, VerificationError, verify};
@@ -323,13 +323,7 @@ fn compile_function(
     let locals = function
         .local_types
         .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            let variable =
-                Variable::from_u32(u32::try_from(index).expect("verified local count fits u32"));
-            builder.declare_var(variable, types::I64);
-            variable
-        })
+        .map(|_| builder.declare_var(types::I64))
         .collect::<Vec<_>>();
     for (index, parameter) in function.parameters.iter().enumerate() {
         builder.def_var(
