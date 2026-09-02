@@ -5,10 +5,11 @@ All notable user-visible changes to THP are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). GitHub releases
 remain marked as prereleases while THP is experimental.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-02
 
 ### Changed
 
+- deps: Update blake3, toml, cranelift-* and criterion packages
 - doc: Reconciled language, iterator, collection, and stream availability with the
   executable compiler and VM, using symbol-level implementation matrices.
 - doc: Defined the proposed invariant `Traversable<K, V>`, `Iterator<K, V>`, and
