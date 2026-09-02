@@ -1,4 +1,5 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use thp_config::parse_lock;
 
 fn lock_with_unparsed_extension() -> Vec<u8> {
