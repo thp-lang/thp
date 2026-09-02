@@ -24,11 +24,8 @@ errors:
 related:
   - std.streams.ReadableStream
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: The compiler and VM implement this operation, including non-consuming limit failure.
 version: "0.1"
 owner: std.streams.ReadableStream
 visibility: public

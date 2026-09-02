@@ -29,10 +29,8 @@ related:
   - std.streams.OpenStreamException
 status: experimental
 availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+notice: The VM constructs this state for runtime failures. The documented public
+  four-argument constructor is not implemented.
 version: "0.1"
 owner: std.streams.OpenStreamException
 visibility: public

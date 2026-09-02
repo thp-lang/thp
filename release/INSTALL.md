@@ -53,7 +53,7 @@ Replace the example version with the version you downloaded.
 ### Linux
 
 ```sh
-THP_ARCHIVE=thp-0.1.0-linux-x86_64.tar.gz
+THP_ARCHIVE=thp-0.2.0-linux-x86_64.tar.gz
 
 awk -v archive="$THP_ARCHIVE" '$2 == archive { print }' SHA256SUMS |
   sha256sum --check -
@@ -62,7 +62,7 @@ awk -v archive="$THP_ARCHIVE" '$2 == archive { print }' SHA256SUMS |
 ### macOS x86-64
 
 ```sh
-THP_ARCHIVE=thp-0.1.0-macos-x86_64.tar.gz
+THP_ARCHIVE=thp-0.2.0-macos-x86_64.tar.gz
 
 awk -v archive="$THP_ARCHIVE" '$2 == archive { print }' SHA256SUMS |
   shasum --algorithm 256 --check -
@@ -71,7 +71,7 @@ awk -v archive="$THP_ARCHIVE" '$2 == archive { print }' SHA256SUMS |
 ### macOS Apple silicon
 
 ```sh
-THP_ARCHIVE=thp-0.1.0-macos-arm64.tar.gz
+THP_ARCHIVE=thp-0.2.0-macos-arm64.tar.gz
 
 awk -v archive="$THP_ARCHIVE" '$2 == archive { print }' SHA256SUMS |
   shasum --algorithm 256 --check -
@@ -80,7 +80,7 @@ awk -v archive="$THP_ARCHIVE" '$2 == archive { print }' SHA256SUMS |
 ### Windows PowerShell
 
 ```powershell
-$ThpArchive = "thp-0.1.0-windows-x86_64.zip"
+$ThpArchive = "thp-0.2.0-windows-x86_64.zip"
 $ChecksumLine = Get-Content SHA256SUMS |
     Where-Object { $_ -match "\s+$([regex]::Escape($ThpArchive))$" }
 
@@ -139,7 +139,7 @@ Expected output:
 Hello, world!
 ```
 
-THP v0.1 is not production-ready, is not a PHP-compatible replacement, and
+THP v0.2.0 is not production-ready, is not a PHP-compatible replacement, and
 does not execute through PHP's engine.
 
 ## Licensing

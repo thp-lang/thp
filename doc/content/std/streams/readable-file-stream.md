@@ -13,10 +13,8 @@ constants: []
 properties: []
 status: experimental
 availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+notice: Files::openRead(), reading, tell(), and closing execute. The documented
+  SeekableStream relationship and seek() operation are not implemented for files.
 version: "0.1"
 ---
 

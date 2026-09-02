@@ -28,10 +28,10 @@ related:
   - std.streams.SeekableStream
 status: experimental
 availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+notice: >-
+  The executable subset is seek(int $position): void from the stream start on
+  memory and temporary streams. SeekFrom, relative/end origins, file seeking,
+  and returning the new position remain proposed.
 version: "0.1"
 owner: std.streams.SeekableStream
 visibility: public

@@ -27,7 +27,7 @@ rather than this library section.
 | [`Option`](thp:std.baseTypes.Option)                           | Represents either one value or no value.        |
 | [`TraceLine`](thp:std.baseTypes.TraceLine)                     | Represents one frame in a captured stack trace. |
 | [`Iterator`](thp:std.baseTypes.Iterator)                       | Traverses typed keys and values with a cursor.  |
-| [`IteratorAggregate`](thp:std.baseTypes.IteratorAggregate)     | Creates a fresh iterator for each traversal.    |
+| [`IteratorAggregate`](thp:std.baseTypes.IteratorAggregate)     | Produces the next traversable layer.            |
 
 ## See also
 
@@ -43,8 +43,13 @@ generic element and key constraints. `[]` creates a vector,
 Collection operations use global functions prefixed by their native input
 shape rather than methods or PHP's `array_*` names. Proposed functions include
 `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()`,
-`map_transform()`, `map_filter()`, and `map_merge()`. They are not implemented;
-`count()` is the only executable general collection function in this checkout.
+`map_transform()`, `map_filter()`, and `map_merge()`. Every transformation is
+proposed. `count(string|vector<T>|map<K, V>): int` is the only executable
+general collection function in this checkout. It reads the collection length
+without consuming, moving, or creating traversal state. Proposed
+[`iterator_count()`](thp:std.spl.iterator_count) instead accepts an
+`Iterator<K, V>`, counts from its current cursor through exhaustion, advances
+it, and does not rewind; the two names are neither aliases nor overloads.
 The executable `foreach` implementation currently works with native vectors
 and maps, preserves single evaluation and keys, and supports `break` and
 `continue`. Iterator objects remain a proposal.

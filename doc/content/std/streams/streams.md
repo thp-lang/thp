@@ -11,16 +11,17 @@ constants: []
 properties: []
 status: experimental
 availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  partially implemented experimental contract and may change as runtime integration proceeds.
+notice: Streams::open() implements php://memory, php://temp[/maxmemory:N], and
+  read-only thp:/input. Local paths, file://, and complete mode support remain proposed.
 version: "0.1"
 ---
 
-`Streams` is a final compatibility factory for names computed at runtime.
-The first proposal recognizes local paths, `file://`, `php://memory`, and
-`php://temp/maxmemory:N`. The executable runtime also provides the request's
-shared, read-only `thp:/input` stream.
+`Streams` is a final compatibility factory for names computed at runtime. The
+executable subset recognizes `php://memory`, `php://temp`,
+`php://temp/maxmemory:N`, and the request's shared read-only `thp:/input`
+stream. Local paths and `file://` remain proposed here.
 
-Because the URI and mode are dynamic, `open()` returns `Stream`. Use
-`instanceof` to narrow the result to its supported capability interfaces.
+The proposed general signature returns `Stream`. The executable compiler
+currently gives supported literal URIs a narrower native stream type. Use
+`instanceof` to narrow capability interfaces; the `Stream::isReadable()`,
+`isWritable()`, and `isSeekable()` methods remain proposed.

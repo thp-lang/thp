@@ -13,9 +13,8 @@ properties: []
 status: experimental
 availability: partial
 notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+  writeAll() executes on memory and temporary streams. write(), flush(), the
+  documented Stream parent, and writable files remain proposed.
 version: "0.1"
 ---
 

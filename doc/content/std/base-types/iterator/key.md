@@ -30,6 +30,8 @@ without advancing the cursor.
 Repeated calls return the same logical key until the cursor moves. The method
 fails when `valid()` is false. An implementation may check its state directly;
 it is not required to make a nested virtual call to `valid()`.
+`foreach` calls `key()` only for the keyed loop form, after `value()`. The
+invariant `K` value is preserved without PHP array-key coercion.
 
 ## Example
 

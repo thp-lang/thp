@@ -596,15 +596,15 @@ impl ModuleGraph {
             let mut signature_dependencies = Vec::new();
             collect_signature_dependencies(&resolved, &mut signature_dependencies);
             for (is_function, symbol) in signature_dependencies {
-                if let Some(export) = dependency_export(index, is_function, &symbol) {
-                    if export.module != module.id {
-                        edges.insert((
-                            module.id.clone(),
-                            export.module.clone(),
-                            DependencyKind::Signature,
-                            symbol,
-                        ));
-                    }
+                if let Some(export) = dependency_export(index, is_function, &symbol)
+                    && export.module != module.id
+                {
+                    edges.insert((
+                        module.id.clone(),
+                        export.module.clone(),
+                        DependencyKind::Signature,
+                        symbol,
+                    ));
                 }
             }
             let mut body_dependencies = Vec::new();
@@ -612,15 +612,15 @@ impl ModuleGraph {
                 collect_body_statement(statement, &mut body_dependencies);
             }
             for (is_function, symbol) in body_dependencies {
-                if let Some(export) = dependency_export(index, is_function, &symbol) {
-                    if export.module != module.id {
-                        edges.insert((
-                            module.id.clone(),
-                            export.module.clone(),
-                            DependencyKind::Body,
-                            symbol,
-                        ));
-                    }
+                if let Some(export) = dependency_export(index, is_function, &symbol)
+                    && export.module != module.id
+                {
+                    edges.insert((
+                        module.id.clone(),
+                        export.module.clone(),
+                        DependencyKind::Body,
+                        symbol,
+                    ));
                 }
             }
         }

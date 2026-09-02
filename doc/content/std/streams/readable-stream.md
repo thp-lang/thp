@@ -13,9 +13,8 @@ properties: []
 status: experimental
 availability: partial
 notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+  read(), readAll(), eof(), tell(), and closing execute. The documented Stream
+  parent and capability-inspection methods remain proposed.
 version: "0.1"
 ---
 

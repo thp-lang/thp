@@ -239,10 +239,10 @@ impl LockError {
 impl fmt::Display for LockError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.path.display())?;
-        if let Some(location) = &self.location {
-            if location.line != 0 {
-                write!(formatter, ":{}:{}", location.line, location.column)?;
-            }
+        if let Some(location) = &self.location
+            && location.line != 0
+        {
+            write!(formatter, ":{}:{}", location.line, location.column)?;
         }
         if let Some(field) = &self.field {
             write!(formatter, " ({field})")?;

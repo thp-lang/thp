@@ -31,6 +31,10 @@ When another element exists, it becomes the current element. Otherwise the
 iterator becomes exhausted and `valid()` returns `false`. Calling `advance()`
 after exhaustion leaves the iterator exhausted.
 
+`foreach` calls this after the body and after `continue`. It does not call it
+after `break`, `return`, or a throw. Any throwable propagates unchanged after
+enclosing `using` and `finally` cleanup.
+
 ## Example
 
 ```thp

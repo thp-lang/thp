@@ -30,6 +30,8 @@ value without advancing the cursor.
 Repeated calls return the same logical value until the cursor moves. The method
 fails when `valid()` is false. An implementation may check its state directly;
 it is not required to make a nested virtual call to `valid()`.
+`foreach` calls `value()` once after a successful `valid()` check and before
+the optional `key()` call.
 
 ## Example
 

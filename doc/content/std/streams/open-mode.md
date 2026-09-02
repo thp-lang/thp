@@ -20,9 +20,8 @@ cases:
 status: experimental
 availability: partial
 notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+  Read, Write, and ReadWrite names are recognized. Only Read for thp:/input and
+  the supported memory/temp combinations execute; the other cases remain proposed.
 version: "0.1"
 ---
 

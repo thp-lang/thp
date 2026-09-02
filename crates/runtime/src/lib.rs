@@ -72,10 +72,10 @@ impl RequestHeap {
             .try_reserve_exact(root_capacity)
             .map_err(|_| RuntimeErrorKind::AllocationFailure)?;
         let metadata_bytes = roots.capacity() * mem::size_of::<*mut HeapCell>();
-        if let Some(limit) = max_bytes {
-            if metadata_bytes > limit {
-                return Err(RuntimeErrorKind::HeapLimit { limit });
-            }
+        if let Some(limit) = max_bytes
+            && metadata_bytes > limit
+        {
+            return Err(RuntimeErrorKind::HeapLimit { limit });
         }
         Ok(Self {
             state: Rc::new(HeapState {
@@ -510,10 +510,10 @@ impl RequestInput {
         max_bytes: Option<u64>,
         max_time: Option<Duration>,
     ) -> Result<Self, RuntimeErrorKind> {
-        if let (Some(length), Some(limit)) = (declared_length, max_bytes) {
-            if length > limit {
-                return Err(RuntimeErrorKind::InputSizeLimit { limit });
-            }
+        if let (Some(length), Some(limit)) = (declared_length, max_bytes)
+            && length > limit
+        {
+            return Err(RuntimeErrorKind::InputSizeLimit { limit });
         }
         Ok(Self {
             state: Rc::new(RefCell::new(RequestInputState {
@@ -1098,10 +1098,10 @@ impl Value {
     ) -> Result<(), RuntimeErrorKind> {
         let active = ACTIVE_HEAP.with(|owner| owner.borrow().as_ref().map(|owner| owner.id));
         for value in values {
-            if let Some(owner) = value.owner_id() {
-                if Some(owner) != active {
-                    return Err(RuntimeErrorKind::CrossRequestValue);
-                }
+            if let Some(owner) = value.owner_id()
+                && Some(owner) != active
+            {
+                return Err(RuntimeErrorKind::CrossRequestValue);
             }
         }
         Ok(())

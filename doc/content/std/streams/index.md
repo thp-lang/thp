@@ -8,15 +8,27 @@ order: 60
 status: experimental
 availability: partial
 notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+  Reading, complete memory/temp writes, absolute seeking, closing, selected
+  factories and URI forms, and typed failures execute. Capability inspection,
+  partial writes, flushing, relative seeking, and writable files remain proposed.
 ---
 
 THP does not expose PHP's generic `resource` type. External state is represented
 by nominal, opaque native objects such as `MemoryStream` and file-stream
 classes. Their types describe what operations are available, while the runtime
 keeps ownership and cleanup predictable.
+
+## Availability
+
+| Availability | Symbols                                                                                                                                                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| implemented  | `MemoryStream::open()`, `TempStream::open()`, `Files::openRead()`, `read()`, `readAll()`, `eof()`, `writeAll()`, `tell()`, `close()`, `isClosed()`, stream exception types, `getTarget()`, `getSystemCode()`              |
+| partial      | `MemoryStream`, `TempStream`, `ReadableFileStream`, `ReadableStream`, `WritableStream`, `SeekableStream`, `Files`, `Streams`, `OpenMode`, absolute `seek()`, `Streams::open()`, public `OpenStreamException` construction |
+| proposed     | `Stream` capability inspection, `write()`, `flush()`, `SeekFrom`, relative/end seeking, `WriteMode`, `Files::openWrite()`, `Files::openReadWrite()`, `WritableFileStream`, `ReadWriteFileStream`                          |
+
+See [implementation status](thp:guide.implementationStatus) for the exact
+executable signatures and limitations. An API signature below does not make a
+proposed member available.
 
 ## PHP baseline
 
@@ -285,15 +297,18 @@ The modes correspond to PHP's familiar mode strings:
 | `ReadWriteAppend`   | `a+`     | Read, write, and seek; append      |
 | `CreateExclusive`   | `x+`     | Read, write, and seek; new target  |
 
-The first version recognizes local file paths, `file://`, `php://memory`, and
-`php://temp/maxmemory:N`. It also recognizes the shared, read-only request
-stream `thp:/input`. Unknown schemes and malformed wrapper options throw
+The executable subset recognizes `php://memory`, `php://temp`,
+`php://temp/maxmemory:N`, and the shared read-only request stream
+`thp:/input`. Local paths and `file://` remain proposed for this bridge; use
+implemented `Files::openRead()` for a local read-only file. Unknown schemes and
+malformed wrapper options throw
 [`InvalidStreamUriException`](thp:std.streams.InvalidStreamUriException).
 User-registered wrappers, network schemes, standard descriptors, output
 wrappers, and `php://filter` are reserved for later proposals.
 
-The returned object's implemented capability interfaces reflect the requested
-mode. If a scheme cannot provide the requested capability,
+For supported URI/mode pairs, the returned object's implemented capability
+interfaces reflect the executable stream. If a scheme cannot provide the
+requested capability,
 `UnsupportedStreamOperationException` is thrown during opening.
 
 Because a URI may be computed at runtime, `Streams::open()` returns only

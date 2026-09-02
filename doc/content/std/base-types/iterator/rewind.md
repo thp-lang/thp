@@ -32,6 +32,9 @@ an element and `false` when it is empty. Restartable iterators return to their
 first element after partial or complete traversal. A one-shot implementation
 may fail when called after it has advanced, but it must accept the initial
 `rewind()` performed on a fresh iterator.
+Direct iterator `foreach` calls this exactly once before its first `valid()`
+check. Aggregate layers are resolved first, with one `getIterator()` call per
+layer.
 
 ## Example
 
