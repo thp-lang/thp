@@ -10,8 +10,9 @@ status: experimental
 availability: partial
 notice: >-
   Scalars, nullable and union types, user classes, native vectors and maps, and
-  arbitrary-byte strings execute. Generic user types and the broader proposed
-  type system remain unimplemented.
+  arbitrary-byte strings execute. Invariant erased generic classes and
+  interfaces execute; generic functions, methods, traits, defaults, variance,
+  and intersection bounds remain proposed.
 ---
 
 THP checks declared types before and during execution. THP replaces PHP's
@@ -97,8 +98,11 @@ function findName(map<int, string> $names, int $id): ?string {
 }
 ```
 
-Classes, interfaces, and enumerations define user types. Their advanced generic
-and runtime behavior is still evolving.
+Classes and interfaces may declare invariant type parameters with optional
+nominal `extends` bounds. A reference to a generic declaration supplies its
+exact arity, while `new` may infer class arguments from supplied constructor
+arguments. Generic arguments are retained for static checking and module and
+bytecode validation, but are erased from runtime objects.
 
 ## Type conversion
 

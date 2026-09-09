@@ -44,12 +44,12 @@ compiler if used as though it were available.
 | `foreach (vector<T>)`, `foreach (map<K, V>)`                                      | implemented  | Native collections only; the source is evaluated once and traversal uses its captured COW snapshot               |
 | `break`, `continue`                                                               | partial      | Level one only; numeric levels are rejected                                                                      |
 | Scalar operators                                                                  | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing |
-| Classes and interfaces                                                            | partial      | Nominal classes and non-generic, methods-only interfaces; generic interfaces remain proposed                     |
+| Classes and interfaces                                                            | partial      | Erased generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported  |
 | Traits                                                                            | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                        |
 | `Throwable`, `Exception`, `Error`, `UnhandledMatchError`                          | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures         |
 | `try`, `catch`, `finally`, `throw`, `using`                                       | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                  |
 | Namespaces, imports, and project autoload discovery                               | implemented  | Semicolon namespaces and deterministic configured source maps; no runtime include/autoload callbacks             |
-| OPcache, frozen projects, metrics, embedding, C ABI                               | implemented  | Cache/bytecode formats and C ABI remain version 1                                                                |
+| OPcache, frozen projects, metrics, embedding, C ABI                               | implemented  | Generic metadata is hashed and schema-versioned; the public C ABI remains version 1                              |
 | Cranelift JIT                                                                     | partial      | Safe scalar subset; automatic mode falls back to the VM                                                          |
 
 ### Collection and iterator symbols
@@ -57,9 +57,9 @@ compiler if used as though it were available.
 | Symbol                                                                 | Availability | Input and cursor behavior                                                                         |
 | ---------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------- |
 | `count(string\|vector<T>\|map<K, V>): int`                             | implemented  | Reads the value's byte or collection length; it does not consume, move, or create traversal state |
-| `Traversable<K, V>`                                                    | proposed     | Invariant marker interface; `K` has no additional constraint                                      |
-| `Iterator<K, V>`                                                       | proposed     | Invariant cursor interface extending `Traversable<K, V>`                                          |
-| `IteratorAggregate<K, V>`                                              | proposed     | Invariant aggregate interface; `getIterator()` returns `Traversable<K, V>`                        |
+| `Traversable<K, V>`                                                    | implemented  | Executable invariant marker interface; `K` has no additional constraint                           |
+| `Iterator<K, V>`                                                       | implemented  | Executable cursor interface extending `Traversable<K, V>`                                         |
+| `IteratorAggregate<K, V>`                                              | implemented  | Executable aggregate interface; `getIterator()` returns `Traversable<K, V>`                       |
 | `foreach (Traversable<K, V>)`                                          | proposed     | Iterator-object dispatch and execution are not implemented                                        |
 | `iterator_count<K, V>(Iterator<K, V>): int`                            | proposed     | Counts from the current cursor through exhaustion, advances it, and never rewinds                 |
 | `iterator_apply()`                                                     | proposed     | Callback-driven consuming traversal is not implemented                                            |

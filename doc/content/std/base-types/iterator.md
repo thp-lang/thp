@@ -18,8 +18,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This THP-native contract is proposed and is not yet implemented in this repository.
+availability: implemented
+notice: The interface and method-dispatch contract executes; object-based foreach remains proposed.
 version: "0.1"
 ---
 
@@ -76,7 +76,8 @@ and insertion order. There is no separate keyed-iterator interface.
 ## Example
 
 ```thp
-function printEntries<K, V>(Iterator<K, V> $iterator): void {
+function printEntries(Iterator<int, string> $iterator): void
+{
     $iterator->rewind();
 
     while ($iterator->valid()) {
@@ -86,7 +87,7 @@ function printEntries<K, V>(Iterator<K, V> $iterator): void {
 }
 ```
 
-The example invokes the proposed protocol directly. Passing the iterator to
+The example invokes the executable protocol directly. Passing the iterator to
 `foreach` remains proposed until iterator-object traversal is implemented.
 
 ## See also

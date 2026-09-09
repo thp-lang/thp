@@ -9,14 +9,14 @@ use std::fmt;
 use thp_diagnostics::Span;
 use thp_hir::{
     Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type,
+    PropertyId, Type, TypeParameter,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 1;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -33,11 +33,20 @@ pub struct Class {
     pub kind: NominalKind,
     pub abstract_class: bool,
     pub final_class: bool,
+    pub type_parameters: Vec<TypeParameter>,
     pub properties: Vec<Property>,
     pub methods: Vec<Method>,
     pub dispatch: Vec<Option<Callee>>,
     pub interfaces: Vec<ClassId>,
+    pub interface_types: Vec<NominalType>,
     pub parent: Option<ClassId>,
+    pub parent_type: Option<NominalType>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NominalType {
+    pub class: ClassId,
+    pub arguments: Vec<Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -230,6 +239,7 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                 kind: class.kind,
                 abstract_class: class.abstract_class,
                 final_class: class.final_class,
+                type_parameters: class.type_parameters.clone(),
                 properties: class
                     .properties
                     .iter()
@@ -267,6 +277,11 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                             .map(|interface| interface.id)
                     })
                     .collect(),
+                interface_types: class
+                    .interface_types
+                    .iter()
+                    .filter_map(|ty| lower_nominal_type(ty, &module.classes))
+                    .collect(),
                 parent: class.parent.as_ref().and_then(|parent| {
                     module
                         .classes
@@ -274,6 +289,10 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                         .find(|candidate| &candidate.name == parent)
                         .map(|parent| parent.id)
                 }),
+                parent_type: class
+                    .parent_type
+                    .as_ref()
+                    .and_then(|ty| lower_nominal_type(ty, &module.classes)),
             })
             .collect(),
         functions: module
@@ -327,6 +346,21 @@ pub fn lower(module: &thp_mir::Module) -> Program {
             })
             .collect(),
     }
+}
+
+fn lower_nominal_type(ty: &Type, classes: &[thp_hir::Class]) -> Option<NominalType> {
+    let (name, arguments) = match ty {
+        Type::Object(name) => (name, Vec::new()),
+        Type::Nominal { name, arguments } => (name, arguments.clone()),
+        _ => return None,
+    };
+    classes
+        .iter()
+        .find(|class| &class.name == name)
+        .map(|class| NominalType {
+            class: class.id,
+            arguments,
+        })
 }
 
 fn lower_instruction(instruction: &thp_mir::InstructionKind) -> InstructionKind {
@@ -587,10 +621,80 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 class.name
             )));
         }
+        for (parameter_index, parameter) in class.type_parameters.iter().enumerate() {
+            if parameter.id.owner != class.id || parameter.id.index as usize != parameter_index {
+                return Err(global_error(format!(
+                    "{} has a malformed type-parameter identity",
+                    class.name
+                )));
+            }
+            if class.type_parameters[..parameter_index]
+                .iter()
+                .any(|previous| previous.name == parameter.name)
+            {
+                return Err(global_error(format!(
+                    "{} has duplicate type-parameter names",
+                    class.name
+                )));
+            }
+            if let Some(bound) = &parameter.bound {
+                verify_encoded_type(program, bound)?;
+                if !matches!(bound, Type::Object(_) | Type::Nominal { .. }) {
+                    return Err(global_error(format!(
+                        "{} has a non-nominal type-parameter bound",
+                        class.name
+                    )));
+                }
+            }
+        }
+        if class.parent != class.parent_type.as_ref().map(|parent| parent.class) {
+            return Err(global_error(format!(
+                "{} has inconsistent instantiated parent metadata",
+                class.name
+            )));
+        }
+        if class.interfaces.len() != class.interface_types.len()
+            || class
+                .interfaces
+                .iter()
+                .zip(&class.interface_types)
+                .any(|(erased, instantiated)| erased != &instantiated.class)
+        {
+            return Err(global_error(format!(
+                "{} has inconsistent instantiated interface metadata",
+                class.name
+            )));
+        }
+        if let Some(parent) = &class.parent_type {
+            verify_nominal_type(program, parent)?;
+        }
+        for interface in &class.interface_types {
+            verify_nominal_type(program, interface)?;
+        }
         for interface in &class.interfaces {
             if program.classes[interface.0 as usize].kind != NominalKind::Interface {
                 return Err(global_error(format!(
                     "{} has a non-interface in its interface closure",
+                    class.name
+                )));
+            }
+        }
+        if class.kind == NominalKind::Class && !class.abstract_class {
+            let has = |name: &str| {
+                class
+                    .interfaces
+                    .iter()
+                    .any(|interface| program.classes[interface.0 as usize].name == name)
+            };
+            if has("Traversable") && !has("Iterator") && !has("IteratorAggregate") {
+                return Err(global_error(format!(
+                    "concrete class {} has no iterator strategy",
+                    class.name
+                )));
+            }
+            if has("Iterator") && has("IteratorAggregate") {
+                return Err(global_error(format!(
+                    "concrete class {} has two iterator strategies",
                     class.name
                 )));
             }
@@ -614,8 +718,15 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                     class.name
                 )));
             }
+            if !class.type_parameters.is_empty() {
+                return Err(global_error(format!(
+                    "{} is an unsupported generic throwable",
+                    class.name
+                )));
+            }
         }
         for property in &class.properties {
+            verify_encoded_type(program, &property.ty)?;
             if property.declaring_class.0 as usize >= program.classes.len() {
                 return Err(global_error(format!(
                     "{} has a property with an invalid declaring class",
@@ -624,6 +735,10 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
             }
         }
         for method in &class.methods {
+            for ty in &method.parameter_types {
+                verify_encoded_type(program, ty)?;
+            }
+            verify_encoded_type(program, &method.return_type)?;
             if method.slot.0 as usize >= class.dispatch.len()
                 || method.declaring_class.0 as usize >= program.classes.len()
             {
@@ -677,9 +792,115 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 "function owner is out of bounds",
             ));
         }
+        for ty in function
+            .local_types
+            .iter()
+            .chain(&function.register_types)
+            .chain(std::iter::once(&function.return_type))
+        {
+            verify_encoded_type(program, ty)?;
+        }
         verify_function(program, function)?;
     }
     Ok(())
+}
+
+fn verify_nominal_type(program: &Program, nominal: &NominalType) -> Result<(), VerificationError> {
+    let Some(class) = program.classes.get(nominal.class.0 as usize) else {
+        return Err(global_error("instantiated nominal class is out of bounds"));
+    };
+    if nominal.arguments.len() != class.type_parameters.len() {
+        return Err(global_error(format!(
+            "instantiated type {} has incorrect argument arity",
+            class.name
+        )));
+    }
+    for argument in &nominal.arguments {
+        verify_encoded_type(program, argument)?;
+        if contains_void(argument) {
+            return Err(global_error("generic type argument contains void"));
+        }
+    }
+    let instantiated = NominalType {
+        class: class.id,
+        arguments: nominal.arguments.clone(),
+    };
+    for (parameter, argument) in class.type_parameters.iter().zip(&nominal.arguments) {
+        if let Some(bound) = &parameter.bound {
+            let bound = substitute_descriptor_type(bound, Some(&instantiated), class);
+            if !type_accepts(program, &bound, argument) {
+                return Err(global_error(format!(
+                    "type argument {argument} does not satisfy bound {bound} for {}",
+                    parameter.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_encoded_type(program: &Program, ty: &Type) -> Result<(), VerificationError> {
+    match ty {
+        Type::Vector(element) => verify_encoded_type(program, element),
+        Type::Map(key, value) => {
+            verify_encoded_type(program, key)?;
+            verify_encoded_type(program, value)
+        }
+        Type::Union(members) => {
+            for member in members {
+                verify_encoded_type(program, member)?;
+            }
+            Ok(())
+        }
+        Type::Object(name) => {
+            let Some(class) = class_by_name(program, name) else {
+                return Err(global_error(format!("type names unknown nominal {name}")));
+            };
+            if !class.type_parameters.is_empty() {
+                return Err(global_error(format!(
+                    "raw generic type {name} is not permitted"
+                )));
+            }
+            Ok(())
+        }
+        Type::Nominal { name, arguments } => {
+            let Some(class) = class_by_name(program, name) else {
+                return Err(global_error(format!("type names unknown nominal {name}")));
+            };
+            verify_nominal_type(
+                program,
+                &NominalType {
+                    class: class.id,
+                    arguments: arguments.clone(),
+                },
+            )
+        }
+        Type::Parameter { id, name } => {
+            let Some(parameter) = program
+                .classes
+                .get(id.owner.0 as usize)
+                .and_then(|class| class.type_parameters.get(id.index as usize))
+            else {
+                return Err(global_error("type references an unknown type parameter"));
+            };
+            if parameter.id != *id || parameter.name != *name {
+                return Err(global_error("type-parameter metadata is inconsistent"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn contains_void(ty: &Type) -> bool {
+    match ty {
+        Type::Void => true,
+        Type::Vector(element) => contains_void(element),
+        Type::Map(key, value) => contains_void(key) || contains_void(value),
+        Type::Union(members) => members.iter().any(contains_void),
+        Type::Nominal { arguments, .. } => arguments.iter().any(contains_void),
+        _ => false,
+    }
 }
 
 fn has_parent_cycle(program: &Program, start: ClassId) -> bool {
@@ -747,7 +968,11 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
             if let Some(parent) = class.parent.filter(|_| class.kind == NominalKind::Class) {
                 let parent = &program.classes[parent.0 as usize];
                 if let Some(inherited) = parent.properties.get(property_index)
-                    && (inherited.ty != property.ty
+                    && (substitute_descriptor_type(
+                        &inherited.ty,
+                        class.parent_type.as_ref(),
+                        parent,
+                    ) != property.ty
                         || inherited.visibility != property.visibility
                         || inherited.declaring_class != property.declaring_class)
                 {
@@ -783,6 +1008,28 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                     class.name
                 )));
             }
+            let parent_instantiation = class
+                .parent_type
+                .as_ref()
+                .expect("erased and instantiated parent metadata agreed");
+            if class.kind == NominalKind::Interface
+                && !class.interface_types.contains(parent_instantiation)
+            {
+                return Err(global_error(format!(
+                    "{} has an incomplete instantiated interface closure",
+                    class.name
+                )));
+            }
+            for inherited in &parent.interface_types {
+                let inherited =
+                    instantiate_nominal_edge(inherited, Some(parent_instantiation), parent);
+                if !class.interface_types.contains(&inherited) {
+                    return Err(global_error(format!(
+                        "{} has an incomplete or conflicting instantiated interface closure",
+                        class.name
+                    )));
+                }
+            }
             for inherited in &parent.methods {
                 let Some(method) = class
                     .methods
@@ -794,9 +1041,13 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                         class.name, inherited.name
                     )));
                 };
+                let inherited =
+                    instantiate_descriptor_method(inherited, class.parent_type.as_ref(), parent);
                 if method.slot != inherited.slot
-                    || !method_signature_equal(method, inherited)
+                    || !method_signature_equal(method, &inherited)
                     || visibility_rank(method.visibility) < visibility_rank(inherited.visibility)
+                    || (method.declaring_class == inherited.declaring_class
+                        && method.callee != inherited.callee)
                 {
                     return Err(global_error(format!(
                         "{} has an incompatible inherited method {}",
@@ -815,9 +1066,27 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                 }
             }
         }
+        for instantiated in &class.interface_types {
+            let interface = &program.classes[instantiated.class.0 as usize];
+            for inherited in &interface.interface_types {
+                let inherited = instantiate_nominal_edge(inherited, Some(instantiated), interface);
+                if !class.interface_types.contains(&inherited) {
+                    return Err(global_error(format!(
+                        "{} has an incomplete or conflicting instantiated interface closure",
+                        class.name
+                    )));
+                }
+            }
+        }
         for interface in &class.interfaces {
             let interface = &program.classes[interface.0 as usize];
+            let instantiated = class
+                .interface_types
+                .iter()
+                .find(|candidate| candidate.class == interface.id);
             for requirement in &interface.methods {
+                let requirement =
+                    instantiate_descriptor_method(requirement, instantiated, interface);
                 let Some(method) = class
                     .methods
                     .iter()
@@ -828,7 +1097,7 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                         class.name, requirement.name
                     )));
                 };
-                if !method_signature_equal(method, requirement)
+                if !method_signature_equal(method, &requirement)
                     || method.visibility != thp_syntax::Visibility::Public
                 {
                     return Err(global_error(format!(
@@ -892,7 +1161,9 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                     class.name
                 )));
             }
-            if let Some(Callee::Function(function)) = method.callee {
+            if method.declaring_class == class.id
+                && let Some(Callee::Function(function)) = method.callee
+            {
                 verify_user_method(program, method, function)?;
             }
         }
@@ -917,6 +1188,225 @@ fn method_signature_equal(left: &Method, right: &Method) -> bool {
     left.static_method == right.static_method
         && left.parameter_types == right.parameter_types
         && left.return_type == right.return_type
+}
+
+fn substitute_descriptor_type(
+    ty: &Type,
+    instantiated: Option<&NominalType>,
+    declaration: &Class,
+) -> Type {
+    fn apply(
+        ty: &Type,
+        substitutions: &std::collections::BTreeMap<thp_hir::TypeParameterId, Type>,
+    ) -> Type {
+        match ty {
+            Type::Parameter { id, .. } => {
+                substitutions.get(id).cloned().unwrap_or_else(|| ty.clone())
+            }
+            Type::Vector(element) => Type::Vector(Box::new(apply(element, substitutions))),
+            Type::Map(key, value) => Type::Map(
+                Box::new(apply(key, substitutions)),
+                Box::new(apply(value, substitutions)),
+            ),
+            Type::Union(members) => Type::Union(
+                members
+                    .iter()
+                    .map(|member| apply(member, substitutions))
+                    .collect(),
+            ),
+            Type::Nominal { name, arguments } => Type::Nominal {
+                name: name.clone(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| apply(argument, substitutions))
+                    .collect(),
+            },
+            _ => ty.clone(),
+        }
+    }
+    let substitutions = instantiated
+        .into_iter()
+        .flat_map(|instantiated| {
+            declaration
+                .type_parameters
+                .iter()
+                .zip(&instantiated.arguments)
+                .map(|(parameter, argument)| (parameter.id, argument.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    apply(ty, &substitutions)
+}
+
+fn instantiate_descriptor_method(
+    method: &Method,
+    instantiated: Option<&NominalType>,
+    declaration: &Class,
+) -> Method {
+    let mut method = method.clone();
+    method.parameter_types = method
+        .parameter_types
+        .iter()
+        .map(|ty| substitute_descriptor_type(ty, instantiated, declaration))
+        .collect();
+    method.return_type = substitute_descriptor_type(&method.return_type, instantiated, declaration);
+    method
+}
+
+fn instantiate_nominal_edge(
+    edge: &NominalType,
+    instantiated: Option<&NominalType>,
+    declaration: &Class,
+) -> NominalType {
+    NominalType {
+        class: edge.class,
+        arguments: edge
+            .arguments
+            .iter()
+            .map(|argument| substitute_descriptor_type(argument, instantiated, declaration))
+            .collect(),
+    }
+}
+
+fn declaration_bytecode_type(class: &Class) -> Type {
+    if class.type_parameters.is_empty() {
+        Type::Object(class.name.clone())
+    } else {
+        Type::Nominal {
+            name: class.name.clone(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|parameter| Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn encoded_nominal_parts(ty: &Type) -> Option<(&str, &[Type])> {
+    match ty {
+        Type::Object(name) => Some((name, &[])),
+        Type::Nominal { name, arguments } => Some((name, arguments)),
+        _ => None,
+    }
+}
+
+fn encoded_nominal_lookup_type(program: &Program, ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Object(_) | Type::Nominal { .. } => Some(ty.clone()),
+        Type::Parameter { id, .. } => program
+            .classes
+            .get(id.owner.0 as usize)
+            .and_then(|class| class.type_parameters.get(id.index as usize))
+            .and_then(|parameter| parameter.bound.as_ref())
+            .and_then(|bound| encoded_nominal_lookup_type(program, bound)),
+        _ => None,
+    }
+}
+
+fn instantiation_for_class(program: &Program, ty: &Type, target: ClassId) -> Option<NominalType> {
+    if let Type::Parameter { id, .. } = ty {
+        let bound = program
+            .classes
+            .get(id.owner.0 as usize)?
+            .type_parameters
+            .get(id.index as usize)?
+            .bound
+            .as_ref()?;
+        return instantiation_for_class(program, bound, target);
+    }
+    let (name, arguments) = encoded_nominal_parts(ty)?;
+    let class = class_by_name(program, name)?;
+    let current = NominalType {
+        class: class.id,
+        arguments: arguments.to_vec(),
+    };
+    if class.id == target {
+        return Some(current);
+    }
+    class
+        .parent_type
+        .iter()
+        .chain(&class.interface_types)
+        .map(|edge| {
+            let edge_class = &program.classes[edge.class.0 as usize];
+            let arguments = edge
+                .arguments
+                .iter()
+                .map(|argument| substitute_descriptor_type(argument, Some(&current), class))
+                .collect::<Vec<_>>();
+            if arguments.is_empty() {
+                Type::Object(edge_class.name.clone())
+            } else {
+                Type::Nominal {
+                    name: edge_class.name.clone(),
+                    arguments,
+                }
+            }
+        })
+        .find_map(|edge| instantiation_for_class(program, &edge, target))
+}
+
+fn infer_descriptor_instantiation(
+    method: &Method,
+    arguments: &[Register],
+    result: Option<&Type>,
+    caller: &Function,
+    declaration: &Class,
+) -> Option<NominalType> {
+    fn unify(
+        pattern: &Type,
+        actual: &Type,
+        output: &mut std::collections::BTreeMap<thp_hir::TypeParameterId, Type>,
+    ) {
+        match (pattern, actual) {
+            (Type::Parameter { id, .. }, actual) => {
+                output.entry(*id).or_insert_with(|| actual.clone());
+            }
+            (Type::Vector(pattern), Type::Vector(actual)) => unify(pattern, actual, output),
+            (Type::Map(pk, pv), Type::Map(ak, av)) => {
+                unify(pk, ak, output);
+                unify(pv, av, output);
+            }
+            (
+                Type::Nominal {
+                    name: pn,
+                    arguments: pa,
+                },
+                Type::Nominal {
+                    name: an,
+                    arguments: aa,
+                },
+            ) if pn == an => {
+                for (pattern, actual) in pa.iter().zip(aa) {
+                    unify(pattern, actual, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut inferred = std::collections::BTreeMap::new();
+    for (pattern, argument) in method.parameter_types.iter().zip(arguments) {
+        unify(
+            pattern,
+            &caller.register_types[argument.0 as usize],
+            &mut inferred,
+        );
+    }
+    if let Some(result) = result {
+        unify(&method.return_type, result, &mut inferred);
+    }
+    let arguments = declaration
+        .type_parameters
+        .iter()
+        .map(|parameter| inferred.get(&parameter.id).cloned())
+        .collect::<Option<Vec<_>>>()?;
+    Some(NominalType {
+        class: declaration.id,
+        arguments,
+    })
 }
 
 const fn visibility_rank(visibility: thp_syntax::Visibility) -> u8 {
@@ -963,7 +1453,7 @@ fn verify_user_method(
     if !method.static_method {
         let receiver = parameters.next().expect("receiver count was checked");
         let declaring = &program.classes[method.declaring_class.0 as usize];
-        if function.local_types[receiver.0 as usize] != Type::Object(declaring.name.clone()) {
+        if function.local_types[receiver.0 as usize] != declaration_bytecode_type(declaring) {
             return Err(global_error(format!(
                 "method {} has an incompatible receiver",
                 method.name
@@ -1043,6 +1533,12 @@ fn verify_function(program: &Program, function: &Function) -> Result<(), Verific
                     return Err(function_error(
                         function.id,
                         "catch class is not a Throwable subtype",
+                    ));
+                }
+                if !class.type_parameters.is_empty() {
+                    return Err(function_error(
+                        function.id,
+                        "generic catch classes are not supported",
                     ));
                 }
                 if function.local_types[clause.local.0 as usize] != Type::Object(class.name.clone())
@@ -1359,10 +1855,12 @@ fn verify_instruction(
                     let Some(receiver) = arguments.first() else {
                         return Err(error("receiver-derived direct method call has no receiver"));
                     };
-                    if !matches!(
-                        function.register_types[receiver.0 as usize],
-                        Type::Object(_)
-                    ) {
+                    if encoded_nominal_lookup_type(
+                        program,
+                        &function.register_types[receiver.0 as usize],
+                    )
+                    .is_none()
+                    {
                         return Err(error(
                             "receiver-derived called class requires an object receiver",
                         ));
@@ -1374,6 +1872,26 @@ fn verify_instruction(
             else {
                 return Err(error("direct method call violates member visibility"));
             };
+            let mut method = method.clone();
+            let declaration = &program.classes[method.declaring_class.0 as usize];
+            let instantiated = if method.static_method {
+                infer_descriptor_instantiation(
+                    &method,
+                    arguments,
+                    instruction.ty.as_ref(),
+                    function,
+                    declaration,
+                )
+            } else {
+                arguments.first().and_then(|receiver| {
+                    instantiation_for_class(
+                        program,
+                        &function.register_types[receiver.0 as usize],
+                        method.declaring_class,
+                    )
+                })
+            };
+            method = instantiate_descriptor_method(&method, instantiated.as_ref(), declaration);
             let signature_arguments = if method.static_method {
                 arguments.as_slice()
             } else {
@@ -1383,7 +1901,7 @@ fn verify_instruction(
             };
             verify_method_signature(
                 program,
-                method,
+                &method,
                 signature_arguments,
                 instruction.ty.as_ref(),
                 function,
@@ -1407,7 +1925,11 @@ fn verify_instruction(
             for argument in arguments {
                 check_register(function, *argument, block, Some(index))?;
             }
-            let Type::Object(class_name) = &function.register_types[receiver.0 as usize] else {
+            let receiver_type = &function.register_types[receiver.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("virtual method receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("virtual method receiver is not an object"));
             };
             let class = class_by_name(program, class_name)
@@ -1420,15 +1942,20 @@ fn verify_instruction(
             if method.static_method {
                 return Err(error("virtual instance call targets a static method"));
             }
+            let instantiated = NominalType {
+                class: class.id,
+                arguments: receiver_arguments.to_vec(),
+            };
+            let method = instantiate_descriptor_method(method, Some(&instantiated), class);
             verify_method_signature(
                 program,
-                method,
+                &method,
                 arguments,
                 instruction.ty.as_ref(),
                 function,
             )
             .map_err(|message| error(&message))?;
-            if !member_accessible(program, function.owner, method) {
+            if !member_accessible(program, function.owner, &method) {
                 return Err(error("virtual method call violates member visibility"));
             }
         }
@@ -1476,19 +2003,29 @@ fn verify_instruction(
             if class.kind != NominalKind::Class || class.abstract_class {
                 return Err(error("only a concrete class can be allocated"));
             }
-            if instruction.ty.as_ref() != Some(&Type::Object(class.name.clone())) {
+            if instruction
+                .ty
+                .as_ref()
+                .and_then(encoded_nominal_parts)
+                .map(|(name, _)| name)
+                != Some(class.name.as_str())
+            {
                 return Err(error("allocated object type does not match its class"));
             }
         }
         InstructionKind::GetProperty { object, property } => {
             check_register(function, *object, block, Some(index))?;
-            let Type::Object(class_name) = &function.register_types[object.0 as usize] else {
+            let receiver_type = &function.register_types[object.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("property receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("property receiver is not an object"));
             };
             let Some(class) = program
                 .classes
                 .iter()
-                .find(|class| &class.name == class_name)
+                .find(|class| class.name == class_name)
             else {
                 return Err(error("property receiver class is unavailable"));
             };
@@ -1498,7 +2035,15 @@ fn verify_instruction(
             if !property_accessible(program, function.owner, property) {
                 return Err(error("property load violates member visibility"));
             }
-            if instruction.ty.as_ref() != Some(&property.ty) {
+            let property_type = substitute_descriptor_type(
+                &property.ty,
+                Some(&NominalType {
+                    class: class.id,
+                    arguments: receiver_arguments.to_vec(),
+                }),
+                class,
+            );
+            if instruction.ty.as_ref() != Some(&property_type) {
                 return Err(error("loaded property type does not match result type"));
             }
         }
@@ -1509,13 +2054,17 @@ fn verify_instruction(
         } => {
             check_register(function, *object, block, Some(index))?;
             check_register(function, *value, block, Some(index))?;
-            let Type::Object(class_name) = &function.register_types[object.0 as usize] else {
+            let receiver_type = &function.register_types[object.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("property receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("property receiver is not an object"));
             };
             let Some(class) = program
                 .classes
                 .iter()
-                .find(|class| &class.name == class_name)
+                .find(|class| class.name == class_name)
             else {
                 return Err(error("property receiver class is unavailable"));
             };
@@ -1527,7 +2076,14 @@ fn verify_instruction(
             }
             if !type_accepts(
                 program,
-                &property.ty,
+                &substitute_descriptor_type(
+                    &property.ty,
+                    Some(&NominalType {
+                        class: class.id,
+                        arguments: receiver_arguments.to_vec(),
+                    }),
+                    class,
+                ),
                 &function.register_types[value.0 as usize],
             ) {
                 return Err(error("stored property type does not match property type"));
@@ -1543,7 +2099,11 @@ fn verify_instruction(
         } => {
             check_register(function, *object, block, Some(index))?;
             check_register(function, *value, block, Some(index))?;
-            let Type::Object(class_name) = &function.register_types[object.0 as usize] else {
+            let receiver_type = &function.register_types[object.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("property initializer receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("property initializer receiver is not an object"));
             };
             let class = class_by_name(program, class_name)
@@ -1568,7 +2128,14 @@ fn verify_instruction(
                 .ok_or_else(|| error("initialized property is out of bounds"))?;
             if !type_accepts(
                 program,
-                &property.ty,
+                &substitute_descriptor_type(
+                    &property.ty,
+                    Some(&NominalType {
+                        class: class.id,
+                        arguments: receiver_arguments.to_vec(),
+                    }),
+                    class,
+                ),
                 &function.register_types[value.0 as usize],
             ) {
                 return Err(error("initialized value type does not match property type"));
@@ -1681,6 +2248,13 @@ fn verify_callee_call(
             if arguments.len() != target.parameters.len() {
                 return Err("call argument count does not match function signature".to_owned());
             }
+            let generic_owner = target
+                .owner
+                .and_then(|owner| program.classes.get(owner.0 as usize))
+                .is_some_and(|owner| !owner.type_parameters.is_empty());
+            if generic_owner {
+                return Ok(());
+            }
             for (argument, parameter) in arguments.iter().zip(&target.parameters) {
                 if !type_accepts(
                     program,
@@ -1782,8 +2356,13 @@ fn direct_method<'program>(
                     .owner
                     .is_some_and(|owner| is_instance_of_id(program, owner, method.declaring_class)),
                 CalledClass::Receiver => arguments.first().is_some_and(|receiver| {
-                    let Type::Object(name) = &calling_function.register_types[receiver.0 as usize]
-                    else {
+                    let Some(lookup_type) = encoded_nominal_lookup_type(
+                        program,
+                        &calling_function.register_types[receiver.0 as usize],
+                    ) else {
+                        return false;
+                    };
+                    let Some((name, _)) = encoded_nominal_parts(&lookup_type) else {
                         return false;
                     };
                     class_by_name(program, name).is_some_and(|class| {
@@ -1798,8 +2377,13 @@ fn direct_method<'program>(
                 return called_class != CalledClass::Receiver;
             }
             arguments.first().is_some_and(|receiver| {
-                let Type::Object(name) = &calling_function.register_types[receiver.0 as usize]
-                else {
+                let Some(lookup_type) = encoded_nominal_lookup_type(
+                    program,
+                    &calling_function.register_types[receiver.0 as usize],
+                ) else {
+                    return false;
+                };
+                let Some((name, _)) = encoded_nominal_parts(&lookup_type) else {
                     return false;
                 };
                 class_by_name(program, name).is_some_and(|class| {
@@ -2150,6 +2734,12 @@ fn type_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
     expected == &Type::Mixed
         || actual == &Type::Never
         || expected == actual
+        || matches!(actual, Type::Parameter { id, .. } if program
+            .classes
+            .get(id.owner.0 as usize)
+            .and_then(|class| class.type_parameters.get(id.index as usize))
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| type_accepts(program, expected, bound)))
         || matches!(
             actual,
             Type::Union(members)
@@ -2164,11 +2754,52 @@ fn type_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
                     .iter()
                     .any(|member| type_accepts(program, member, actual))
         )
-        || matches!(
-            (expected, actual),
-            (Type::Object(expected), Type::Object(actual))
-                if is_instance_of_name(program, actual, expected)
-        )
+        || encoded_nominal_accepts(program, expected, actual)
+}
+
+fn encoded_nominal_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
+    let Some((expected_name, expected_arguments)) = encoded_nominal_parts(expected) else {
+        return false;
+    };
+    let Some((actual_name, actual_arguments)) = encoded_nominal_parts(actual) else {
+        return false;
+    };
+    if expected_name == actual_name {
+        return expected_arguments == actual_arguments;
+    }
+    let Some(actual_class) = class_by_name(program, actual_name) else {
+        return false;
+    };
+    let instantiated = NominalType {
+        class: actual_class.id,
+        arguments: actual_arguments.to_vec(),
+    };
+    actual_class
+        .parent_type
+        .iter()
+        .chain(&actual_class.interface_types)
+        .map(|edge| NominalType {
+            class: edge.class,
+            arguments: edge
+                .arguments
+                .iter()
+                .map(|argument| {
+                    substitute_descriptor_type(argument, Some(&instantiated), actual_class)
+                })
+                .collect(),
+        })
+        .any(|edge| {
+            let edge_class = &program.classes[edge.class.0 as usize];
+            let edge_type = if edge.arguments.is_empty() {
+                Type::Object(edge_class.name.clone())
+            } else {
+                Type::Nominal {
+                    name: edge_class.name.clone(),
+                    arguments: edge.arguments,
+                }
+            };
+            encoded_nominal_accepts(program, expected, &edge_type)
+        })
 }
 
 fn is_instance_of_name(program: &Program, actual: &str, expected: &str) -> bool {
@@ -2377,6 +3008,87 @@ $box = new Box("\x00\xff");
         let decoded = decode(&encode(&program)).unwrap();
         verify(&decoded).unwrap();
         assert!(decoded.classes.iter().any(|class| class.name == "Box"));
+    }
+
+    #[test]
+    fn generic_descriptors_round_trip_and_reject_forged_metadata() {
+        let program = compile(
+            r#"<?thp
+interface Value<T> { public function value(): T; }
+interface Root<T> {}
+interface Child<T> extends Root<T> {}
+class Box<T> implements Value<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+class Marker<T> implements Child<T> {}
+$value: Value<int> = new Box(42);
+echo $value->value() . "";
+"#,
+        );
+        let decoded = decode(&encode(&program)).unwrap();
+        verify(&decoded).unwrap();
+        let box_class = decoded
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        assert_eq!(box_class.type_parameters.len(), 1);
+        assert_eq!(box_class.interface_types[0].arguments.len(), 1);
+
+        let mut invalid_parameter = decoded.clone();
+        let box_class = invalid_parameter
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        box_class.type_parameters[0].id.index = 99;
+        assert!(
+            verify(&invalid_parameter)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed type-parameter identity")
+        );
+
+        let mut invalid_closure = decoded.clone();
+        let root = invalid_closure
+            .classes
+            .iter()
+            .find(|class| class.name == "Root")
+            .unwrap()
+            .id;
+        let marker = invalid_closure
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Marker")
+            .unwrap();
+        marker
+            .interface_types
+            .iter_mut()
+            .find(|interface| interface.class == root)
+            .unwrap()
+            .arguments[0] = thp_hir::Type::String;
+        assert!(
+            verify(&invalid_closure)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete or conflicting instantiated interface closure")
+        );
+
+        let mut invalid_arity = decoded;
+        let box_class = invalid_arity
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        box_class.interface_types[0].arguments.clear();
+        assert!(
+            verify(&invalid_arity)
+                .unwrap_err()
+                .to_string()
+                .contains("incorrect argument arity")
+        );
     }
 
     #[test]

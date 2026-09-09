@@ -189,10 +189,11 @@ pub struct FunctionDecl {
 pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
+    pub type_parameters: Vec<TypeParameterDecl>,
     pub abstract_class: bool,
     pub final_class: bool,
-    pub parent: Option<NameRef>,
-    pub interfaces: Vec<NameRef>,
+    pub parent: Option<NominalRef>,
+    pub interfaces: Vec<NominalRef>,
     pub trait_uses: Vec<TraitUse>,
     pub properties: Vec<PropertyDecl>,
     pub methods: Vec<MethodDecl>,
@@ -202,8 +203,24 @@ pub struct ClassDecl {
 pub struct InterfaceDecl {
     pub name: String,
     pub name_span: Span,
-    pub parent: Option<NameRef>,
+    pub type_parameters: Vec<TypeParameterDecl>,
+    pub parent: Option<NominalRef>,
     pub methods: Vec<MethodDecl>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeParameterDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub bound: Option<TypeSyntax>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NominalRef {
+    pub name: String,
+    pub arguments: Vec<TypeSyntax>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -336,6 +353,7 @@ pub enum ExprKind {
     New {
         class_name: String,
         class_span: Span,
+        type_arguments: Vec<TypeSyntax>,
         arguments: Vec<Argument>,
     },
     Property {
@@ -373,9 +391,12 @@ pub enum ExprKind {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScopeTarget {
-    Named(String),
+    Named {
+        name: String,
+        type_arguments: Vec<TypeSyntax>,
+    },
     SelfType,
     Parent,
     Static,

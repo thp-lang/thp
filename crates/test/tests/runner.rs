@@ -13,8 +13,8 @@ fn repository_phpt_specifications_pass_through_the_runner() {
     let summary = Runner::default()
         .run_paths([root.join("resources"), root.join("language")])
         .expect("run fixtures");
-    assert_eq!(summary.tests, 39);
-    assert_eq!(summary.passed, 39);
+    assert_eq!(summary.tests, 44);
+    assert_eq!(summary.passed, 44);
     assert!(summary.is_success());
 }
 

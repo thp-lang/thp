@@ -52,6 +52,13 @@ syntax, and precedence-shaped expressions. A qualified name is still syntax at
 this point. A type such as `vector<User>` records its written name and type
 arguments rather than a resolved semantic type.
 
+Class and interface declarations retain each type-parameter name, optional
+bound, and source span. Parent classes, parent interfaces, implemented
+interfaces, explicit `new Box<int>()`, and `Box<int>::make()` targets use
+spanned nominal references with their written arguments. The parser keeps
+`instanceof Box` as a bare erased runtime target and rejects
+`instanceof Box<int>` before semantic analysis.
+
 The parser uses precedence parsing for expressions and targeted routines for
 declarations and statements. When it encounters malformed input, it emits a
 structured diagnostic and synchronizes at a safe token such as a semicolon or

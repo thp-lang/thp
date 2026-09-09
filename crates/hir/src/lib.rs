@@ -8,9 +8,23 @@ use std::fmt;
 use thp_diagnostics::{Diagnostic, Span};
 use thp_syntax::{
     Argument, BinaryOp, Block, Expr, ExprKind, ForClause, ForClauseKind, FunctionDecl, MatchArm,
-    MethodDecl, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitUse, TypeSyntax,
-    TypeSyntaxKind, UnaryOp, Visibility,
+    MethodDecl, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitUse,
+    TypeParameterDecl as SyntaxTypeParameter, TypeSyntax, TypeSyntaxKind, UnaryOp, Visibility,
 };
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TypeParameterId {
+    pub owner: ClassId,
+    pub index: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TypeParameter {
+    pub id: TypeParameterId,
+    pub name: String,
+    pub bound: Option<Type>,
+    pub span: Span,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Type {
@@ -26,6 +40,8 @@ pub enum Type {
     Map(Box<Type>, Box<Type>),
     Union(Vec<Type>),
     Object(String),
+    Nominal { name: String, arguments: Vec<Type> },
+    Parameter { id: TypeParameterId, name: String },
 }
 
 impl Type {
@@ -35,10 +51,15 @@ impl Type {
             Self::Float => Representation::F64,
             Self::Bool => Representation::Bool,
             Self::String => Representation::Bytes,
-            Self::Vector(_) | Self::Map(_, _) | Self::Object(_) => Representation::Reference,
-            Self::Null | Self::Void | Self::Never | Self::Mixed | Self::Union(_) => {
-                Representation::Value
+            Self::Vector(_) | Self::Map(_, _) | Self::Object(_) | Self::Nominal { .. } => {
+                Representation::Reference
             }
+            Self::Null
+            | Self::Void
+            | Self::Never
+            | Self::Mixed
+            | Self::Union(_)
+            | Self::Parameter { .. } => Representation::Value,
         }
     }
 
@@ -93,7 +114,17 @@ impl fmt::Display for Type {
             Self::Mixed => formatter.write_str("mixed"),
             Self::Vector(element) => write!(formatter, "vector<{element}>"),
             Self::Map(key, value) => write!(formatter, "map<{key}, {value}>"),
-            Self::Object(name) => formatter.write_str(name),
+            Self::Object(name) | Self::Parameter { name, .. } => formatter.write_str(name),
+            Self::Nominal { name, arguments } => {
+                write!(formatter, "{name}<")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{argument}")?;
+                }
+                formatter.write_str(">")
+            }
             Self::Union(members) => {
                 for (index, member) in members.iter().enumerate() {
                     if index > 0 {
@@ -185,8 +216,11 @@ pub struct Class {
     pub kind: NominalKind,
     pub abstract_class: bool,
     pub final_class: bool,
+    pub type_parameters: Vec<TypeParameter>,
     pub parent: Option<String>,
+    pub parent_type: Option<Type>,
     pub interfaces: Vec<String>,
+    pub interface_types: Vec<Type>,
     pub properties: Vec<Property>,
     pub methods: Vec<Method>,
     pub method_slots: Vec<MethodSlot>,
@@ -507,8 +541,14 @@ struct ClassSignature {
     kind: NominalKind,
     abstract_class: bool,
     final_class: bool,
+    type_parameters: Vec<TypeParameter>,
+    type_parameter_syntax: Vec<SyntaxTypeParameter>,
     parent: Option<String>,
+    parent_syntax: Option<NominalRef>,
+    parent_type: Option<Type>,
     interfaces: Vec<String>,
+    interface_syntax: Vec<NominalRef>,
+    interface_types: Vec<Type>,
     trait_uses: Vec<TraitUse>,
     declared_properties: Vec<Property>,
     declared_property_initializers: Vec<Option<Expr>>,
@@ -675,8 +715,11 @@ impl TypeChecker {
                 kind: class.kind,
                 abstract_class: class.abstract_class,
                 final_class: class.final_class,
+                type_parameters: class.type_parameters,
                 parent: class.parent,
+                parent_type: class.parent_type,
                 interfaces: class.interfaces,
+                interface_types: class.interface_types,
                 properties: class.properties,
                 methods: class
                     .methods
@@ -726,50 +769,52 @@ impl TypeChecker {
 
     fn collect_nominal_names(&mut self, program: &Program) {
         for statement in &program.statements {
-            let (name, name_span, kind, abstract_class, final_class, parent, interfaces, uses) =
-                match &statement.kind {
-                    StmtKind::Class(declaration) => (
-                        &declaration.name,
-                        declaration.name_span,
-                        NominalKind::Class,
-                        declaration.abstract_class,
-                        declaration.final_class,
-                        declaration
-                            .parent
-                            .as_ref()
-                            .map(|parent| parent.name.clone()),
-                        declaration
-                            .interfaces
-                            .iter()
-                            .map(|interface| interface.name.clone())
-                            .collect(),
-                        declaration.trait_uses.clone(),
-                    ),
-                    StmtKind::Interface(declaration) => (
-                        &declaration.name,
-                        declaration.name_span,
-                        NominalKind::Interface,
-                        true,
-                        false,
-                        declaration
-                            .parent
-                            .as_ref()
-                            .map(|parent| parent.name.clone()),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                    StmtKind::Trait(declaration) => (
-                        &declaration.name,
-                        declaration.name_span,
-                        NominalKind::Trait,
-                        true,
-                        false,
-                        None,
-                        Vec::new(),
-                        declaration.trait_uses.clone(),
-                    ),
-                    _ => continue,
-                };
+            let (
+                name,
+                name_span,
+                kind,
+                abstract_class,
+                final_class,
+                type_parameter_syntax,
+                parent_syntax,
+                interface_syntax,
+                uses,
+            ) = match &statement.kind {
+                StmtKind::Class(declaration) => (
+                    &declaration.name,
+                    declaration.name_span,
+                    NominalKind::Class,
+                    declaration.abstract_class,
+                    declaration.final_class,
+                    declaration.type_parameters.clone(),
+                    declaration.parent.clone(),
+                    declaration.interfaces.clone(),
+                    declaration.trait_uses.clone(),
+                ),
+                StmtKind::Interface(declaration) => (
+                    &declaration.name,
+                    declaration.name_span,
+                    NominalKind::Interface,
+                    true,
+                    false,
+                    declaration.type_parameters.clone(),
+                    declaration.parent.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                StmtKind::Trait(declaration) => (
+                    &declaration.name,
+                    declaration.name_span,
+                    NominalKind::Trait,
+                    true,
+                    false,
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    declaration.trait_uses.clone(),
+                ),
+                _ => continue,
+            };
             if let Some(previous) = self.classes.get(name) {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -785,6 +830,45 @@ impl TypeChecker {
             let id = ClassId(
                 u32::try_from(self.classes.len()).expect("class count is limited to u32::MAX"),
             );
+            let mut seen_parameters = BTreeMap::new();
+            let type_parameters = type_parameter_syntax
+                .iter()
+                .enumerate()
+                .filter_map(|(index, parameter)| {
+                    if let Some(previous) =
+                        seen_parameters.insert(&parameter.name, parameter.name_span)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "name_resolution",
+                                "N0010",
+                                parameter.name_span,
+                                format!(
+                                    "type parameter `{}` is declared more than once",
+                                    parameter.name
+                                ),
+                            )
+                            .with_label(previous, "first parameter is here"),
+                        );
+                        return None;
+                    }
+                    Some(TypeParameter {
+                        id: TypeParameterId {
+                            owner: id,
+                            index: u32::try_from(index)
+                                .expect("type parameter count is limited to u32::MAX"),
+                        },
+                        name: parameter.name.clone(),
+                        bound: None,
+                        span: parameter.span,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let parent = parent_syntax.as_ref().map(|parent| parent.name.clone());
+            let interfaces = interface_syntax
+                .iter()
+                .map(|interface| interface.name.clone())
+                .collect();
             self.classes.insert(
                 name.clone(),
                 ClassSignature {
@@ -793,8 +877,14 @@ impl TypeChecker {
                     kind,
                     abstract_class,
                     final_class,
+                    type_parameters,
+                    type_parameter_syntax,
                     parent,
+                    parent_syntax,
+                    parent_type: None,
                     interfaces,
+                    interface_syntax,
+                    interface_types: Vec::new(),
                     trait_uses: uses,
                     declared_properties: Vec::new(),
                     declared_property_initializers: Vec::new(),
@@ -890,6 +980,87 @@ impl TypeChecker {
     }
 
     fn collect_signatures(&mut self, program: &Program) {
+        let nominal_names = self.classes.keys().cloned().collect::<Vec<_>>();
+        for name in &nominal_names {
+            let Some(snapshot) = self.classes.get(name).cloned() else {
+                continue;
+            };
+            if snapshot.native {
+                continue;
+            }
+            let environment = type_parameter_environment(&snapshot.type_parameters);
+            let mut parameters = snapshot.type_parameters.clone();
+            for (parameter, syntax) in parameters.iter_mut().zip(&snapshot.type_parameter_syntax) {
+                let Some(bound_syntax) = &syntax.bound else {
+                    continue;
+                };
+                let bound = resolve_type_with_bound_check(
+                    bound_syntax,
+                    &self.classes,
+                    &environment,
+                    &mut self.diagnostics,
+                    false,
+                );
+                if let Some(bound) = bound {
+                    if matches!(bound, Type::Object(_) | Type::Nominal { .. }) {
+                        parameter.bound = Some(bound);
+                    } else {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1010",
+                            bound_syntax.span,
+                            "a type-parameter bound must name a class or interface",
+                        ));
+                    }
+                }
+            }
+            self.classes
+                .get_mut(name)
+                .expect("nominal exists")
+                .type_parameters = parameters;
+        }
+        for name in nominal_names {
+            let Some(snapshot) = self.classes.get(&name).cloned() else {
+                continue;
+            };
+            if snapshot.native {
+                continue;
+            }
+            for (parameter, syntax) in snapshot
+                .type_parameters
+                .iter()
+                .zip(&snapshot.type_parameter_syntax)
+            {
+                if let (Some(bound), Some(bound_syntax)) = (&parameter.bound, &syntax.bound) {
+                    validate_type_argument_bounds(
+                        bound,
+                        bound_syntax.span,
+                        &self.classes,
+                        &mut self.diagnostics,
+                    );
+                }
+            }
+            let environment = type_parameter_environment(&snapshot.type_parameters);
+            let parent_type = snapshot.parent_syntax.as_ref().and_then(|parent| {
+                resolve_nominal_ref(parent, &self.classes, &environment, &mut self.diagnostics)
+            });
+            let interface_types = snapshot
+                .interface_syntax
+                .iter()
+                .filter_map(|interface| {
+                    resolve_nominal_ref(
+                        interface,
+                        &self.classes,
+                        &environment,
+                        &mut self.diagnostics,
+                    )
+                })
+                .collect();
+            let class = self.classes.get_mut(&name).expect("nominal exists");
+            class.parent_type = parent_type;
+            class.interface_types = interface_types;
+        }
+        let empty_parameters = BTreeMap::new();
         for statement in &program.statements {
             let StmtKind::Function(declaration) = &statement.kind else {
                 continue;
@@ -906,10 +1077,16 @@ impl TypeChecker {
                 );
                 continue;
             }
-            let parameters = resolve_parameters(declaration, &self.classes, &mut self.diagnostics);
+            let parameters = resolve_parameters(
+                declaration,
+                &self.classes,
+                &empty_parameters,
+                &mut self.diagnostics,
+            );
             let return_type = resolve_type(
                 &declaration.return_type,
                 &self.classes,
+                &empty_parameters,
                 &mut self.diagnostics,
             )
             .unwrap_or(Type::Mixed);
@@ -952,6 +1129,7 @@ impl TypeChecker {
             let Some(existing) = self.classes.get(name).cloned() else {
                 continue;
             };
+            let type_parameters = type_parameter_environment(&existing.type_parameters);
             if existing.span != statement.span {
                 continue;
             }
@@ -972,8 +1150,13 @@ impl TypeChecker {
                     continue;
                 }
                 property_names.insert(property.name.clone(), property.name_span);
-                let ty = resolve_type(&property.ty, &self.classes, &mut self.diagnostics)
-                    .unwrap_or(Type::Mixed);
+                let ty = resolve_type(
+                    &property.ty,
+                    &self.classes,
+                    &type_parameters,
+                    &mut self.diagnostics,
+                )
+                .unwrap_or(Type::Mixed);
                 properties.push(Property {
                     id: PropertyId(
                         u32::try_from(properties.len())
@@ -1005,11 +1188,16 @@ impl TypeChecker {
                     );
                     continue;
                 }
-                let parameters =
-                    resolve_parameters(&method.function, &self.classes, &mut self.diagnostics);
+                let parameters = resolve_parameters(
+                    &method.function,
+                    &self.classes,
+                    &type_parameters,
+                    &mut self.diagnostics,
+                );
                 let return_type = resolve_type(
                     &method.function.return_type,
                     &self.classes,
+                    &type_parameters,
                     &mut self.diagnostics,
                 )
                 .unwrap_or(Type::Mixed);
@@ -1188,6 +1376,21 @@ impl TypeChecker {
             properties.clone_from(&parent.properties);
             initializers.clone_from(&parent.property_initializers);
             methods = parent.methods.clone();
+            let parent_type = current
+                .parent_type
+                .clone()
+                .unwrap_or_else(|| Type::Object(parent_name.clone()));
+            for property in &mut properties {
+                property.ty = instantiate_member_type(
+                    &parent_type,
+                    property.declaring_class,
+                    &property.ty,
+                    &self.classes,
+                );
+            }
+            for method in methods.values_mut() {
+                instantiate_method_signature(method, &parent_type, &self.classes);
+            }
             if current.kind == NominalKind::Class {
                 interfaces.extend(parent.interfaces.clone());
             } else if current.kind == NominalKind::Interface {
@@ -1275,7 +1478,14 @@ impl TypeChecker {
                 };
                 interfaces.push(interface.name.clone());
                 interfaces.extend(interface.interfaces.clone());
-                for (method_name, requirement) in interface.methods {
+                let interface_type = current
+                    .interface_types
+                    .iter()
+                    .find(|ty| nominal_parts(ty).is_some_and(|(name, _)| name == interface_name))
+                    .cloned()
+                    .unwrap_or_else(|| Type::Object(interface_name.clone()));
+                for (method_name, mut requirement) in interface.methods {
+                    instantiate_method_signature(&mut requirement, &interface_type, &self.classes);
                     if let Some(existing) = methods.get(&method_name) {
                         if !method_contract_equal(existing, &requirement)
                             || existing.visibility != Visibility::Public
@@ -1317,8 +1527,52 @@ impl TypeChecker {
             }
         }
 
-        interfaces.sort();
-        interfaces.dedup();
+        let interface_types = instantiated_interface_closure(&current, &self.classes);
+        let mut canonical_interfaces = BTreeMap::<String, Type>::new();
+        for interface_type in interface_types {
+            let Some((interface_name, _)) = nominal_parts(&interface_type) else {
+                continue;
+            };
+            if let Some(previous) = canonical_interfaces.get(interface_name) {
+                if previous != &interface_type {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1012",
+                        current.span,
+                        format!(
+                            "hierarchy reaches interface `{interface_name}` with conflicting arguments `{previous}` and `{interface_type}`"
+                        ),
+                    ));
+                }
+            } else {
+                canonical_interfaces.insert(interface_name.to_owned(), interface_type);
+            }
+        }
+        if current.kind == NominalKind::Class && !current.abstract_class {
+            let has_traversable = canonical_interfaces.contains_key("Traversable");
+            let has_iterator = canonical_interfaces.contains_key("Iterator");
+            let has_aggregate = canonical_interfaces.contains_key("IteratorAggregate");
+            let directly_traversable = current.interface_types.iter().any(|interface| {
+                nominal_parts(interface).is_some_and(|(name, _)| name == "Traversable")
+            });
+            if directly_traversable || (has_traversable && !has_iterator && !has_aggregate) {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1013",
+                    current.span,
+                    "a concrete class cannot implement `Traversable<K, V>` directly; implement `Iterator<K, V>` or `IteratorAggregate<K, V>`",
+                ));
+            }
+            if has_iterator && has_aggregate {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1014",
+                    current.span,
+                    "a concrete class cannot implement both iterator strategies",
+                ));
+            }
+        }
+        interfaces = canonical_interfaces.keys().cloned().collect();
         if interfaces.iter().any(|interface| interface == "Throwable") {
             let allowed = match current.kind {
                 NominalKind::Interface => current.name == "Throwable",
@@ -1337,6 +1591,14 @@ impl TypeChecker {
                     "T0014",
                     current.span,
                     "`Throwable` is sealed; only `Exception`, `Error`, and their descendants are throwable",
+                ));
+            }
+            if !current.type_parameters.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1015",
+                    current.span,
+                    "generic throwable classes and interfaces are not supported",
                 ));
             }
         }
@@ -1367,6 +1629,7 @@ impl TypeChecker {
         class.property_initializers = initializers;
         class.methods = methods;
         class.interfaces = interfaces;
+        class.interface_types = canonical_interfaces.into_values().collect();
         class.constructor = constructor;
         class.linked = true;
         stack.pop();
@@ -1712,6 +1975,7 @@ struct FunctionChecker<'signatures, 'diagnostics> {
     loop_depth: usize,
     owner: Option<ClassId>,
     static_method: bool,
+    type_parameters: BTreeMap<String, Type>,
 }
 
 impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
@@ -1727,6 +1991,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         owner: Option<ClassId>,
         static_method: bool,
     ) -> Self {
+        let type_parameters = owner
+            .and_then(|owner| classes.values().find(|class| class.id == owner))
+            .map_or_else(BTreeMap::new, |class| {
+                type_parameter_environment(&class.type_parameters)
+            });
         Self {
             signatures,
             classes,
@@ -1741,16 +2010,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             loop_depth: 0,
             owner,
             static_method,
+            type_parameters,
         }
     }
 
     fn declare_receiver(&mut self, class: &ClassSignature) {
-        let id = self.add_local(
-            "this".to_owned(),
-            Type::Object(class.name.clone()),
-            class.span,
-            true,
-        );
+        let id = self.add_local("this".to_owned(), declaration_type(class), class.span, true);
         self.parameters.push(id);
     }
 
@@ -1836,9 +2101,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 annotation,
                 value,
             } => {
-                let annotated = annotation
-                    .as_ref()
-                    .and_then(|syntax| resolve_type(syntax, self.classes, self.diagnostics));
+                let annotated = annotation.as_ref().and_then(|syntax| {
+                    resolve_type(
+                        syntax,
+                        self.classes,
+                        &self.type_parameters,
+                        self.diagnostics,
+                    )
+                });
                 if let Some(id) = self.names.get(name).copied() {
                     if annotation.is_some() {
                         self.diagnostics.push(Diagnostic::error(
@@ -2105,6 +2375,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
+                        if !class.type_parameters.is_empty() {
+                            self.diagnostics.push(Diagnostic::error(
+                                "typing",
+                                "T1016",
+                                clause.class_span,
+                                "generic catch targets are not supported",
+                            ));
+                        }
                         if !is_nominal_subtype(self.classes, &class.name, "Throwable") {
                             self.diagnostics.push(Diagnostic::error(
                                 "typing",
@@ -2171,7 +2449,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 body,
             } => {
                 let value = self.lower_expression(value, None)?;
-                let Type::Object(class_name) = &value.ty else {
+                let Some(lookup_type) = nominal_lookup_type(&value.ty, self.classes) else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0601",
@@ -2180,6 +2458,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                let (class_name, _) = nominal_parts(&lookup_type).expect("lookup type is nominal");
                 if !is_nominal_subtype(self.classes, class_name, "Closeable") {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
@@ -2246,9 +2525,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 annotation,
                 value,
             } => {
-                let annotated = annotation
-                    .as_ref()
-                    .and_then(|syntax| resolve_type(syntax, self.classes, self.diagnostics));
+                let annotated = annotation.as_ref().and_then(|syntax| {
+                    resolve_type(
+                        syntax,
+                        self.classes,
+                        &self.type_parameters,
+                        self.diagnostics,
+                    )
+                });
                 let local = if let Some(local) = self.names.get(name).copied() {
                     if annotation.is_some() {
                         self.diagnostics.push(Diagnostic::error(
@@ -2581,6 +2865,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             ExprKind::New {
                 class_name,
                 class_span,
+                type_arguments,
                 arguments,
             } => {
                 let Some(class) = self.classes.get(class_name).cloned() else {
@@ -2621,6 +2906,35 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 }
+                let instance_type = if class.type_parameters.is_empty() {
+                    if !type_arguments.is_empty() {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1002",
+                            *class_span,
+                            format!(
+                                "type `{class_name}` expects 0 generic arguments, found {}",
+                                type_arguments.len()
+                            ),
+                        ));
+                    }
+                    Type::Object(class.name.clone())
+                } else if type_arguments.is_empty() {
+                    self.infer_construction_type(&class, arguments, expression.span)?
+                } else {
+                    resolve_type(
+                        &TypeSyntax {
+                            kind: TypeSyntaxKind::Named {
+                                name: class_name.clone(),
+                                arguments: type_arguments.clone(),
+                            },
+                            span: *class_span,
+                        },
+                        self.classes,
+                        &self.type_parameters,
+                        self.diagnostics,
+                    )?
+                };
                 let constructor = class.constructor;
                 let initializers = class
                     .properties
@@ -2628,16 +2942,24 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     .zip(&class.property_initializers)
                     .filter_map(|(property, initializer)| {
                         let initializer = initializer.as_ref()?;
-                        let value = self.lower_expression(initializer, Some(&property.ty))?;
-                        self.expect_type(&property.ty, &value.ty, value.span);
+                        let property_type = instantiate_member_type(
+                            &instance_type,
+                            property.declaring_class,
+                            &property.ty,
+                            self.classes,
+                        );
+                        let value = self.lower_expression(initializer, Some(&property_type))?;
+                        self.expect_type(&property_type, &value.ty, value.span);
                         Some((property.id, value))
                     })
                     .collect();
                 let arguments = if constructor.is_some() {
-                    let method = class
+                    let mut method = class
                         .methods
                         .get("__construct")
-                        .expect("constructor id has a method signature");
+                        .expect("constructor id has a method signature")
+                        .clone();
+                    instantiate_method_signature(&mut method, &instance_type, self.classes);
                     self.bind_arguments(
                         "__construct",
                         arguments,
@@ -2654,7 +2976,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         initializers,
                         arguments,
                     },
-                    Type::Object(class.name),
+                    instance_type,
                 )
             }
             ExprKind::Property {
@@ -2679,7 +3001,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 arguments,
             } => {
                 let object = self.lower_expression(object, None)?;
-                let Type::Object(class_name) = object.ty.clone() else {
+                let Some(lookup_type) = nominal_lookup_type(&object.ty, self.classes) else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0402",
@@ -2688,6 +3010,9 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                let (class_name, _) =
+                    nominal_parts(&lookup_type).expect("nominal lookup type is nominal");
+                let class_name = class_name.to_owned();
                 let Some(class) = self.classes.get(&class_name) else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
@@ -2697,7 +3022,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
-                let Some(method) = class.methods.get(name).cloned() else {
+                let Some(mut method) = class.methods.get(name).cloned() else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0404",
@@ -2706,6 +3031,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                instantiate_method_signature(&mut method, &lookup_type, self.classes);
                 self.check_member_access(
                     method.declaring_class,
                     method.visibility,
@@ -2759,7 +3085,9 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 name_span,
                 arguments,
             } => {
-                if let ScopeTarget::Named(class_name) = target
+                if let ScopeTarget::Named {
+                    name: class_name, ..
+                } = target
                     && self
                         .classes
                         .get(class_name)
@@ -2768,8 +3096,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 {
                     return self.lower_native_static(class_name, name, arguments, expression.span);
                 }
-                let (class_name, called_class, late_static) = match target {
-                    ScopeTarget::Named(class_name) => {
+                let (class_name, called_class, late_static, call_type) = match target {
+                    ScopeTarget::Named {
+                        name: class_name,
+                        type_arguments,
+                    } => {
                         let Some(class) = self.classes.get(class_name) else {
                             self.diagnostics.push(Diagnostic::error(
                                 "name_resolution",
@@ -2779,7 +3110,50 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (class.name.clone(), CalledClass::Explicit(class.id), false)
+                        let call_type = if class.type_parameters.is_empty() {
+                            if !type_arguments.is_empty() {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "typing",
+                                    "T1002",
+                                    *class_span,
+                                    format!(
+                                        "type `{class_name}` expects 0 generic arguments, found {}",
+                                        type_arguments.len()
+                                    ),
+                                ));
+                            }
+                            Type::Object(class.name.clone())
+                        } else if type_arguments.is_empty() {
+                            self.diagnostics.push(Diagnostic::error(
+                                "typing",
+                                "T1002",
+                                *class_span,
+                                format!(
+                                    "generic class `{class_name}` requires {} explicit arguments for named static access",
+                                    class.type_parameters.len()
+                                ),
+                            ));
+                            declaration_type(class)
+                        } else {
+                            resolve_type(
+                                &TypeSyntax {
+                                    kind: TypeSyntaxKind::Named {
+                                        name: class_name.clone(),
+                                        arguments: type_arguments.clone(),
+                                    },
+                                    span: *class_span,
+                                },
+                                self.classes,
+                                &self.type_parameters,
+                                self.diagnostics,
+                            )?
+                        };
+                        (
+                            class.name.clone(),
+                            CalledClass::Explicit(class.id),
+                            false,
+                            call_type,
+                        )
                     }
                     ScopeTarget::SelfType => {
                         let Some(owner) = self.owner_class() else {
@@ -2791,7 +3165,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (owner.name.clone(), CalledClass::Forwarded, false)
+                        (
+                            owner.name.clone(),
+                            CalledClass::Forwarded,
+                            false,
+                            declaration_type(owner),
+                        )
                     }
                     ScopeTarget::Parent => {
                         let Some(owner) = self.owner_class() else {
@@ -2812,7 +3191,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (parent.clone(), CalledClass::Forwarded, false)
+                        let parent_type = owner
+                            .parent_type
+                            .clone()
+                            .unwrap_or_else(|| Type::Object(parent.clone()));
+                        (parent.clone(), CalledClass::Forwarded, false, parent_type)
                     }
                     ScopeTarget::Static => {
                         let Some(owner) = self.owner_class() else {
@@ -2824,7 +3207,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (owner.name.clone(), CalledClass::Forwarded, true)
+                        (
+                            owner.name.clone(),
+                            CalledClass::Forwarded,
+                            true,
+                            declaration_type(owner),
+                        )
                     }
                 };
                 let Some(class) = self.classes.get(&class_name) else {
@@ -2836,7 +3224,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
-                let Some(method) = class.methods.get(name).cloned() else {
+                let Some(mut method) = class.methods.get(name).cloned() else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0404",
@@ -2845,6 +3233,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                instantiate_method_signature(&mut method, &call_type, self.classes);
                 self.check_member_access(
                     method.declaring_class,
                     method.visibility,
@@ -2883,7 +3272,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         ));
                         return None;
                     };
-                    if matches!(target, ScopeTarget::Named(_))
+                    if matches!(target, ScopeTarget::Named { .. })
                         && self.owner_class().is_some_and(|owner| {
                             !is_nominal_subtype(self.classes, &owner.name, &class_name)
                         })
@@ -3406,13 +3795,131 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         }
     }
 
+    fn infer_construction_type(
+        &mut self,
+        class: &ClassSignature,
+        arguments: &[Argument],
+        span: Span,
+    ) -> Option<Type> {
+        let Some(constructor) = class.methods.get("__construct").cloned() else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "typing",
+                    "T1011",
+                    span,
+                    format!("cannot infer type arguments for `{}`", class.name),
+                )
+                .with_note("provide explicit generic arguments"),
+            );
+            return None;
+        };
+        let parameters = &constructor.signature.parameters;
+        let variadic = parameters.iter().position(|parameter| parameter.variadic);
+        let mut next = 0;
+        let mut occupied = vec![false; parameters.len()];
+        let mut inferred = BTreeMap::<TypeParameterId, Type>::new();
+        let class_parameters = class
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect::<BTreeSet<_>>();
+        let mut conflict = false;
+        for argument in arguments {
+            let target = if let Some(name) = &argument.name {
+                parameters
+                    .iter()
+                    .position(|parameter| parameter.name == *name && !parameter.variadic)
+                    .map(ArgumentTarget::Parameter)
+            } else {
+                while next < parameters.len() && occupied[next] && !parameters[next].variadic {
+                    next += 1;
+                }
+                if next < parameters.len() && !parameters[next].variadic {
+                    let target = ArgumentTarget::Parameter(next);
+                    next += 1;
+                    Some(target)
+                } else {
+                    variadic.map(|_| ArgumentTarget::Variadic)
+                }
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            let pattern = match target {
+                ArgumentTarget::Parameter(index) => {
+                    occupied[index] = true;
+                    &parameters[index].ty
+                }
+                ArgumentTarget::Variadic => {
+                    let Type::Vector(element) = &parameters[variadic.expect("variadic exists")].ty
+                    else {
+                        continue;
+                    };
+                    element
+                }
+            };
+            let Some(value) = self.lower_expression(&argument.value, None) else {
+                continue;
+            };
+            if !unify_inference(pattern, &value.ty, &class_parameters, &mut inferred) {
+                conflict = true;
+            }
+        }
+        let missing = class
+            .type_parameters
+            .iter()
+            .filter(|parameter| !inferred.contains_key(&parameter.id))
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>();
+        if conflict || !missing.is_empty() {
+            let reason = if conflict {
+                "constructor arguments infer conflicting generic types".to_owned()
+            } else {
+                format!(
+                    "constructor arguments do not determine {}",
+                    missing.join(", ")
+                )
+            };
+            self.diagnostics.push(
+                Diagnostic::error("typing", "T1011", span, reason)
+                    .with_note("provide explicit generic arguments"),
+            );
+            return None;
+        }
+        let arguments = class
+            .type_parameters
+            .iter()
+            .map(|parameter| inferred[&parameter.id].clone())
+            .collect::<Vec<_>>();
+        for (parameter, argument) in class.type_parameters.iter().zip(&arguments) {
+            if let Some(bound) = &parameter.bound {
+                let bound = substitute_type(bound, &inferred);
+                if !type_accepts(&bound, argument, self.classes) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1006",
+                        span,
+                        format!(
+                            "inferred type `{argument}` does not satisfy bound `{bound}` for `{}`",
+                            parameter.name
+                        ),
+                    ));
+                }
+            }
+        }
+        Some(Type::Nominal {
+            name: class.name.clone(),
+            arguments,
+        })
+    }
+
     fn lookup_property(
         &mut self,
         object_type: &Type,
         name: &str,
         span: Span,
     ) -> Option<(PropertyId, Type)> {
-        let Type::Object(class_name) = object_type else {
+        let Some(lookup_type) = nominal_lookup_type(object_type, self.classes) else {
             self.diagnostics.push(Diagnostic::error(
                 "typing",
                 "T0407",
@@ -3421,6 +3928,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             ));
             return None;
         };
+        let (class_name, _) = nominal_parts(&lookup_type).expect("lookup type is nominal");
         let Some(class) = self.classes.get(class_name) else {
             self.diagnostics.push(Diagnostic::error(
                 "typing",
@@ -3451,7 +3959,15 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             "property",
             name,
         );
-        Some((property.id, property.ty.clone()))
+        Some((
+            property.id,
+            instantiate_member_type(
+                &lookup_type,
+                property.declaring_class,
+                &property.ty,
+                self.classes,
+            ),
+        ))
     }
 
     fn owner_class(&self) -> Option<&ClassSignature> {
@@ -3668,6 +4184,7 @@ fn block_guarantees_exit(statements: &[Statement]) -> bool {
 fn resolve_parameters(
     declaration: &FunctionDecl,
     classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<ParameterSignature> {
     let mut optional_seen = false;
@@ -3677,8 +4194,8 @@ fn resolve_parameters(
         .iter()
         .enumerate()
         .map(|(index, parameter)| {
-            let element_type =
-                resolve_type(&parameter.ty, classes, diagnostics).unwrap_or(Type::Mixed);
+            let element_type = resolve_type(&parameter.ty, classes, type_parameters, diagnostics)
+                .unwrap_or(Type::Mixed);
             if parameter.variadic {
                 if variadic_seen {
                     diagnostics.push(Diagnostic::error(
@@ -3776,6 +4293,12 @@ fn type_accepts(
     expected == &Type::Mixed
         || actual == &Type::Never
         || expected == actual
+        || matches!(actual, Type::Parameter { id, .. } if classes
+            .values()
+            .flat_map(|class| &class.type_parameters)
+            .find(|parameter| parameter.id == *id)
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| type_accepts(expected, bound, classes)))
         || matches!(
             actual,
             Type::Union(members)
@@ -3790,11 +4313,142 @@ fn type_accepts(
                     .iter()
                     .any(|member| type_accepts(member, actual, classes))
         )
-        || matches!(
-            (expected, actual),
-            (Type::Object(expected), Type::Object(actual))
-                if is_nominal_subtype(classes, actual, expected)
-        )
+        || nominal_type_accepts(expected, actual, classes)
+}
+
+fn nominal_type_accepts(
+    expected: &Type,
+    actual: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> bool {
+    let Some((expected_name, expected_arguments)) = nominal_parts(expected) else {
+        return false;
+    };
+    let Some((actual_name, _)) = nominal_parts(actual) else {
+        return false;
+    };
+    if expected_name == actual_name {
+        return expected == actual;
+    }
+    instantiated_ancestor(actual, expected_name, classes).is_some_and(|ancestor| {
+        nominal_parts(&ancestor).is_some_and(|(_, arguments)| arguments == expected_arguments)
+    })
+}
+
+fn nominal_parts(ty: &Type) -> Option<(&str, &[Type])> {
+    match ty {
+        Type::Object(name) => Some((name, &[])),
+        Type::Nominal { name, arguments } => Some((name, arguments)),
+        _ => None,
+    }
+}
+
+fn nominal_lookup_type(ty: &Type, classes: &BTreeMap<String, ClassSignature>) -> Option<Type> {
+    match ty {
+        Type::Object(_) | Type::Nominal { .. } => Some(ty.clone()),
+        Type::Parameter { id, .. } => classes
+            .values()
+            .flat_map(|class| &class.type_parameters)
+            .find(|parameter| parameter.id == *id)
+            .and_then(|parameter| parameter.bound.clone()),
+        _ => None,
+    }
+}
+
+fn instantiated_ancestor(
+    actual: &Type,
+    expected_name: &str,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Option<Type> {
+    fn visit(
+        actual: &Type,
+        expected_name: &str,
+        classes: &BTreeMap<String, ClassSignature>,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        let (actual_name, actual_arguments) = nominal_parts(actual)?;
+        if actual_name == expected_name {
+            return Some(actual.clone());
+        }
+        let class = classes.get(actual_name)?;
+        if !visiting.insert(actual_name.to_owned()) {
+            return None;
+        }
+        let substitutions = class
+            .type_parameters
+            .iter()
+            .zip(actual_arguments)
+            .map(|(parameter, argument)| (parameter.id, argument.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let ancestor = class
+            .parent_type
+            .iter()
+            .chain(&class.interface_types)
+            .map(|edge| substitute_type(edge, &substitutions))
+            .find_map(|edge| visit(&edge, expected_name, classes, visiting));
+        visiting.remove(actual_name);
+        ancestor
+    }
+
+    visit(actual, expected_name, classes, &mut BTreeSet::new())
+}
+
+fn instantiated_interface_closure(
+    class: &ClassSignature,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Vec<Type> {
+    fn visit(
+        ty: &Type,
+        classes: &BTreeMap<String, ClassSignature>,
+        output: &mut Vec<Type>,
+        depth: usize,
+    ) {
+        if depth > classes.len() {
+            return;
+        }
+        let Some((name, arguments)) = nominal_parts(ty) else {
+            return;
+        };
+        let Some(class) = classes.get(name) else {
+            return;
+        };
+        let substitutions = class
+            .type_parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.id, argument.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if class.kind == NominalKind::Interface {
+            output.push(ty.clone());
+        }
+        if let Some(parent) = &class.parent_type {
+            let parent = substitute_type(parent, &substitutions);
+            visit(&parent, classes, output, depth + 1);
+        }
+        for interface in &class.interface_types {
+            let interface = substitute_type(interface, &substitutions);
+            visit(&interface, classes, output, depth + 1);
+        }
+    }
+
+    let mut output = Vec::new();
+    let declaration = declaration_type(class);
+    let (_, arguments) = nominal_parts(&declaration).expect("declaration type is nominal");
+    let substitutions = class
+        .type_parameters
+        .iter()
+        .zip(arguments)
+        .map(|(parameter, argument)| (parameter.id, argument.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(parent) = &class.parent_type {
+        let parent = substitute_type(parent, &substitutions);
+        visit(&parent, classes, &mut output, 0);
+    }
+    for interface in &class.interface_types {
+        let interface = substitute_type(interface, &substitutions);
+        visit(&interface, classes, &mut output, 0);
+    }
+    output
 }
 
 fn type_is_subtype_of(
@@ -3804,6 +4458,13 @@ fn type_is_subtype_of(
 ) -> bool {
     match actual {
         Type::Object(actual) => is_nominal_subtype(classes, actual, expected),
+        Type::Nominal { name, .. } => is_nominal_subtype(classes, name, expected),
+        Type::Parameter { id, .. } => classes
+            .values()
+            .flat_map(|class| &class.type_parameters)
+            .find(|parameter| parameter.id == *id)
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| type_is_subtype_of(bound, expected, classes)),
         Type::Union(members) => members
             .iter()
             .all(|member| type_is_subtype_of(member, expected, classes)),
@@ -3816,23 +4477,7 @@ fn is_nominal_subtype(
     actual: &str,
     expected: &str,
 ) -> bool {
-    if actual == expected {
-        return true;
-    }
-    let Some(actual) = classes.get(actual) else {
-        return false;
-    };
-    if actual
-        .interfaces
-        .iter()
-        .any(|interface| interface == expected)
-    {
-        return true;
-    }
-    actual
-        .parent
-        .as_deref()
-        .is_some_and(|parent| is_nominal_subtype(classes, parent, expected))
+    instantiated_ancestor(&Type::Object(actual.to_owned()), expected, classes).is_some()
 }
 
 fn is_class_id_subtype(
@@ -3874,21 +4519,57 @@ fn loop_clause_type(clause: &LoopClause) -> &Type {
 fn resolve_type(
     syntax: &TypeSyntax,
     classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
     diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Type> {
+    resolve_type_with_bound_check(syntax, classes, type_parameters, diagnostics, true)
+}
+
+fn resolve_type_with_bound_check(
+    syntax: &TypeSyntax,
+    classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
+    diagnostics: &mut Vec<Diagnostic>,
+    check_bounds: bool,
 ) -> Option<Type> {
     match &syntax.kind {
         TypeSyntaxKind::Nullable(inner) => {
-            let inner = resolve_type(inner, classes, diagnostics)?;
+            let inner = resolve_type_with_bound_check(
+                inner,
+                classes,
+                type_parameters,
+                diagnostics,
+                check_bounds,
+            )?;
             Some(normalize_union(vec![inner, Type::Null]))
         }
         TypeSyntaxKind::Union(members) => Some(normalize_union(
             members
                 .iter()
-                .filter_map(|member| resolve_type(member, classes, diagnostics))
+                .filter_map(|member| {
+                    resolve_type_with_bound_check(
+                        member,
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )
+                })
                 .collect(),
         )),
         TypeSyntaxKind::Named { name, arguments } => {
             let arity = arguments.len();
+            if let Some(parameter) = type_parameters.get(name) {
+                if arity != 0 {
+                    diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1001",
+                        syntax.span,
+                        format!("type parameter `{name}` does not accept arguments"),
+                    ));
+                }
+                return Some(parameter.clone());
+            }
             let primitive = match name.as_str() {
                 "int" => Some(Type::Int),
                 "float" => Some(Type::Float),
@@ -3912,14 +4593,30 @@ fn resolve_type(
                 return Some(primitive);
             }
             match name.as_str() {
-                "vector" if arity == 1 => Some(Type::Vector(Box::new(resolve_type(
-                    &arguments[0],
-                    classes,
-                    diagnostics,
-                )?))),
+                "vector" if arity == 1 => {
+                    Some(Type::Vector(Box::new(resolve_type_with_bound_check(
+                        &arguments[0],
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )?)))
+                }
                 "map" if arity == 2 => Some(Type::Map(
-                    Box::new(resolve_type(&arguments[0], classes, diagnostics)?),
-                    Box::new(resolve_type(&arguments[1], classes, diagnostics)?),
+                    Box::new(resolve_type_with_bound_check(
+                        &arguments[0],
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )?),
+                    Box::new(resolve_type_with_bound_check(
+                        &arguments[1],
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )?),
                 )),
                 "vector" | "map" => {
                     let expected = if name == "vector" { 1 } else { 2 };
@@ -3933,17 +4630,9 @@ fn resolve_type(
                     ));
                     None
                 }
-                _ if arity == 0
-                    && classes
-                        .get(name)
-                        .is_some_and(|class| class.kind != NominalKind::Trait) =>
-                {
-                    Some(Type::Object(name.clone()))
-                }
-                _ if arity == 0
-                    && classes
-                        .get(name)
-                        .is_some_and(|class| class.kind == NominalKind::Trait) =>
+                _ if classes
+                    .get(name)
+                    .is_some_and(|class| class.kind == NominalKind::Trait) =>
                 {
                     diagnostics.push(Diagnostic::error(
                         "typing",
@@ -3952,6 +4641,76 @@ fn resolve_type(
                         format!("trait `{name}` cannot be used as a type"),
                     ));
                     None
+                }
+                _ if let Some(class) = classes.get(name) => {
+                    if arity != class.type_parameters.len() {
+                        diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1002",
+                            syntax.span,
+                            format!(
+                                "type `{name}` expects {} generic arguments, found {arity}",
+                                class.type_parameters.len()
+                            ),
+                        ));
+                        return None;
+                    }
+                    if arity == 0 {
+                        return Some(Type::Object(name.clone()));
+                    }
+                    let resolved = arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            resolve_type_with_bound_check(
+                                argument,
+                                classes,
+                                type_parameters,
+                                diagnostics,
+                                check_bounds,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if resolved.len() != arguments.len() {
+                        return None;
+                    }
+                    for (index, argument) in resolved.iter().enumerate() {
+                        if type_contains_void(argument) {
+                            diagnostics.push(Diagnostic::error(
+                                "typing",
+                                "T1005",
+                                arguments[index].span,
+                                "generic type arguments cannot contain `void`",
+                            ));
+                        }
+                    }
+                    let substitutions = class
+                        .type_parameters
+                        .iter()
+                        .zip(&resolved)
+                        .map(|(parameter, argument)| (parameter.id, argument.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    if check_bounds {
+                        for (parameter, argument) in class.type_parameters.iter().zip(&resolved) {
+                            if let Some(bound) = &parameter.bound {
+                                let bound = substitute_type(bound, &substitutions);
+                                if !type_accepts(&bound, argument, classes) {
+                                    diagnostics.push(Diagnostic::error(
+                                        "typing",
+                                        "T1006",
+                                        syntax.span,
+                                        format!(
+                                            "type argument `{argument}` does not satisfy bound `{bound}` for `{}`",
+                                            parameter.name
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some(Type::Nominal {
+                        name: name.clone(),
+                        arguments: resolved,
+                    })
                 }
                 _ => {
                     diagnostics.push(Diagnostic::error(
@@ -3967,6 +4726,267 @@ fn resolve_type(
     }
 }
 
+fn resolve_nominal_ref(
+    reference: &NominalRef,
+    classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Type> {
+    resolve_type(
+        &TypeSyntax {
+            kind: TypeSyntaxKind::Named {
+                name: reference.name.clone(),
+                arguments: reference.arguments.clone(),
+            },
+            span: reference.span,
+        },
+        classes,
+        type_parameters,
+        diagnostics,
+    )
+}
+
+fn validate_type_argument_bounds(
+    ty: &Type,
+    span: Span,
+    classes: &BTreeMap<String, ClassSignature>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match ty {
+        Type::Vector(element) => {
+            validate_type_argument_bounds(element, span, classes, diagnostics);
+        }
+        Type::Map(key, value) => {
+            validate_type_argument_bounds(key, span, classes, diagnostics);
+            validate_type_argument_bounds(value, span, classes, diagnostics);
+        }
+        Type::Union(members) => {
+            for member in members {
+                validate_type_argument_bounds(member, span, classes, diagnostics);
+            }
+        }
+        Type::Nominal { name, arguments } => {
+            for argument in arguments {
+                validate_type_argument_bounds(argument, span, classes, diagnostics);
+            }
+            let Some(class) = classes.get(name) else {
+                return;
+            };
+            let substitutions = class
+                .type_parameters
+                .iter()
+                .zip(arguments)
+                .map(|(parameter, argument)| (parameter.id, argument.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for (parameter, argument) in class.type_parameters.iter().zip(arguments) {
+                if let Some(bound) = &parameter.bound {
+                    let bound = substitute_type(bound, &substitutions);
+                    if !type_accepts(&bound, argument, classes) {
+                        diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1006",
+                            span,
+                            format!(
+                                "type argument `{argument}` does not satisfy bound `{bound}` for `{}`",
+                                parameter.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Null
+        | Type::Void
+        | Type::Never
+        | Type::Mixed
+        | Type::Object(_)
+        | Type::Parameter { .. } => {}
+    }
+}
+
+fn type_parameter_environment(parameters: &[TypeParameter]) -> BTreeMap<String, Type> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            (
+                parameter.name.clone(),
+                Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn declaration_type(class: &ClassSignature) -> Type {
+    if class.type_parameters.is_empty() {
+        Type::Object(class.name.clone())
+    } else {
+        Type::Nominal {
+            name: class.name.clone(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|parameter| Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn type_contains_void(ty: &Type) -> bool {
+    match ty {
+        Type::Void => true,
+        Type::Vector(element) => type_contains_void(element),
+        Type::Map(key, value) => type_contains_void(key) || type_contains_void(value),
+        Type::Union(members) => members.iter().any(type_contains_void),
+        Type::Nominal { arguments, .. } => arguments.iter().any(type_contains_void),
+        _ => false,
+    }
+}
+
+fn substitute_type(ty: &Type, substitutions: &BTreeMap<TypeParameterId, Type>) -> Type {
+    match ty {
+        Type::Parameter { id, .. } => substitutions.get(id).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Vector(element) => Type::Vector(Box::new(substitute_type(element, substitutions))),
+        Type::Map(key, value) => Type::Map(
+            Box::new(substitute_type(key, substitutions)),
+            Box::new(substitute_type(value, substitutions)),
+        ),
+        Type::Union(members) => normalize_union(
+            members
+                .iter()
+                .map(|member| substitute_type(member, substitutions))
+                .collect(),
+        ),
+        Type::Nominal { name, arguments } => Type::Nominal {
+            name: name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_type(argument, substitutions))
+                .collect(),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn substitutions_for_ancestor(
+    receiver: &Type,
+    declaring_class: ClassId,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> BTreeMap<TypeParameterId, Type> {
+    let mut substitutions = BTreeMap::new();
+    if let Some((receiver_name, receiver_arguments)) = nominal_parts(receiver)
+        && let Some(receiver_class) = classes.get(receiver_name)
+    {
+        substitutions.extend(
+            receiver_class
+                .type_parameters
+                .iter()
+                .zip(receiver_arguments)
+                .map(|(parameter, argument)| (parameter.id, argument.clone())),
+        );
+    }
+    let Some(declaring) = classes.values().find(|class| class.id == declaring_class) else {
+        return substitutions;
+    };
+    let Some(ancestor) = instantiated_ancestor(receiver, &declaring.name, classes) else {
+        return substitutions;
+    };
+    let Some((_, arguments)) = nominal_parts(&ancestor) else {
+        return substitutions;
+    };
+    substitutions.extend(
+        declaring
+            .type_parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.id, argument.clone())),
+    );
+    substitutions
+}
+
+fn instantiate_member_type(
+    receiver: &Type,
+    declaring_class: ClassId,
+    member_type: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Type {
+    substitute_type(
+        member_type,
+        &substitutions_for_ancestor(receiver, declaring_class, classes),
+    )
+}
+
+fn instantiate_method_signature(
+    method: &mut MethodSignature,
+    receiver: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) {
+    let substitutions = substitutions_for_ancestor(receiver, method.declaring_class, classes);
+    for parameter in &mut method.signature.parameters {
+        parameter.ty = substitute_type(&parameter.ty, &substitutions);
+    }
+    method.signature.return_type = substitute_type(&method.signature.return_type, &substitutions);
+}
+
+fn unify_inference(
+    pattern: &Type,
+    actual: &Type,
+    class_parameters: &BTreeSet<TypeParameterId>,
+    inferred: &mut BTreeMap<TypeParameterId, Type>,
+) -> bool {
+    match pattern {
+        Type::Parameter { id, .. } if class_parameters.contains(id) => {
+            if matches!(actual, Type::Mixed | Type::Union(_)) {
+                return true;
+            }
+            if type_contains_void(actual) {
+                return false;
+            }
+            if let Some(previous) = inferred.get(id) {
+                previous == actual
+            } else {
+                inferred.insert(*id, actual.clone());
+                true
+            }
+        }
+        Type::Vector(pattern) => {
+            matches!(actual, Type::Vector(actual) if unify_inference(pattern, actual, class_parameters, inferred))
+        }
+        Type::Map(pattern_key, pattern_value) => matches!(
+            actual,
+            Type::Map(actual_key, actual_value)
+                if unify_inference(pattern_key, actual_key, class_parameters, inferred)
+                    && unify_inference(pattern_value, actual_value, class_parameters, inferred)
+        ),
+        Type::Nominal {
+            name: pattern_name,
+            arguments: pattern_arguments,
+        } => {
+            let Some((actual_name, actual_arguments)) = nominal_parts(actual) else {
+                return true;
+            };
+            pattern_name == actual_name
+                && pattern_arguments.len() == actual_arguments.len()
+                && pattern_arguments
+                    .iter()
+                    .zip(actual_arguments)
+                    .all(|(pattern, actual)| {
+                        unify_inference(pattern, actual, class_parameters, inferred)
+                    })
+        }
+        _ => true,
+    }
+}
+
 type NativeNominalSpec<'name> = (
     &'name str,
     NominalKind,
@@ -3978,6 +4998,30 @@ type NativeNominalSpec<'name> = (
 
 fn native_nominals() -> BTreeMap<String, ClassSignature> {
     let specs: &[NativeNominalSpec<'_>] = &[
+        (
+            "Traversable",
+            NominalKind::Interface,
+            true,
+            false,
+            None,
+            &[],
+        ),
+        (
+            "Iterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Traversable"),
+            &[],
+        ),
+        (
+            "IteratorAggregate",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Traversable"),
+            &[],
+        ),
         ("Closeable", NominalKind::Interface, true, false, None, &[]),
         (
             "ReadableStream",
@@ -4121,10 +5165,19 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                         kind: *kind,
                         abstract_class: *abstract_class,
                         final_class: *final_class,
+                        type_parameters: Vec::new(),
+                        type_parameter_syntax: Vec::new(),
                         parent: parent.map(ToOwned::to_owned),
+                        parent_syntax: None,
+                        parent_type: parent.map(|name| Type::Object(name.to_owned())),
                         interfaces: interfaces
                             .iter()
                             .map(|interface| (*interface).to_owned())
+                            .collect(),
+                        interface_syntax: Vec::new(),
+                        interface_types: interfaces
+                            .iter()
+                            .map(|interface| Type::Object((*interface).to_owned()))
                             .collect(),
                         trait_uses: Vec::new(),
                         declared_properties: Vec::new(),
@@ -4143,9 +5196,121 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         )
         .collect::<BTreeMap<_, _>>();
 
+    for name in ["Traversable", "Iterator", "IteratorAggregate"] {
+        let class = classes
+            .get_mut(name)
+            .expect("iterator prelude nominal exists");
+        class.type_parameters = ["K", "V"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, parameter_name)| TypeParameter {
+                id: TypeParameterId {
+                    owner: class.id,
+                    index: u32::try_from(index).expect("prelude parameter count fits u32"),
+                },
+                name: parameter_name.to_owned(),
+                bound: None,
+                span: Span::empty(0),
+            })
+            .collect();
+    }
+    for name in ["Iterator", "IteratorAggregate"] {
+        let class = classes
+            .get_mut(name)
+            .expect("iterator prelude nominal exists");
+        class.parent_type = Some(Type::Nominal {
+            name: "Traversable".to_owned(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|parameter| Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                })
+                .collect(),
+        });
+    }
+
     let nullable_throwable =
         normalize_union(vec![Type::Object("Throwable".to_owned()), Type::Null]);
     let throwable_vector = Type::Vector(Box::new(Type::Object("Throwable".to_owned())));
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "rewind",
+        None,
+        false,
+        vec![],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "valid",
+        None,
+        false,
+        vec![],
+        Type::Bool,
+        true,
+    );
+    let iterator_parameters = classes["Iterator"].type_parameters.clone();
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "key",
+        None,
+        false,
+        vec![],
+        Type::Parameter {
+            id: iterator_parameters[0].id,
+            name: "K".to_owned(),
+        },
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "value",
+        None,
+        false,
+        vec![],
+        Type::Parameter {
+            id: iterator_parameters[1].id,
+            name: "V".to_owned(),
+        },
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "advance",
+        None,
+        false,
+        vec![],
+        Type::Void,
+        true,
+    );
+    let aggregate_parameters = classes["IteratorAggregate"].type_parameters.clone();
+    add_native_method(
+        &mut classes,
+        "IteratorAggregate",
+        "getIterator",
+        None,
+        false,
+        vec![],
+        Type::Nominal {
+            name: "Traversable".to_owned(),
+            arguments: aggregate_parameters
+                .iter()
+                .map(|parameter| Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                })
+                .collect(),
+        },
+        true,
+    );
     add_native_method(
         &mut classes,
         "Throwable",
@@ -4797,6 +5962,168 @@ mod tests {
     }
 
     #[test]
+    fn generic_classes_infer_and_substitute_members() {
+        let output = typecheck(
+            r"<?thp
+interface Value<T> {
+    public function value(): T;
+}
+class Box<T> implements Value<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+$box = new Box(42);
+$value: int = $box->value();
+",
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let main = output.module.function(output.module.entry);
+        assert!(matches!(
+            &main.locals[0].ty,
+            Type::Nominal { name, arguments }
+                if name == "Box" && arguments == &[Type::Int]
+        ));
+    }
+
+    #[test]
+    fn generics_enforce_arity_invariance_bounds_and_inference_conflicts() {
+        let codes = diagnostic_codes(
+            r"<?thp
+class Animal {}
+class Dog extends Animal {}
+class Cage<T extends Animal> {
+    public function __construct(T $first, T $second) {}
+}
+$raw: Cage = new Cage<int>(1, 1);
+$dogs: Cage<Dog> = new Cage<Animal>(new Animal(), new Animal());
+$conflict = new Cage(new Dog(), new Animal());
+",
+        );
+        assert!(codes.contains(&"T1002"));
+        assert!(codes.contains(&"T1006"));
+        assert!(codes.contains(&"T0005"));
+        assert!(codes.contains(&"T1011"));
+
+        let declaration_errors = diagnostic_codes(
+            "<?thp\nclass Duplicate<T, T> {}\nclass Unknown<T extends Missing> {}",
+        );
+        assert!(declaration_errors.contains(&"N0010"));
+        assert!(declaration_errors.contains(&"T1003"));
+    }
+
+    #[test]
+    fn generic_hierarchies_compose_substitutions_and_reject_conflicts() {
+        let output = typecheck(
+            r#"<?thp
+interface Root<T> { public function value(): T; }
+interface Left<T> extends Root<T> {}
+class Base<T> implements Left<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+class Child<U> extends Base<U> {}
+class Strings extends Child<string> {}
+$strings = new Strings("ok");
+$root: Root<string> = $strings;
+$value: string = $root->value();
+"#,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+
+        let codes = diagnostic_codes(
+            r"<?thp
+interface Root<T> {}
+interface IntRoot extends Root<int> {}
+interface StringRoot extends Root<string> {}
+abstract class Ambiguous implements IntRoot, StringRoot {}
+",
+        );
+        assert!(codes.contains(&"T1012"));
+    }
+
+    #[test]
+    fn iterator_prelude_enforces_concrete_strategy_rules() {
+        let direct = diagnostic_codes("<?thp\nclass Direct implements Traversable<int, string> {}");
+        assert!(direct.contains(&"T1013"));
+
+        let redundant = diagnostic_codes(
+            "<?thp\nabstract class Cursor implements Iterator<int, string> {}\nclass DirectToo extends Cursor implements Traversable<int, string> {}",
+        );
+        assert!(redundant.contains(&"T1013"));
+
+        let dual = diagnostic_codes(
+            r"<?thp
+abstract class Both implements Iterator<int, string>, IteratorAggregate<int, string> {}
+class Concrete extends Both {}
+",
+        );
+        assert!(dual.contains(&"T1014"));
+
+        let deferred =
+            typecheck("<?thp\nabstract class Deferred implements Traversable<int, string> {}");
+        assert!(
+            deferred.diagnostics.is_empty(),
+            "{:?}",
+            deferred.diagnostics
+        );
+    }
+
+    #[test]
+    fn bounded_parameters_allow_members_but_unbounded_parameters_do_not() {
+        let bounded = typecheck(
+            r"<?thp
+interface Named { public function name(): string; }
+interface Source<T extends Named> {}
+class Wrapped<U extends Source<T>, T extends Named> {}
+class Reader<T extends Named> {
+    public function read(T $value): string { return $value->name(); }
+}
+",
+        );
+        assert!(bounded.diagnostics.is_empty(), "{:?}", bounded.diagnostics);
+        let unbounded = diagnostic_codes(
+            r"<?thp
+class Reader<T> {
+    public function read(T $value): string { return $value->name(); }
+}
+",
+        );
+        assert!(unbounded.contains(&"T0402"));
+    }
+
+    #[test]
+    fn constructor_inference_handles_nesting_named_and_variadic_arguments() {
+        let output = typecheck(
+            r#"<?thp
+class Pack<T, U> {
+    public function __construct(vector<T> $items, map<string, U> $labels, T ...$rest) {}
+}
+$named = new Pack(labels: {"one" => "first"}, items: [1]);
+$variadic = new Pack([2], {"two" => "second"}, 3, 4);
+"#,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let main = output.module.function(output.module.entry);
+        for local in &main.locals[..2] {
+            assert!(matches!(
+                &local.ty,
+                Type::Nominal { name, arguments }
+                    if name == "Pack" && arguments == &[Type::Int, Type::String]
+            ));
+        }
+
+        let underdetermined = diagnostic_codes(
+            r"<?thp
+class Box<T> { public function __construct(vector<T> $items = []) {} }
+$box = new Box();
+",
+        );
+        assert!(underdetermined.contains(&"T1011"));
+    }
+
+    #[test]
     fn propagates_function_and_vector_types() {
         let output = typecheck(
             r#"<?thp
@@ -4946,6 +6273,22 @@ class Reopened extends Closed {}
         assert!(codes.contains(&"T0012"));
         assert!(codes.contains(&"T0011"));
         assert!(codes.contains(&"T0010"));
+    }
+
+    #[test]
+    fn cyclic_generic_inheritance_does_not_overflow_subtyping() {
+        let codes = diagnostic_codes(
+            r"<?thp
+class A<T> extends B<T> {}
+class B<T> extends A<T> {}
+class C<T> {}
+$value: C<int> = new B<int>();
+throw new B<int>();
+",
+        );
+        assert!(codes.contains(&"T0011"));
+        assert!(codes.contains(&"T0005"));
+        assert!(codes.contains(&"T0008"));
     }
 
     #[test]

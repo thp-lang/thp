@@ -30,6 +30,11 @@ Entries are immutable and published atomically. A hit is fully decoded and
 verified before use; a missing, corrupt, or incompatible normal entry compiles
 again.
 
+Generic signatures and bounds participate in module-interface hashes and the
+bytecode schema identity. Generic bodies retain parameter-dependent value types,
+which are outside the baseline JIT subset; `auto` therefore selects the VM for
+them.
+
 Project cache warming uses separate artifacts:
 
 | Extension | Contents                                      |

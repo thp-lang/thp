@@ -11,11 +11,11 @@ use std::path::{Component, Path, PathBuf};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, Span};
 use thp_syntax::{
     Block, ClassDecl, Expr, ExprKind, ForClause, ForClauseKind, FunctionDecl, InterfaceDecl,
-    NameRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitDecl, TraitUse,
-    TypeSyntax, TypeSyntaxKind, UseKind,
+    NameRef, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitDecl,
+    TraitUse, TypeSyntax, TypeSyntaxKind, UseKind,
 };
 
-pub const INTERFACE_FORMAT_VERSION: u16 = 1;
+pub const INTERFACE_FORMAT_VERSION: u16 = 2;
 pub const OBJECT_FORMAT_VERSION: u16 = 1;
 pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 
@@ -385,9 +385,40 @@ impl DeclarationKind {
 pub struct Export {
     pub name: String,
     pub kind: DeclarationKind,
+    /// Deterministic, body-independent declaration metadata used by importers.
+    pub signature: String,
+    pub type_parameters: Vec<TypeParameterMetadata>,
+    pub parent: Option<String>,
+    pub interfaces: Vec<String>,
+    pub properties: Vec<PropertyMetadata>,
+    pub constructor: Option<MethodMetadata>,
+    pub methods: Vec<MethodMetadata>,
     pub module: ModuleId,
     pub source: SourceId,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeParameterMetadata {
+    pub name: String,
+    pub bound: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyMetadata {
+    pub name: String,
+    pub ty: String,
+    pub visibility: thp_syntax::Visibility,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MethodMetadata {
+    pub name: String,
+    pub signature: String,
+    pub visibility: thp_syntax::Visibility,
+    pub static_method: bool,
+    pub abstract_method: bool,
+    pub final_method: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -477,11 +508,23 @@ pub fn extract_interface(
         let Some((short, span, kind, signature)) = declaration_signature(statement) else {
             continue;
         };
-        let name = qualify_declaration(&namespace, short);
+        let name = if short.contains('\\') {
+            short.to_owned()
+        } else {
+            qualify_declaration(&namespace, short)
+        };
+        let metadata = declaration_metadata(statement);
         canonical.push(format!("{}:{name}:{signature}", kind.as_str()));
         exports.push(Export {
             name,
             kind,
+            signature,
+            type_parameters: metadata.type_parameters,
+            parent: metadata.parent,
+            interfaces: metadata.interfaces,
+            properties: metadata.properties,
+            constructor: metadata.constructor,
+            methods: metadata.methods,
             module: module.id.clone(),
             source,
             span,
@@ -662,8 +705,17 @@ fn collect_signature_dependencies(program: &Program, output: &mut Vec<(bool, Str
         match &statement.kind {
             StmtKind::Function(function) => collect_function_signature(function, output),
             StmtKind::Class(class) => {
+                let start = output.len();
+                for parameter in &class.type_parameters {
+                    if let Some(bound) = &parameter.bound {
+                        collect_type_dependencies(bound, output);
+                    }
+                }
                 if let Some(parent) = &class.parent {
                     output.push((false, parent.name.clone()));
+                    for argument in &parent.arguments {
+                        collect_type_dependencies(argument, output);
+                    }
                 }
                 output.extend(
                     class
@@ -671,6 +723,11 @@ fn collect_signature_dependencies(program: &Program, output: &mut Vec<(bool, Str
                         .iter()
                         .map(|name| (false, name.name.clone())),
                 );
+                for interface in &class.interfaces {
+                    for argument in &interface.arguments {
+                        collect_type_dependencies(argument, output);
+                    }
+                }
                 for trait_use in &class.trait_uses {
                     output.extend(
                         trait_use
@@ -685,14 +742,39 @@ fn collect_signature_dependencies(program: &Program, output: &mut Vec<(bool, Str
                 for method in &class.methods {
                     collect_function_signature(&method.function, output);
                 }
+                let parameter_names = class
+                    .type_parameters
+                    .iter()
+                    .map(|parameter| parameter.name.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut dependencies = output.split_off(start);
+                dependencies.retain(|(_, name)| !parameter_names.contains(name.as_str()));
+                output.extend(dependencies);
             }
             StmtKind::Interface(interface) => {
+                let start = output.len();
+                for parameter in &interface.type_parameters {
+                    if let Some(bound) = &parameter.bound {
+                        collect_type_dependencies(bound, output);
+                    }
+                }
                 if let Some(parent) = &interface.parent {
                     output.push((false, parent.name.clone()));
+                    for argument in &parent.arguments {
+                        collect_type_dependencies(argument, output);
+                    }
                 }
                 for method in &interface.methods {
                     collect_function_signature(&method.function, output);
                 }
+                let parameter_names = interface
+                    .type_parameters
+                    .iter()
+                    .map(|parameter| parameter.name.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut dependencies = output.split_off(start);
+                dependencies.retain(|(_, name)| !parameter_names.contains(name.as_str()));
+                output.extend(dependencies);
             }
             StmtKind::Trait(trait_decl) => {
                 for trait_use in &trait_decl.trait_uses {
@@ -895,7 +977,7 @@ fn collect_body_expr(expression: &Expr, output: &mut Vec<(bool, String)>) {
         ExprKind::StaticCall {
             target, arguments, ..
         } => {
-            if let ScopeTarget::Named(name) = target {
+            if let ScopeTarget::Named { name, .. } = target {
                 output.push((false, name.clone()));
             }
             for argument in arguments {
@@ -1214,20 +1296,29 @@ fn resolve_class(
     function_aliases: &BTreeMap<String, String>,
     index: &ExportIndex,
 ) {
+    let mut type_aliases = type_aliases.clone();
+    for parameter in &class.type_parameters {
+        type_aliases.insert(parameter.name.clone(), parameter.name.clone());
+    }
+    for parameter in &mut class.type_parameters {
+        if let Some(bound) = &mut parameter.bound {
+            resolve_type(bound, namespace, &type_aliases);
+        }
+    }
     if let Some(parent) = &mut class.parent {
-        resolve_name_ref(parent, namespace, type_aliases);
+        resolve_nominal_ref(parent, namespace, &type_aliases);
     }
     for interface in &mut class.interfaces {
-        resolve_name_ref(interface, namespace, type_aliases);
+        resolve_nominal_ref(interface, namespace, &type_aliases);
     }
-    resolve_trait_uses(&mut class.trait_uses, namespace, type_aliases);
+    resolve_trait_uses(&mut class.trait_uses, namespace, &type_aliases);
     for property in &mut class.properties {
-        resolve_type(&mut property.ty, namespace, type_aliases);
+        resolve_type(&mut property.ty, namespace, &type_aliases);
         if let Some(initializer) = &mut property.initializer {
             resolve_expr(
                 initializer,
                 namespace,
-                type_aliases,
+                &type_aliases,
                 function_aliases,
                 index,
             );
@@ -1237,7 +1328,7 @@ fn resolve_class(
         resolve_function(
             &mut method.function,
             namespace,
-            type_aliases,
+            &type_aliases,
             function_aliases,
             index,
         );
@@ -1251,14 +1342,23 @@ fn resolve_interface(
     function_aliases: &BTreeMap<String, String>,
     index: &ExportIndex,
 ) {
+    let mut type_aliases = type_aliases.clone();
+    for parameter in &interface.type_parameters {
+        type_aliases.insert(parameter.name.clone(), parameter.name.clone());
+    }
+    for parameter in &mut interface.type_parameters {
+        if let Some(bound) = &mut parameter.bound {
+            resolve_type(bound, namespace, &type_aliases);
+        }
+    }
     if let Some(parent) = &mut interface.parent {
-        resolve_name_ref(parent, namespace, type_aliases);
+        resolve_nominal_ref(parent, namespace, &type_aliases);
     }
     for method in &mut interface.methods {
         resolve_function(
             &mut method.function,
             namespace,
-            type_aliases,
+            &type_aliases,
             function_aliases,
             index,
         );
@@ -1374,10 +1474,14 @@ fn resolve_expr(
         }
         ExprKind::New {
             class_name,
+            type_arguments,
             arguments,
             ..
         } => {
             *class_name = resolve_type_name(class_name, namespace, type_aliases);
+            for argument in type_arguments {
+                resolve_type(argument, namespace, type_aliases);
+            }
             for argument in arguments {
                 resolve_expr(
                     &mut argument.value,
@@ -1391,8 +1495,15 @@ fn resolve_expr(
         ExprKind::StaticCall {
             target, arguments, ..
         } => {
-            if let ScopeTarget::Named(name) = target {
+            if let ScopeTarget::Named {
+                name,
+                type_arguments,
+            } = target
+            {
                 *name = resolve_type_name(name, namespace, type_aliases);
+                for argument in type_arguments {
+                    resolve_type(argument, namespace, type_aliases);
+                }
             }
             for argument in arguments {
                 resolve_expr(
@@ -1510,6 +1621,17 @@ fn resolve_name_ref(reference: &mut NameRef, namespace: &str, aliases: &BTreeMap
     reference.name = resolve_type_name(&reference.name, namespace, aliases);
 }
 
+fn resolve_nominal_ref(
+    reference: &mut NominalRef,
+    namespace: &str,
+    aliases: &BTreeMap<String, String>,
+) {
+    reference.name = resolve_type_name(&reference.name, namespace, aliases);
+    for argument in &mut reference.arguments {
+        resolve_type(argument, namespace, aliases);
+    }
+}
+
 fn resolve_type_name(name: &str, namespace: &str, aliases: &BTreeMap<String, String>) -> String {
     if name.starts_with('\\') {
         return name.trim_start_matches('\\').to_owned();
@@ -1586,6 +1708,79 @@ fn declaration_signature(statement: &Stmt) -> Option<(&str, Span, DeclarationKin
     }
 }
 
+#[derive(Default)]
+struct DeclarationMetadata {
+    type_parameters: Vec<TypeParameterMetadata>,
+    parent: Option<String>,
+    interfaces: Vec<String>,
+    properties: Vec<PropertyMetadata>,
+    constructor: Option<MethodMetadata>,
+    methods: Vec<MethodMetadata>,
+}
+
+fn declaration_metadata(statement: &Stmt) -> DeclarationMetadata {
+    let (parameters, parent, interfaces, properties, methods) = match &statement.kind {
+        StmtKind::Class(class) => (
+            class.type_parameters.as_slice(),
+            class.parent.as_ref().map(nominal_ref_signature),
+            class.interfaces.iter().map(nominal_ref_signature).collect(),
+            class.properties.as_slice(),
+            class.methods.as_slice(),
+        ),
+        StmtKind::Interface(interface) => (
+            interface.type_parameters.as_slice(),
+            interface.parent.as_ref().map(nominal_ref_signature),
+            Vec::new(),
+            &[] as &[thp_syntax::PropertyDecl],
+            interface.methods.as_slice(),
+        ),
+        StmtKind::Trait(trait_decl) => (
+            &[] as &[thp_syntax::TypeParameterDecl],
+            None,
+            Vec::new(),
+            trait_decl.properties.as_slice(),
+            trait_decl.methods.as_slice(),
+        ),
+        _ => return DeclarationMetadata::default(),
+    };
+    let methods = methods.iter().map(method_metadata).collect::<Vec<_>>();
+    DeclarationMetadata {
+        type_parameters: parameters
+            .iter()
+            .map(|parameter| TypeParameterMetadata {
+                name: parameter.name.clone(),
+                bound: parameter.bound.as_ref().map(type_signature),
+            })
+            .collect(),
+        parent,
+        interfaces,
+        properties: properties
+            .iter()
+            .map(|property| PropertyMetadata {
+                name: property.name.clone(),
+                ty: type_signature(&property.ty),
+                visibility: property.visibility,
+            })
+            .collect(),
+        constructor: methods
+            .iter()
+            .find(|method| method.name == "__construct")
+            .cloned(),
+        methods,
+    }
+}
+
+fn method_metadata(method: &thp_syntax::MethodDecl) -> MethodMetadata {
+    MethodMetadata {
+        name: method.function.name.clone(),
+        signature: function_signature(&method.function),
+        visibility: method.visibility,
+        static_method: method.static_method,
+        abstract_method: method.abstract_method,
+        final_method: method.final_method,
+    }
+}
+
 fn function_signature(function: &FunctionDecl) -> String {
     let parameters = function
         .parameters
@@ -1609,15 +1804,20 @@ fn function_signature(function: &FunctionDecl) -> String {
 
 fn class_signature(class: &ClassDecl) -> String {
     format!(
-        "abstract={};final={};parent={:?};interfaces={:?};traits={:?};properties={};methods={}",
+        "abstract={};final={};parameters={};parent={};interfaces={};traits={:?};properties={};methods={}",
         class.abstract_class,
         class.final_class,
-        class.parent.as_ref().map(|value| &value.name),
+        type_parameter_signature(&class.type_parameters),
+        class
+            .parent
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), nominal_ref_signature),
         class
             .interfaces
             .iter()
-            .map(|value| &value.name)
-            .collect::<Vec<_>>(),
+            .map(nominal_ref_signature)
+            .collect::<Vec<_>>()
+            .join(","),
         class
             .trait_uses
             .iter()
@@ -1651,8 +1851,12 @@ fn class_signature(class: &ClassDecl) -> String {
 
 fn interface_signature(interface: &InterfaceDecl) -> String {
     format!(
-        "parent={:?};methods={}",
-        interface.parent.as_ref().map(|value| &value.name),
+        "parameters={};parent={};methods={}",
+        type_parameter_signature(&interface.type_parameters),
+        interface
+            .parent
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), nominal_ref_signature),
         interface
             .methods
             .iter()
@@ -1660,6 +1864,40 @@ fn interface_signature(interface: &InterfaceDecl) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn type_parameter_signature(parameters: &[thp_syntax::TypeParameterDecl]) -> String {
+    parameters
+        .iter()
+        .map(|parameter| {
+            format!(
+                "{}:{}",
+                parameter.name,
+                parameter
+                    .bound
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), type_signature)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn nominal_ref_signature(reference: &NominalRef) -> String {
+    if reference.arguments.is_empty() {
+        reference.name.clone()
+    } else {
+        format!(
+            "{}<{}>",
+            reference.name,
+            reference
+                .arguments
+                .iter()
+                .map(type_signature)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
 fn trait_signature(trait_decl: &TraitDecl) -> String {
@@ -1953,8 +2191,13 @@ fn is_builtin_type(name: &str) -> bool {
             | "null"
             | "Vec"
             | "Map"
+            | "vector"
+            | "map"
             | "Stream"
             | "Exception"
+            | "Traversable"
+            | "Iterator"
+            | "IteratorAggregate"
             | "Resource"
     )
 }
@@ -2058,6 +2301,45 @@ mod tests {
             panic!("expected named type");
         };
         assert_eq!(name, "Vendor\\Client");
+    }
+
+    #[test]
+    fn generic_metadata_participates_in_interface_hashes() {
+        let module = super::ModulePath {
+            id: ModuleId::new("Vendor\\Box").unwrap(),
+            path: "Box.thp".into(),
+            canonical_path: "Box.thp".into(),
+            expected_namespace: "Vendor".to_owned(),
+            is_entry: false,
+        };
+        let source = |bound: &str, body: &str| {
+            parse(&SourceFile::new(
+                "Box.thp",
+                format!(
+                    "<?thp\nnamespace Vendor;\nclass Entity {{}}\nclass Box<T extends {bound}> {{ public function value(T $value): T {{ {body} }} }}"
+                ),
+            ))
+            .program
+        };
+        let first =
+            extract_interface(&module, SourceId(0), &source("Entity", "return $value;")).unwrap();
+        let body_edit = extract_interface(
+            &module,
+            SourceId(0),
+            &source("Entity", "$copy = $value; return $copy;"),
+        )
+        .unwrap();
+        assert_eq!(first.interface_hash, body_edit.interface_hash);
+        let bound_edit =
+            extract_interface(&module, SourceId(0), &source("Throwable", "return $value;"))
+                .unwrap();
+        assert_ne!(first.interface_hash, bound_edit.interface_hash);
+        let box_export = first
+            .exports
+            .iter()
+            .find(|export| export.name == "Vendor\\Box")
+            .unwrap();
+        assert!(box_export.signature.contains("parameters=T:Entity"));
     }
 
     #[test]
