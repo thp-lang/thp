@@ -4642,7 +4642,16 @@ fn resolve_type_with_bound_check(
                     ));
                     None
                 }
-                _ if let Some(class) = classes.get(name) => {
+                _ => {
+                    let Some(class) = classes.get(name) else {
+                        diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1003",
+                            syntax.span,
+                            format!("unknown type `{name}`"),
+                        ));
+                        return None;
+                    };
                     if arity != class.type_parameters.len() {
                         diagnostics.push(Diagnostic::error(
                             "typing",
@@ -4711,15 +4720,6 @@ fn resolve_type_with_bound_check(
                         name: name.clone(),
                         arguments: resolved,
                     })
-                }
-                _ => {
-                    diagnostics.push(Diagnostic::error(
-                        "typing",
-                        "T1003",
-                        syntax.span,
-                        format!("unknown type `{name}`"),
-                    ));
-                    None
                 }
             }
         }
