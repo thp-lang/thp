@@ -14,8 +14,8 @@ errors:
   - description: Failures encountered while restarting the underlying source propagate.
 related: []
 status: experimental
-availability: proposed
-notice: This member belongs to an experimental API contract and is not implemented in this repository.
+availability: implemented
+notice: This method signature participates in executable interface checks and virtual dispatch.
 version: "0.1"
 owner: std.baseTypes.Iterator
 visibility: public

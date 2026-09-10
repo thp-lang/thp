@@ -337,7 +337,7 @@ pub fn compile_project_with_provider(
             }),
         }
     }
-    let interfaces = units
+    let mut interfaces = units
         .iter()
         .filter_map(|unit| unit.interface.clone())
         .collect::<Vec<_>>();
@@ -406,6 +406,21 @@ pub fn compile_project_with_provider(
                         diagnostic,
                     }),
             );
+        }
+        if diagnostics.is_empty() {
+            for unit in &mut units {
+                match extract_interface(&unit.module, unit.source_id, &unit.ast) {
+                    Ok(interface) => unit.interface = Some(interface),
+                    Err(diagnostic) => diagnostics.push(ProjectDiagnostic {
+                        source: unit.source_id,
+                        diagnostic,
+                    }),
+                }
+            }
+            interfaces = units
+                .iter()
+                .filter_map(|unit| unit.interface.clone())
+                .collect();
         }
     }
 
@@ -531,7 +546,11 @@ pub fn cache_warm_project(
             interface
                 .exports
                 .iter()
-                .map(|export| (export.kind.as_str(), export.name.as_str()))
+                .map(|export| (
+                    export.kind.as_str(),
+                    export.name.as_str(),
+                    export.signature.as_str(),
+                ))
                 .collect::<Vec<_>>()
         );
         let reused = compilation
@@ -541,7 +560,7 @@ pub fn cache_warm_project(
             })
             .ok()
             .flatten()
-            .is_some();
+            .is_some_and(|cached| cached == payload.as_bytes());
         if !reused {
             compilation
                 .metrics
@@ -1119,6 +1138,102 @@ mod tests {
     }
 
     #[test]
+    fn compiles_generic_contracts_across_modules() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\n\"App\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Value.thp"),
+            r"<?thp
+namespace App;
+interface Named { public function name(): string; }
+interface Value<T extends Named> { public function value(): T; }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Base.thp"),
+            r"<?thp
+namespace App;
+abstract class Base<T extends Named> implements Value<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Box.thp"),
+            "<?thp\nnamespace App;\nclass Box<T extends Named> extends Base<T> {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Wrapped.thp"),
+            "<?thp\nnamespace App;\nclass Wrapped<U extends Value<T>, T extends Named> {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("main.thp"),
+            r#"<?thp
+use App\Value;
+use App\Box;
+class Label implements App\Named {
+    public string $text;
+    public function __construct(string $text) { $this->text = $text; }
+    public function name(): string { return $this->text; }
+}
+$value: Value<Label> = new Box(new Label("modules"));
+echo $value->value()->name();
+"#,
+        )
+        .unwrap();
+        let compilation = compile_project(&ProjectRequest::new(
+            directory.path(),
+            directory.path().join("main.thp"),
+        ))
+        .unwrap();
+        assert!(
+            compilation.is_success(),
+            "{}",
+            compilation.rendered_diagnostics()
+        );
+        let value_interface = compilation
+            .interfaces
+            .iter()
+            .flat_map(|interface| &interface.exports)
+            .find(|export| export.name == "App\\Value")
+            .unwrap();
+        assert!(
+            value_interface
+                .signature
+                .contains("parameters=T:App\\Named")
+        );
+        let box_export = compilation
+            .interfaces
+            .iter()
+            .flat_map(|interface| &interface.exports)
+            .find(|export| export.name == "App\\Box")
+            .unwrap();
+        assert_eq!(box_export.parent.as_deref(), Some("App\\Base<T>"));
+        let wrapped_export = compilation
+            .interfaces
+            .iter()
+            .flat_map(|interface| &interface.exports)
+            .find(|export| export.name == "App\\Wrapped")
+            .unwrap();
+        assert!(
+            wrapped_export
+                .signature
+                .contains("parameters=U:App\\Value<T>,T:App\\Named")
+        );
+    }
+
+    #[test]
     fn warms_and_loads_a_frozen_project_without_sources() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("src")).unwrap();
@@ -1160,12 +1275,22 @@ mod tests {
         let library = directory.path().join("src/Math.thp");
         std::fs::write(
             &library,
-            "<?thp\nnamespace App;\nfunction calculate(int $value): int { return $value * 2; }\n",
+            r"<?thp
+namespace App;
+interface Left {}
+interface Right {}
+class Item implements Left, Right {}
+class Box<T extends Left> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+",
         )
         .unwrap();
         std::fs::write(
             directory.path().join("main.thp"),
-            "<?thp\nuse function App\\calculate;\necho calculate(2) . \"\";\n",
+            "<?thp\nuse App\\Box;\nuse App\\Item;\n$box = new Box(new Item());\necho \"ok\";\n",
         )
         .unwrap();
         let request = ProjectRequest::new(directory.path(), directory.path().join("main.thp"));
@@ -1175,7 +1300,17 @@ mod tests {
 
         std::fs::write(
             &library,
-            "<?thp\nnamespace App;\nfunction calculate(int $value): int { return $value + 2; }\n",
+            r"<?thp
+namespace App;
+interface Left {}
+interface Right {}
+class Item implements Left, Right {}
+class Box<T extends Left> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { $copy = $this->item; return $copy; }
+}
+",
         )
         .unwrap();
         let (body_edit, _) = cache_warm_project(&request, &store).unwrap();
@@ -1196,7 +1331,17 @@ mod tests {
 
         std::fs::write(
             &library,
-            "<?thp\nnamespace App;\nfunction calculate(int $number): int { return $number + 2; }\n",
+            r"<?thp
+namespace App;
+interface Left {}
+interface Right {}
+class Item implements Left, Right {}
+class Box<T extends Right> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { $copy = $this->item; return $copy; }
+}
+",
         )
         .unwrap();
         let (interface_edit, _) = cache_warm_project(&request, &store).unwrap();

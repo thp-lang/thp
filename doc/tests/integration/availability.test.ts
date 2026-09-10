@@ -63,21 +63,44 @@ describe("0.2.0 contract availability", () => {
     );
   });
 
-  it("keeps iterator protocols, adapters, and transformations proposed", async () => {
+  it("keeps broad class availability partial", async () => {
     const model = await createModel({ root });
-    const iteratorPages = model.pages.filter(
+    const classes = model.pages.find(
+      (page) => page.source.data.id === "guide.languageClassesAndObjects",
+    )!;
+    const status = model.pages.find(
+      (page) => page.source.data.id === "guide.implementationStatus",
+    )!;
+
+    expect(classes.source.data.availability).toBe("partial");
+    expect(status.source.body).toMatch(
+      /\| Classes and interfaces\s+\| partial\s+\|/,
+    );
+  });
+
+  it("implements iterator protocols while keeping traversal adapters proposed", async () => {
+    const model = await createModel({ root });
+    const protocolPages = model.pages.filter(
       (page) =>
-        page.route.startsWith("/std/iterators/") ||
         page.source.data.id === "std.baseTypes.Traversable" ||
         page.source.data.id === "std.baseTypes.Iterator" ||
         page.source.data.id.startsWith("std.baseTypes.Iterator::") ||
         page.source.data.id === "std.baseTypes.IteratorAggregate" ||
         page.source.data.id.startsWith("std.baseTypes.IteratorAggregate::"),
     );
+    const adapterPages = model.pages.filter((page) =>
+      page.route.startsWith("/std/iterators/"),
+    );
 
-    expect(iteratorPages.length).toBeGreaterThan(100);
+    expect(protocolPages.length).toBe(9);
     expect(
-      iteratorPages.every(
+      protocolPages.every(
+        (page) => page.source.data.availability === "implemented",
+      ),
+    ).toBe(true);
+    expect(adapterPages.length).toBeGreaterThan(100);
+    expect(
+      adapterPages.every(
         (page) => page.source.data.availability === "proposed",
       ),
     ).toBe(true);

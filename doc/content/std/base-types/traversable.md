@@ -14,8 +14,8 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This THP contract is proposed and is not yet implemented in this repository.
+availability: implemented
+notice: The interface contract and generic hierarchy checks execute; object-based foreach remains proposed.
 version: "0.1"
 ---
 
@@ -47,15 +47,14 @@ The type parameters are invariant. For example, a
 ## Example
 
 ```thp
-function printValues<K, V>(Traversable<K, V> $values): void {
-    foreach ($values as $value) {
-        var_dump($value);
-    }
+function acceptNames(Traversable<int, string> $values): void
+{
+    // The interface value may be stored or passed onward today.
 }
 ```
 
-The proposed parameter accepts either iterator strategy without exposing its
-concrete implementation. Iterator-object `foreach` is not executable yet.
+The parameter accepts either iterator strategy without exposing its concrete
+implementation. Iterator-object `foreach` is not executable yet.
 
 These concrete declarations are invalid:
 

@@ -5,9 +5,9 @@ use thp_diagnostics::{Diagnostic, SourceFile, Span};
 use crate::{
     Argument, BinaryOp, Block, CatchClause, ClassDecl, Expr, ExprKind, ForClause, ForClauseKind,
     FunctionDecl, InterfaceDecl, LexOutput, LoopBinding, MapEntry, MatchArm, MethodDecl, NameRef,
-    NamespaceDecl, Parameter, Program, PropertyDecl, QualifiedName, ScopeTarget, Stmt, StmtKind,
-    Token, TokenKind, TraitAdaptation, TraitDecl, TraitUse, TypeSyntax, TypeSyntaxKind, UnaryOp,
-    UseDecl, UseKind, Visibility, lex,
+    NamespaceDecl, NominalRef, Parameter, Program, PropertyDecl, QualifiedName, ScopeTarget, Stmt,
+    StmtKind, Token, TokenKind, TraitAdaptation, TraitDecl, TraitUse, TypeParameterDecl,
+    TypeSyntax, TypeSyntaxKind, UnaryOp, UseDecl, UseKind, Visibility, lex,
 };
 
 type ParsedMembers = (Vec<TraitUse>, Vec<PropertyDecl>, Vec<MethodDecl>, Span);
@@ -337,16 +337,18 @@ impl Parser<'_, '_> {
         }
         self.expect(TokenKind::Class, "P0150", "expected `class`")?;
         let name = self.expect(TokenKind::Identifier, "P0151", "expected a class name")?;
+        let type_parameters = self.parse_type_parameters()?;
         let parent = if self.consume(TokenKind::Extends) {
-            Some(self.parse_name_ref("P0152", "expected a parent class name")?)
+            Some(self.parse_nominal_ref("P0152", "expected a parent class type")?)
         } else {
             None
         };
         let mut interfaces = Vec::new();
         if self.consume(TokenKind::Implements) {
             loop {
-                interfaces
-                    .push(self.parse_name_ref("P0153", "expected an implemented interface name")?);
+                interfaces.push(
+                    self.parse_nominal_ref("P0153", "expected an implemented interface type")?,
+                );
                 if !self.consume(TokenKind::Comma) {
                     break;
                 }
@@ -358,6 +360,7 @@ impl Parser<'_, '_> {
             kind: StmtKind::Class(ClassDecl {
                 name: self.text(name.span).to_owned(),
                 name_span: name.span,
+                type_parameters,
                 abstract_class,
                 final_class,
                 parent,
@@ -373,8 +376,9 @@ impl Parser<'_, '_> {
     fn parse_interface(&mut self) -> Option<Stmt> {
         let start = self.advance().span;
         let name = self.expect(TokenKind::Identifier, "P0160", "expected an interface name")?;
+        let type_parameters = self.parse_type_parameters()?;
         let parent = if self.consume(TokenKind::Extends) {
-            let parent = self.parse_name_ref("P0161", "expected a parent interface name")?;
+            let parent = self.parse_nominal_ref("P0161", "expected a parent interface type")?;
             if self.consume(TokenKind::Comma) {
                 self.error_span(
                     "P0162",
@@ -400,10 +404,77 @@ impl Parser<'_, '_> {
             kind: StmtKind::Interface(InterfaceDecl {
                 name: self.text(name.span).to_owned(),
                 name_span: name.span,
+                type_parameters,
                 parent,
                 methods,
             }),
             span: start.join(end),
+        })
+    }
+
+    fn parse_type_parameters(&mut self) -> Option<Vec<TypeParameterDecl>> {
+        if !self.consume(TokenKind::Less) {
+            return Some(Vec::new());
+        }
+        let mut parameters = Vec::new();
+        loop {
+            let name = self.expect(
+                TokenKind::Identifier,
+                "P0190",
+                "expected a type parameter name",
+            )?;
+            let bound = if self.consume(TokenKind::Extends) {
+                Some(self.parse_atomic_type()?)
+            } else {
+                None
+            };
+            parameters.push(TypeParameterDecl {
+                name: self.text(name.span).to_owned(),
+                name_span: name.span,
+                span: bound
+                    .as_ref()
+                    .map_or(name.span, |bound| name.span.join(bound.span)),
+                bound,
+            });
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(
+            TokenKind::Greater,
+            "P0191",
+            "expected `>` after type parameters",
+        )?;
+        Some(parameters)
+    }
+
+    fn parse_nominal_ref(
+        &mut self,
+        code: &'static str,
+        message: &'static str,
+    ) -> Option<NominalRef> {
+        let name = self.parse_qualified_name(true, code, message)?;
+        let mut arguments = Vec::new();
+        let mut end = name.span;
+        if self.consume(TokenKind::Less) {
+            loop {
+                arguments.push(self.parse_type()?);
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+            }
+            end = self
+                .expect(
+                    TokenKind::Greater,
+                    "P0192",
+                    "expected `>` after type arguments",
+                )?
+                .span;
+        }
+        Some(NominalRef {
+            name: name.as_string(),
+            arguments,
+            span: name.span.join(end),
         })
     }
 
@@ -1180,6 +1251,45 @@ impl Parser<'_, '_> {
     fn parse_expression(&mut self, minimum_precedence: u8) -> Option<Expr> {
         let mut left = self.parse_prefix()?;
         loop {
+            if self.at(TokenKind::Less)
+                && matches!(left.kind, ExprKind::Name(_))
+                && let Some((arguments, end)) = self.try_parse_static_type_arguments()
+            {
+                let ExprKind::Name(class_name) = left.kind else {
+                    unreachable!()
+                };
+                let class_span = left.span.join(end);
+                self.expect(
+                    TokenKind::DoubleColon,
+                    "P1003",
+                    "expected `::` after generic class arguments",
+                )?;
+                let name = self.expect(
+                    TokenKind::Identifier,
+                    "P1004",
+                    "expected a member name after `::`",
+                )?;
+                self.expect(
+                    TokenKind::LParen,
+                    "P1005",
+                    "generic static access currently requires a method call",
+                )?;
+                let (call_arguments, call_end) = self.parse_arguments_after_open()?;
+                left = Expr {
+                    kind: ExprKind::StaticCall {
+                        target: ScopeTarget::Named {
+                            name: class_name,
+                            type_arguments: arguments,
+                        },
+                        class_span,
+                        name: self.text(name.span).to_owned(),
+                        name_span: name.span,
+                        arguments: call_arguments,
+                    },
+                    span: left.span.join(call_end),
+                };
+                continue;
+            }
             if self.at(TokenKind::LParen) {
                 if 12 < minimum_precedence {
                     break;
@@ -1253,7 +1363,10 @@ impl Parser<'_, '_> {
                     "self" => ScopeTarget::SelfType,
                     "parent" => ScopeTarget::Parent,
                     "static" => ScopeTarget::Static,
-                    _ => ScopeTarget::Named(class_name.clone()),
+                    _ => ScopeTarget::Named {
+                        name: class_name.clone(),
+                        type_arguments: Vec::new(),
+                    },
                 };
                 self.advance();
                 let name = self.expect(
@@ -1274,7 +1387,11 @@ impl Parser<'_, '_> {
                         span: class_span.join(end),
                     };
                 } else {
-                    let ScopeTarget::Named(class_name) = target else {
+                    let ScopeTarget::Named {
+                        name: class_name,
+                        type_arguments,
+                    } = target
+                    else {
                         self.error_span(
                             "P1005",
                             class_span,
@@ -1282,6 +1399,14 @@ impl Parser<'_, '_> {
                         );
                         return None;
                     };
+                    if !type_arguments.is_empty() {
+                        self.error_span(
+                            "P1005",
+                            class_span,
+                            "generic class constants are not implemented",
+                        );
+                        return None;
+                    }
                     left = Expr {
                         kind: ExprKind::ClassConstant {
                             class_name,
@@ -1305,6 +1430,24 @@ impl Parser<'_, '_> {
                     "P1006",
                     "expected a type name after `instanceof`",
                 )?;
+                if self.consume(TokenKind::Less) {
+                    while !self.at(TokenKind::Greater) && !self.at(TokenKind::Eof) {
+                        let _ = self.parse_type()?;
+                        if !self.consume(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.expect(
+                        TokenKind::Greater,
+                        "P1007",
+                        "expected `>` after instanceof type arguments",
+                    )?;
+                    self.error_span(
+                        "P1007",
+                        class.span.join(end.span),
+                        "`instanceof` is erased; use the bare generic declaration name",
+                    );
+                }
                 let span = left.span.join(class.span);
                 left = Expr {
                     kind: ExprKind::InstanceOf {
@@ -1383,12 +1526,31 @@ impl Parser<'_, '_> {
             TokenKind::New => {
                 let class =
                     self.parse_qualified_name(true, "P1104", "expected a class name after `new`")?;
+                let mut type_arguments = Vec::new();
+                let mut class_span = class.span;
+                if self.consume(TokenKind::Less) {
+                    loop {
+                        type_arguments.push(self.parse_type()?);
+                        if !self.consume(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    class_span = class.span.join(
+                        self.expect(
+                            TokenKind::Greater,
+                            "P1107",
+                            "expected `>` after constructor type arguments",
+                        )?
+                        .span,
+                    );
+                }
                 self.expect(TokenKind::LParen, "P1105", "expected constructor arguments")?;
                 let (arguments, end) = self.parse_arguments_after_open()?;
                 Expr {
                     kind: ExprKind::New {
                         class_name: class.as_string(),
-                        class_span: class.span,
+                        class_span,
+                        type_arguments,
                         arguments,
                     },
                     span: token.span.join(end),
@@ -1451,6 +1613,39 @@ impl Parser<'_, '_> {
             expression = self.finish_call(expression)?;
         }
         Some(expression)
+    }
+
+    fn try_parse_static_type_arguments(&mut self) -> Option<(Vec<TypeSyntax>, Span)> {
+        let saved = self.current;
+        let diagnostic_count = self.diagnostics.len();
+        self.advance();
+        let mut arguments = Vec::new();
+        loop {
+            let Some(argument) = self.parse_type() else {
+                self.current = saved;
+                self.diagnostics.truncate(diagnostic_count);
+                return None;
+            };
+            arguments.push(argument);
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        let Some(end) = self.expect(
+            TokenKind::Greater,
+            "P1003",
+            "expected `>` after generic class arguments",
+        ) else {
+            self.current = saved;
+            self.diagnostics.truncate(diagnostic_count);
+            return None;
+        };
+        if !self.at(TokenKind::DoubleColon) {
+            self.current = saved;
+            self.diagnostics.truncate(diagnostic_count);
+            return None;
+        }
+        Some((arguments, end.span))
     }
 
     fn parse_vector(&mut self, start: Span) -> Option<Expr> {
@@ -1880,6 +2075,54 @@ mod tests {
 
     use super::parse;
     use crate::{BinaryOp, ExprKind, StmtKind};
+
+    #[test]
+    fn parses_generic_nominals_and_explicit_access() {
+        let output = parse(&SourceFile::new(
+            "generic.thp",
+            r"<?thp
+interface Source<T> {}
+class Box<T, U extends Source<T>> implements Source<T> {}
+$box = new Box<int, Source<int>>(1);
+Box<int, Source<int>>::make();
+",
+        ));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let StmtKind::Class(class) = &output.program.statements[1].kind else {
+            panic!("expected class");
+        };
+        assert_eq!(class.type_parameters.len(), 2);
+        assert_eq!(class.interfaces[0].arguments.len(), 1);
+        let StmtKind::Assign { value, .. } = &output.program.statements[2].kind else {
+            panic!("expected construction");
+        };
+        let ExprKind::New { type_arguments, .. } = &value.kind else {
+            panic!("expected new expression");
+        };
+        assert_eq!(type_arguments.len(), 2);
+    }
+
+    #[test]
+    fn diagnoses_malformed_and_runtime_generic_syntax() {
+        let empty = parse(&SourceFile::new("empty.thp", "<?thp\nclass Box<> {}"));
+        assert!(
+            empty
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "P0190")
+        );
+
+        let instanceof = parse(&SourceFile::new(
+            "instanceof.thp",
+            "<?thp\nclass Box<T> {}\n$value = new Box<int>();\n$ok = $value instanceof Box<int>;",
+        ));
+        assert!(
+            instanceof
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "P1007")
+        );
+    }
 
     #[test]
     fn parses_functions_control_flow_and_precedence() {

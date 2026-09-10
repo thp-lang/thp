@@ -3,14 +3,14 @@ use std::fmt;
 use thp_diagnostics::Span;
 use thp_hir::{
     Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type,
+    PropertyId, Type, TypeParameter, TypeParameterId,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 use crate::{
     BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, ExceptionHandler, Function, Instruction,
-    InstructionKind, Method, Program, Property, Terminator, verify,
+    InstructionKind, Method, NominalType, Program, Property, Terminator, verify,
 };
 
 const MAGIC: &[u8; 8] = b"THPBC\0\0\0";
@@ -164,6 +164,20 @@ impl Encoder {
                 self.u8(11);
                 self.string(name);
             }
+            Type::Nominal { name, arguments } => {
+                self.u8(12);
+                self.string(name);
+                self.len(arguments.len());
+                for argument in arguments {
+                    self.ty(argument);
+                }
+            }
+            Type::Parameter { id, name } => {
+                self.u8(13);
+                self.u32(id.owner.0);
+                self.u32(id.index);
+                self.string(name);
+            }
         }
     }
 
@@ -177,6 +191,20 @@ impl Encoder {
         });
         self.u8(u8::from(class.abstract_class));
         self.u8(u8::from(class.final_class));
+        self.len(class.type_parameters.len());
+        for parameter in &class.type_parameters {
+            self.u32(parameter.id.owner.0);
+            self.u32(parameter.id.index);
+            self.string(&parameter.name);
+            match &parameter.bound {
+                Some(bound) => {
+                    self.u8(1);
+                    self.ty(bound);
+                }
+                None => self.u8(0),
+            }
+            self.span(parameter.span);
+        }
         self.len(class.properties.len());
         for property in &class.properties {
             self.ty(&property.ty);
@@ -207,7 +235,26 @@ impl Encoder {
         for interface in &class.interfaces {
             self.u32(interface.0);
         }
+        self.len(class.interface_types.len());
+        for interface in &class.interface_types {
+            self.u32(interface.class.0);
+            self.len(interface.arguments.len());
+            for argument in &interface.arguments {
+                self.ty(argument);
+            }
+        }
         self.u32(class.parent.map_or(NONE, |parent| parent.0));
+        match &class.parent_type {
+            Some(parent) => {
+                self.u8(1);
+                self.u32(parent.class.0);
+                self.len(parent.arguments.len());
+                for argument in &parent.arguments {
+                    self.ty(argument);
+                }
+            }
+            None => self.u8(0),
+        }
     }
 
     fn function(&mut self, function: &Function) {
@@ -694,6 +741,17 @@ impl Decoder<'_> {
                 Type::Union(members)
             }
             11 => Type::Object(self.string()?),
+            12 => Type::Nominal {
+                name: self.string()?,
+                arguments: self.vector(|decoder| decoder.ty(depth + 1))?,
+            },
+            13 => Type::Parameter {
+                id: TypeParameterId {
+                    owner: ClassId(self.u32()?),
+                    index: self.u32()?,
+                },
+                name: self.string()?,
+            },
             tag => return Err(self.error(format!("unknown type tag {tag}"))),
         })
     }
@@ -709,6 +767,25 @@ impl Decoder<'_> {
         };
         let abstract_class = self.boolean()?;
         let final_class = self.boolean()?;
+        let type_parameters = self.vector(|decoder| {
+            let id = TypeParameterId {
+                owner: ClassId(decoder.u32()?),
+                index: decoder.u32()?,
+            };
+            let name = decoder.string()?;
+            let bound = if decoder.boolean()? {
+                Some(decoder.ty(0)?)
+            } else {
+                None
+            };
+            let span = decoder.span()?;
+            Ok(TypeParameter {
+                id,
+                name,
+                bound,
+                span,
+            })
+        })?;
         let properties = self.vector(|decoder| {
             Ok(Property {
                 ty: decoder.ty(0)?,
@@ -732,9 +809,23 @@ impl Decoder<'_> {
         })?;
         let dispatch = self.vector(Self::optional_callee)?;
         let interfaces = self.vector(|decoder| Ok(ClassId(decoder.u32()?)))?;
+        let interface_types = self.vector(|decoder| {
+            Ok(NominalType {
+                class: ClassId(decoder.u32()?),
+                arguments: decoder.vector(|decoder| decoder.ty(0))?,
+            })
+        })?;
         let parent = match self.u32()? {
             NONE => None,
             parent => Some(ClassId(parent)),
+        };
+        let parent_type = if self.boolean()? {
+            Some(NominalType {
+                class: ClassId(self.u32()?),
+                arguments: self.vector(|decoder| decoder.ty(0))?,
+            })
+        } else {
+            None
         };
         Ok(Class {
             id,
@@ -742,11 +833,14 @@ impl Decoder<'_> {
             kind,
             abstract_class,
             final_class,
+            type_parameters,
             properties,
             methods,
             dispatch,
             interfaces,
+            interface_types,
             parent,
+            parent_type,
         })
     }
 

@@ -40,6 +40,12 @@ The verifier checks the current bytecode model as a whole:
 - block terminators target existing blocks and return values match the function;
 - exception-handler ranges and catch targets are structurally valid;
 - built-in calls obey their declared operand and result contracts.
+- generic parameter references belong to existing declarations, nominal
+  argument counts and substituted bounds are valid, and instantiated parent
+  and interface metadata agrees with its erased IDs;
+- inherited and interface method contracts compare only after substitution,
+  and virtual-call argument and result types match the receiver's instantiated
+  signature.
 
 Verification errors are converted into structured compiler diagnostics for
 fresh compilation. A missing or corrupt cache entry is not partially executed;

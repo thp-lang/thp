@@ -18,8 +18,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This THP contract is proposed and is not yet implemented in this repository.
+availability: implemented
+notice: The interface and method-dispatch contract executes; object-based foreach remains proposed.
 version: "0.1"
 ---
 
@@ -40,13 +40,16 @@ independent sources, but freshness is not part of the return type.
 ```thp
 class Users implements IteratorAggregate<int, User>
 {
-    public function __construct(private map<int, User> $users)
+    private Traversable<int, User> $source;
+
+    public function __construct(Traversable<int, User> $source)
     {
+        $this->source = $source;
     }
 
     public function getIterator(): Traversable<int, User>
     {
-        return new MapIterator<int, User>($this->users);
+        return $this->source;
     }
 }
 ```

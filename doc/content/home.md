@@ -69,7 +69,7 @@ persistent cache.
 
 ## Clear experimental boundaries
 
-> THP 0.1 is for command-line experiments. It is not production-ready, is not
+> THP 0.2 is for command-line experiments. It is not production-ready, is not
 > a PHP-compatible replacement, does not execute through the PHP engine, and is
 > not yet a web backend.
 
