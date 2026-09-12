@@ -58,7 +58,9 @@ the filename is the module's final segment, not a requirement that the file
 export a declaration of exactly that name.
 
 The entry file is different. `main.thp` is selected by the CLI, may sit outside
-the mapped directories, and may contain executable top-level statements.
+the mapped directories, and may contain executable top-level statements. A
+project may instead select `public/index.thp`, `bin/console.thp`, or an
+installed package tool for another command; there is no entrypoint registry.
 
 ## Add a contract
 
@@ -241,16 +243,19 @@ availability boundary.
 
 ## Warm a deployable project artifact
 
-For repeated runs, choose a project-local cache directory:
+For a deployment that may compile on a cache miss, generate the lock and choose
+a project-local cache directory:
 
 ```sh
+thp lock
 thp run --opcache=.thp-cache main.thp
 ```
 
-To prepare a frozen project, publish the module interfaces, module objects,
-linked bytecode, and manifest before running:
+To prepare a frozen deployment, generate the lock, then publish the module
+interfaces, module objects, linked bytecode, and manifest before running:
 
 ```sh
+thp lock
 thp cache-warm --opcache=.thp-cache main.thp
 thp run --frozen --opcache=.thp-cache main.thp
 ```

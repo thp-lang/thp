@@ -361,6 +361,122 @@ fn parses_string_and_ordered_list_autoload_mappings() {
 }
 
 #[test]
+fn parses_and_locally_merges_package_roots() {
+    let root = project("[autoload]\npackages = [\"vendor/\", \"shared-vendor/\"]\n");
+    fs::create_dir(root.path().join("vendor")).expect("vendor");
+    fs::create_dir(root.path().join("shared-vendor")).expect("shared vendor");
+    fs::create_dir(root.path().join("local-vendor")).expect("local vendor");
+    fs::write(
+        root.path().join("thp.local.toml"),
+        "[autoload]\npackages = [\"vendor/\", \"local-vendor/\"]\n",
+    )
+    .expect("local config");
+    let config = ProjectConfig::load(root.path()).expect("load");
+    assert_eq!(
+        config.package_roots(),
+        [
+            PathBuf::from("vendor/"),
+            PathBuf::from("shared-vendor/"),
+            PathBuf::from("local-vendor/")
+        ]
+    );
+
+    for value in ["\"\"", "\"../vendor\"", "\"/vendor\""] {
+        let source = format!("[autoload]\npackages = {value}\n");
+        let error = ProjectConfig::parse("thp.toml", &source).expect_err("invalid root");
+        assert_eq!(error.field.as_deref(), Some("autoload.packages"));
+    }
+}
+
+#[test]
+fn discovers_package_mappings_relative_to_each_package_only() {
+    let root = project("[autoload]\npackages = \"vendor/\"\n\"App\\\\\" = \"src/\"\n");
+    let package = root.path().join("vendor/acme/library");
+    fs::create_dir_all(package.join("nested/vendor/ignored/package")).expect("package tree");
+    fs::write(root.path().join("vendor/file"), "ignored").expect("vendor file");
+    fs::write(root.path().join("vendor/acme/file"), "ignored").expect("namespace file");
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\npackages = \"nested/vendor/\"\n\"Acme\\\\Library\\\\\" = [\"src/\", \"generated/\"]\n",
+    )
+    .expect("manifest");
+    fs::write(
+        package.join("thp.local.toml"),
+        "[autoload]\n\"Ignored\\\\\" = \"src/\"\n",
+    )
+    .expect("package local");
+
+    let config = ProjectConfig::load(root.path()).expect("discover");
+    assert_eq!(
+        config.resolved_autoload()["Acme\\Library\\"],
+        [
+            PathBuf::from("vendor/acme/library/src/"),
+            PathBuf::from("vendor/acme/library/generated/")
+        ]
+    );
+    assert!(!config.resolved_autoload().contains_key("Ignored\\"));
+}
+
+#[test]
+fn rejects_missing_manifests_and_exact_prefix_collisions() {
+    let root = project("[autoload]\npackages = \"vendor/\"\n");
+    let package = root.path().join("vendor/acme/one");
+    fs::create_dir_all(&package).expect("package");
+    let error = ProjectConfig::load(root.path()).expect_err("missing manifest");
+    assert_eq!(error.path, package.join("thp.toml"));
+
+    fs::write(package.join("thp.toml"), "[autoload\n").expect("invalid manifest");
+    let error = ProjectConfig::load(root.path()).expect_err("invalid manifest");
+    assert_eq!(error.path, package.join("thp.toml"));
+
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\n\"Same\\\\\" = \"src/\"\n",
+    )
+    .expect("manifest");
+    let second = root.path().join("vendor/acme/two");
+    fs::create_dir_all(&second).expect("second package");
+    fs::write(
+        second.join("thp.toml"),
+        "[autoload]\n\"Same\\\\\" = \"src/\"\n",
+    )
+    .expect("second manifest");
+    let error = ProjectConfig::load(root.path()).expect_err("collision");
+    assert_eq!(error.path, second.join("thp.toml"));
+    assert_eq!(error.field.as_deref(), Some("autoload.Same\\"));
+
+    let root = project("[autoload]\npackages = \"vendor/\"\n\"Project\\\\\" = \"src/\"\n");
+    let package = root.path().join("vendor/acme/package");
+    fs::create_dir_all(&package).expect("package");
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\n\"Project\\\\\" = \"src/\"\n",
+    )
+    .expect("manifest");
+    let error = ProjectConfig::load(root.path()).expect_err("project collision");
+    assert_eq!(error.path, package.join("thp.toml"));
+    assert_eq!(error.field.as_deref(), Some("autoload.Project\\"));
+}
+
+#[test]
+fn package_collision_reports_a_local_mapping_owner() {
+    let root = project("[autoload]\npackages = \"vendor/\"\n");
+    let local = root.path().join("thp.local.toml");
+    fs::write(&local, "[autoload]\n\"Same\\\\\" = \"local-src/\"\n").expect("local config");
+    let package = root.path().join("vendor/acme/package");
+    fs::create_dir_all(&package).expect("package");
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\n\"Same\\\\\" = \"src/\"\n",
+    )
+    .expect("package manifest");
+
+    let error = ProjectConfig::load(root.path()).expect_err("collision");
+    let local = local.display().to_string();
+    assert!(error.message.contains(local.as_str()), "{error}");
+}
+
+#[test]
 fn rejects_invalid_autoload_prefixes_and_empty_directory_lists() {
     for (source, message) in [
         ("[autoload]\nApp = \"src\"\n", "must end with"),

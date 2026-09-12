@@ -72,6 +72,7 @@ pages describing proposals are not promises that the feature executes.
 ## Command-line interface
 
 ```text
+thp lock [--project=DIR]
 thp check [--project=DIR] [--metrics=off|human|json] FILE
 thp inspect [--project=DIR] [--emit=tokens|ast|interfaces|module-graph|hir|mir|bytecode] [--metrics=...] FILE
 thp run [--project=DIR] [--engine=auto|vm|jit] [--opcache=off|PATH] [--max-instructions=N] [--metrics=...] FILE
@@ -81,6 +82,8 @@ thp cache-prune --opcache=PATH [--max-bytes=N] [--metrics=...]
 thp --version
 ```
 
+- `lock` snapshots resolved project and installed-package configuration for
+  deployment.
 - `check` compiles and type-checks without executing.
 - `inspect` displays compiler and project intermediate forms.
 - `run` uses the reference VM or supported JIT subset.

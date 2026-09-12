@@ -43,7 +43,7 @@ modules:
     typeGroup: Types
   data-structures:
     name: Data structures
-    summary: Generic containers, observers, autoloading, and object utilities.
+    summary: Generic containers, observers, and object utilities.
     order: 60
     typeGroup: Types
   extensions:

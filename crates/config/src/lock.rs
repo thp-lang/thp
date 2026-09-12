@@ -5,7 +5,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::diagnostic::SourceLocation;
-use crate::model::{LOCAL_FILE_NAME, PROJECT_FILE_NAME};
+use crate::model::{
+    LOCAL_FILE_NAME, PROJECT_FILE_NAME, validate_namespace_prefix, validate_package_root,
+};
 use crate::{
     ByteSize, Diagnostic, Duration, ExtensionConfig, ExtensionName, Limit, ProjectConfig,
     ResolvedProfile, ResolvedProject, RuntimeConfig, TargetName,
@@ -33,7 +35,7 @@ pub struct LockFile {
 
 impl LockFile {
     /// Loads `thp.lock` and verifies it against the exact presence and contents
-    /// of `thp.toml` and `thp.local.toml`.
+    /// of `thp.toml`, `thp.local.toml`, and discovered package manifests.
     ///
     /// # Errors
     ///
@@ -58,14 +60,21 @@ impl LockFile {
             )
         })?;
         let parsed = parse_lock_at(&bytes, &path)?;
-        let current = source_fingerprint(root)?;
+        let current = source_fingerprint(
+            root,
+            &parsed
+                .package_roots
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>(),
+        )?;
         if parsed.fingerprint != current {
             return Err(LockError::new(
                 LockErrorKind::Stale,
                 &path,
                 None,
                 Some("fingerprint".to_owned()),
-                "lock file is stale because project configuration changed",
+                "lock file is stale because project configuration or installed packages changed",
             ));
         }
         Ok(parsed.into_owned())
@@ -79,9 +88,28 @@ impl LockFile {
         &self.project
     }
 
+    pub fn package_roots(&self) -> &[PathBuf] {
+        &self.project.package_roots
+    }
+
+    pub fn autoload(&self) -> &crate::AutoloadConfig {
+        &self.project.autoload
+    }
+
     /// Selects a target, falling back to common configuration when undeclared.
     pub fn select(&self, target: Option<&str>) -> &ResolvedProfile {
         self.project.select(target)
+    }
+}
+
+impl ProjectConfig {
+    /// Fingerprints root, local, and installed-package configuration sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source error when a configured file or package root cannot be read.
+    pub fn source_fingerprint(&self) -> Result<String, LockError> {
+        source_fingerprint(self.root(), self.package_roots())
     }
 }
 
@@ -100,10 +128,19 @@ pub struct ParsedProfile<'a> {
     pub extensions: Vec<ParsedExtension<'a>>,
 }
 
+/// One resolved namespace mapping borrowed directly from lock bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedAutoloadMapping<'a> {
+    pub prefix: &'a str,
+    pub directories: Vec<&'a str>,
+}
+
 /// A lock representation borrowing extension payloads from the caller's bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedLock<'a> {
     pub fingerprint: &'a str,
+    pub package_roots: Vec<&'a str>,
+    pub autoload: Vec<ParsedAutoloadMapping<'a>>,
     pub common: ParsedProfile<'a>,
     pub targets: Vec<ParsedProfile<'a>>,
 }
@@ -139,9 +176,25 @@ impl ParsedLock<'_> {
                 (target, profile(value))
             })
             .collect();
+        let package_roots = self.package_roots.into_iter().map(PathBuf::from).collect();
+        let autoload = self
+            .autoload
+            .into_iter()
+            .map(|mapping| {
+                (
+                    mapping.prefix.to_owned(),
+                    mapping.directories.into_iter().map(PathBuf::from).collect(),
+                )
+            })
+            .collect();
         LockFile {
             fingerprint: self.fingerprint.to_owned(),
-            project: ResolvedProject { common, targets },
+            project: ResolvedProject {
+                package_roots,
+                autoload,
+                common,
+                targets,
+            },
         }
     }
 }
@@ -272,10 +325,11 @@ pub fn parse_lock(bytes: &[u8]) -> Result<ParsedLock<'_>, LockError> {
 /// loaded, resolved, encoded, or atomically persisted.
 pub fn build_lock(root: impl AsRef<Path>) -> Result<LockBuild, LockError> {
     let root = root.as_ref();
-    let before = source_fingerprint(root)?;
+    let initial = ProjectConfig::load(root).map_err(LockError::source)?;
+    let before = initial.source_fingerprint()?;
     let config = ProjectConfig::load(root).map_err(LockError::source)?;
     let project = config.resolve_all().map_err(LockError::source)?;
-    let after = source_fingerprint(root)?;
+    let after = config.source_fingerprint()?;
     if before != after {
         return Err(LockError::new(
             LockErrorKind::Source,
@@ -351,9 +405,9 @@ fn set_owner_only(path: &Path) -> Result<(), LockError> {
     Ok(())
 }
 
-fn source_fingerprint(root: &Path) -> Result<String, LockError> {
+fn source_fingerprint(root: &Path, package_roots: &[PathBuf]) -> Result<String, LockError> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"THP-CONFIG-SOURCES\0\x01");
+    hasher.update(b"THP-CONFIG-SOURCES\0\x02");
     for (name, required) in [(PROJECT_FILE_NAME, true), (LOCAL_FILE_NAME, false)] {
         hasher.update(&(name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
@@ -380,19 +434,114 @@ fn source_fingerprint(root: &Path) -> Result<String, LockError> {
             }
         }
     }
+    for package_root in package_roots {
+        hash_path(&mut hasher, package_root);
+        let root_path = root.join(package_root);
+        hasher.update(&[u8::from(root_path.is_dir())]);
+        let vendors = fingerprint_directories(&root_path)?;
+        hasher.update(&(vendors.len() as u64).to_le_bytes());
+        for vendor in vendors {
+            let packages = fingerprint_directories(&vendor)?;
+            hasher.update(&(packages.len() as u64).to_le_bytes());
+            for package in packages {
+                let relative = package.strip_prefix(root).unwrap_or(&package);
+                hash_path(&mut hasher, relative);
+                let manifest = package.join(PROJECT_FILE_NAME);
+                match fs::read(&manifest) {
+                    Ok(bytes) => {
+                        hasher.update(&[1]);
+                        hasher.update(&(bytes.len() as u64).to_le_bytes());
+                        hasher.update(&bytes);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        hasher.update(&[0]);
+                    }
+                    Err(error) => {
+                        return Err(LockError::io(
+                            &manifest,
+                            LockErrorKind::Source,
+                            format!("could not fingerprint package manifest: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn fingerprint_directories(path: &Path) -> Result<Vec<PathBuf>, LockError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(LockError::io(
+                path,
+                LockErrorKind::Source,
+                format!("could not scan package directory: {error}"),
+            ));
+        }
+    };
+    let mut directories = entries
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|error| {
+                LockError::io(
+                    path,
+                    LockErrorKind::Source,
+                    format!("could not read package directory entry: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    directories.sort();
+    Ok(directories)
+}
+
+fn hash_path(hasher: &mut blake3::Hasher, path: &Path) {
+    let value = path.to_string_lossy();
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn encode_lock(fingerprint: &str, project: &ResolvedProject) -> Vec<u8> {
     let mut output = Vec::new();
     writeln!(output, "{HEADER} {LOCK_VERSION}").expect("writing to Vec cannot fail");
     writeln!(output, "fingerprint {fingerprint}").expect("writing to Vec cannot fail");
+    writeln!(output, "package-roots {}", project.package_roots.len())
+        .expect("writing to Vec cannot fail");
+    for path in &project.package_roots {
+        encode_payload(&mut output, "package-root", &path.to_string_lossy());
+    }
+    writeln!(output, "autoload {}", project.autoload.len()).expect("writing to Vec cannot fail");
+    for (prefix, directories) in &project.autoload {
+        writeln!(
+            output,
+            "autoload-prefix {} {}",
+            prefix.len(),
+            directories.len()
+        )
+        .expect("writing to Vec cannot fail");
+        output.extend_from_slice(prefix.as_bytes());
+        output.push(b'\n');
+        for directory in directories {
+            encode_payload(&mut output, "autoload-path", &directory.to_string_lossy());
+        }
+    }
     encode_profile(&mut output, None, &project.common);
     for (target, profile) in &project.targets {
         encode_profile(&mut output, Some(target.as_str()), profile);
     }
     output.extend_from_slice(b"end-lock\n");
     output
+}
+
+fn encode_payload(output: &mut Vec<u8>, record: &str, value: &str) {
+    writeln!(output, "{record} {}", value.len()).expect("writing to Vec cannot fail");
+    output.extend_from_slice(value.as_bytes());
+    output.push(b'\n');
 }
 
 fn encode_profile(output: &mut Vec<u8>, target: Option<&str>, profile: &ResolvedProfile) {
@@ -483,6 +632,8 @@ fn parse_lock_at<'a>(bytes: &'a [u8], path: &Path) -> Result<ParsedLock<'a>, Loc
         })
         .ok_or_else(|| cursor.error(None, "invalid source fingerprint"))?;
 
+    let (package_roots, autoload) = parse_project_records(&mut cursor)?;
+
     let common_header = cursor.line("common profile")?;
     if common_header != "profile common" {
         return Err(cursor.error(None, "missing common profile"));
@@ -517,9 +668,102 @@ fn parse_lock_at<'a>(bytes: &'a [u8], path: &Path) -> Result<ParsedLock<'a>, Loc
 
     Ok(ParsedLock {
         fingerprint,
+        package_roots,
+        autoload,
         common,
         targets,
     })
+}
+
+fn parse_project_records<'a>(
+    cursor: &mut Cursor<'a, '_>,
+) -> Result<(Vec<&'a str>, Vec<ParsedAutoloadMapping<'a>>), LockError> {
+    let package_roots_offset = cursor.position;
+    let package_roots_header = cursor.line("package roots")?;
+    if package_roots_header == "profile common" {
+        return Err(cursor.error_at(
+            package_roots_offset,
+            Some("format".to_owned()),
+            "obsolete version-1 lock layout; run `thp lock` to regenerate it",
+        ));
+    }
+    let package_root_count =
+        count_header(package_roots_header, "package-roots").ok_or_else(|| {
+            cursor.error_at(package_roots_offset, None, "invalid package-roots record")
+        })?;
+    let mut package_roots = Vec::new();
+    for _ in 0..package_root_count {
+        let path = parse_payload_record(cursor, "package-root")?;
+        validate_package_root(Path::new(path))
+            .map_err(|message| cursor.error(Some("autoload.packages".to_owned()), message))?;
+        package_roots.push(path);
+    }
+
+    let autoload_offset = cursor.position;
+    let autoload_header = cursor.line("autoload")?;
+    let autoload_count = count_header(autoload_header, "autoload")
+        .ok_or_else(|| cursor.error_at(autoload_offset, None, "invalid autoload record"))?;
+    let mut autoload = Vec::new();
+    let mut previous_prefix = None;
+    for _ in 0..autoload_count {
+        let offset = cursor.position;
+        let header = cursor.line("autoload prefix")?;
+        let fields = header.split(' ').collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0] != "autoload-prefix" {
+            return Err(cursor.error_at(offset, None, "invalid autoload-prefix record"));
+        }
+        let prefix_length = parse_canonical_u64(fields[1])
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| cursor.error_at(offset, None, "invalid autoload prefix length"))?;
+        let directory_count = parse_canonical_u64(fields[2])
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(|| cursor.error_at(offset, None, "invalid autoload path count"))?;
+        let prefix = cursor.payload(prefix_length, "autoload prefix")?;
+        validate_namespace_prefix(prefix).map_err(|message| {
+            cursor.error_at(offset, Some(format!("autoload.{prefix}")), message)
+        })?;
+        if previous_prefix.is_some_and(|previous| previous >= prefix) {
+            return Err(cursor.error_at(
+                offset,
+                Some(format!("autoload.{prefix}")),
+                "autoload prefixes must be unique and lexicographically ordered",
+            ));
+        }
+        let mut directories = Vec::new();
+        for _ in 0..directory_count {
+            let directory = parse_payload_record(cursor, "autoload-path")?;
+            if directory.is_empty() {
+                return Err(cursor.error(
+                    Some(format!("autoload.{prefix}")),
+                    "autoload paths must not be empty",
+                ));
+            }
+            directories.push(directory);
+        }
+        previous_prefix = Some(prefix);
+        autoload.push(ParsedAutoloadMapping {
+            prefix,
+            directories,
+        });
+    }
+    Ok((package_roots, autoload))
+}
+
+fn count_header(line: &str, name: &str) -> Option<usize> {
+    line.strip_prefix(name)
+        .and_then(|value| value.strip_prefix(' '))
+        .and_then(parse_canonical_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn parse_payload_record<'a>(cursor: &mut Cursor<'a, '_>, name: &str) -> Result<&'a str, LockError> {
+    let offset = cursor.position;
+    let length = record_value(cursor, name)?;
+    let length = parse_canonical_u64(length)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| cursor.error_at(offset, Some(name.to_owned()), "invalid byte length"))?;
+    cursor.payload(length, name)
 }
 
 fn parse_profile<'a>(
@@ -676,14 +920,14 @@ impl<'a> Cursor<'a, '_> {
             self.error_at(
                 start,
                 Some(context.to_owned()),
-                "extension payload is shorter than its declared byte length",
+                "payload is shorter than its declared byte length",
             )
         })?;
         if self.source.as_bytes().get(end) != Some(&b'\n') {
             return Err(self.error_at(
                 end.min(self.source.len()),
                 Some(context.to_owned()),
-                "extension payload is not followed by its required LF terminator",
+                "payload is not followed by its required LF terminator",
             ));
         }
         self.position = end + 1;

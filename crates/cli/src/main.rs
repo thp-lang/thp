@@ -10,6 +10,7 @@ use thp_compiler::{
     Compilation, ProjectCompilation, ProjectRequest, cache_warm_project, compile_path,
     compile_path_cached, compile_project, load_frozen_project,
 };
+use thp_config::build_lock;
 use thp_metrics::{Metrics, Stage, TrackingAllocator};
 use thp_opcache::Store;
 use thp_vm::{ExecutionContext, Limits};
@@ -64,6 +65,18 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
         .map_or_else(env::current_dir, Ok)
         .map_err(|error| format!("cannot determine project root: {error}"))?;
     match command.as_str() {
+        "lock" => {
+            if path.is_some() {
+                return Err("`thp lock` does not accept a source file".to_owned());
+            }
+            let result = build_lock(&project_root).map_err(|error| error.to_string())?;
+            println!(
+                "{} {}",
+                if result.changed { "wrote" } else { "unchanged" },
+                result.path.display()
+            );
+            Ok(())
+        }
         "check" => {
             let path = path.ok_or_else(|| "`thp check` requires a source file".to_owned())?;
             let compilation = load_selected_compilation(path, &project_root)?;
@@ -455,6 +468,7 @@ fn print_help() {
 THP standalone compiler and interpreter
 
 Usage:
+  thp lock [--project=DIR]
   thp check [--project=DIR] [--metrics=off|human|json] FILE
   thp inspect [--project=DIR] [--emit=tokens|ast|interfaces|module-graph|hir|mir|bytecode] [--metrics=...] FILE
   thp run [--project=DIR] [--engine=auto|vm|jit] [--opcache=off|PATH] [--max-instructions=N] [--metrics=...] FILE
