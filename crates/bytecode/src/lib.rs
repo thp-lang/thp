@@ -8,15 +8,15 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type, TypeParameter,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId, MethodSlot,
+    NominalKind, PropertyId, RuntimeParameter, Type, TypeParameter,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 2;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -33,8 +33,10 @@ pub struct Class {
     pub kind: NominalKind,
     pub abstract_class: bool,
     pub final_class: bool,
+    pub native: bool,
     pub type_parameters: Vec<TypeParameter>,
     pub properties: Vec<Property>,
+    pub property_initializers: Vec<Option<ConstantValue>>,
     pub methods: Vec<Method>,
     pub dispatch: Vec<Option<Callee>>,
     pub interfaces: Vec<ClassId>,
@@ -67,6 +69,7 @@ pub struct Method {
     pub abstract_method: bool,
     pub final_method: bool,
     pub parameter_types: Vec<Type>,
+    pub parameters: Vec<RuntimeParameter>,
     pub return_type: Type,
 }
 
@@ -182,6 +185,15 @@ pub enum InstructionKind {
         arguments: Vec<Register>,
     },
     NewObject(ClassId),
+    NewDynamic {
+        target: Register,
+        type_arguments: Vec<Type>,
+        arguments: Vec<DynamicArgument>,
+    },
+    CheckedNarrow {
+        value: Register,
+        narrowed: Type,
+    },
     GetProperty {
         object: Register,
         property: PropertyId,
@@ -214,6 +226,13 @@ pub enum InstructionKind {
 }
 
 #[derive(Clone, Debug)]
+pub struct DynamicArgument {
+    pub name: Option<String>,
+    pub value: Register,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
 pub enum Terminator {
     Jump(BlockId),
     Branch {
@@ -239,6 +258,7 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                 kind: class.kind,
                 abstract_class: class.abstract_class,
                 final_class: class.final_class,
+                native: class.native,
                 type_parameters: class.type_parameters.clone(),
                 properties: class
                     .properties
@@ -249,6 +269,7 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                         declaring_class: property.declaring_class,
                     })
                     .collect(),
+                property_initializers: class.property_initializers.clone(),
                 methods: class
                     .methods
                     .iter()
@@ -262,6 +283,7 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                         abstract_method: method.abstract_method,
                         final_method: method.final_method,
                         parameter_types: method.parameter_types.clone(),
+                        parameters: method.parameters.clone(),
                         return_type: method.return_type.clone(),
                     })
                     .collect(),
@@ -443,6 +465,28 @@ fn lower_instruction(instruction: &thp_mir::InstructionKind) -> InstructionKind 
             arguments: arguments.clone(),
         },
         thp_mir::InstructionKind::NewObject(class) => InstructionKind::NewObject(*class),
+        thp_mir::InstructionKind::NewDynamic {
+            target,
+            type_arguments,
+            arguments,
+        } => InstructionKind::NewDynamic {
+            target: *target,
+            type_arguments: type_arguments.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| DynamicArgument {
+                    name: argument.name.clone(),
+                    value: argument.value,
+                    span: argument.span,
+                })
+                .collect(),
+        },
+        thp_mir::InstructionKind::CheckedNarrow { value, narrowed } => {
+            InstructionKind::CheckedNarrow {
+                value: *value,
+                narrowed: narrowed.clone(),
+            }
+        }
         thp_mir::InstructionKind::GetProperty { object, property } => {
             InstructionKind::GetProperty {
                 object: *object,
@@ -734,11 +778,61 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 )));
             }
         }
+        if class.property_initializers.len() != class.properties.len() {
+            return Err(global_error(format!(
+                "{} has inconsistent property initializer metadata",
+                class.name
+            )));
+        }
+        for (property, initializer) in class.properties.iter().zip(&class.property_initializers) {
+            if initializer
+                .as_ref()
+                .is_some_and(|value| !constant_value_matches(&property.ty, value))
+            {
+                return Err(global_error(format!(
+                    "{} has an invalid property initializer",
+                    class.name
+                )));
+            }
+        }
         for method in &class.methods {
             for ty in &method.parameter_types {
                 verify_encoded_type(program, ty)?;
             }
             verify_encoded_type(program, &method.return_type)?;
+            if method.parameters.len() != method.parameter_types.len()
+                || method
+                    .parameters
+                    .iter()
+                    .zip(&method.parameter_types)
+                    .any(|(parameter, ty)| &parameter.ty != ty)
+            {
+                return Err(global_error(format!(
+                    "{} has inconsistent parameter metadata for {}",
+                    class.name, method.name
+                )));
+            }
+            let mut optional = false;
+            for (index, parameter) in method.parameters.iter().enumerate() {
+                verify_encoded_type(program, &parameter.ty)?;
+                if parameter.name.is_empty()
+                    || parameter
+                        .default
+                        .as_ref()
+                        .is_some_and(|value| !constant_value_matches(&parameter.ty, value))
+                    || (parameter.variadic
+                        && (index + 1 != method.parameters.len()
+                            || parameter.default.is_some()
+                            || !matches!(parameter.ty, Type::Vector(_))))
+                    || (!parameter.variadic && parameter.default.is_none() && optional)
+                {
+                    return Err(global_error(format!(
+                        "{} has invalid parameter metadata for {}",
+                        class.name, method.name
+                    )));
+                }
+                optional |= parameter.default.is_some();
+            }
             if method.slot.0 as usize >= class.dispatch.len()
                 || method.declaring_class.0 as usize >= program.classes.len()
             {
@@ -2013,6 +2107,41 @@ fn verify_instruction(
                 return Err(error("allocated object type does not match its class"));
             }
         }
+        InstructionKind::NewDynamic {
+            target,
+            type_arguments,
+            arguments,
+        } => {
+            check_register(function, *target, block, Some(index))?;
+            if function.register_types[target.0 as usize] != Type::String {
+                return Err(error("dynamic class target is not string"));
+            }
+            for ty in type_arguments {
+                verify_encoded_type(program, ty)?;
+                if contains_void(ty) {
+                    return Err(error("dynamic generic argument contains void"));
+                }
+            }
+            for argument in arguments {
+                check_register(function, argument.value, block, Some(index))?;
+                if argument.name.as_ref().is_some_and(String::is_empty) {
+                    return Err(error("dynamic argument name is empty"));
+                }
+            }
+            if instruction.ty.as_ref() != Some(&Type::Mixed) {
+                return Err(error("dynamic construction result is not mixed"));
+            }
+        }
+        InstructionKind::CheckedNarrow { value, narrowed } => {
+            check_register(function, *value, block, Some(index))?;
+            verify_encoded_type(program, narrowed)?;
+            let source = &function.register_types[value.0 as usize];
+            if !valid_checked_narrow(program, source, narrowed)
+                || instruction.ty.as_ref() != Some(narrowed)
+            {
+                return Err(error("invalid checked narrowing target"));
+            }
+        }
         InstructionKind::GetProperty { object, property } => {
             check_register(function, *object, block, Some(index))?;
             let receiver_type = &function.register_types[object.0 as usize];
@@ -2433,6 +2562,21 @@ fn verify_builtin_call(
             .ok_or_else(|| format!("builtin requires a {expected} receiver"))
     };
     match builtin {
+        Builtin::IsString
+        | Builtin::IsInt
+        | Builtin::IsFloat
+        | Builtin::IsNull
+        | Builtin::IsNumeric
+        | Builtin::IsVector
+        | Builtin::IsMap => {
+            if arguments.len() != 1
+                || argument_type(0) == &Type::Void
+                || result != Some(&Type::Bool)
+            {
+                return Err("invalid type-guard signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::Count => {
             if arguments.len() != 1 {
                 return Err("`count` requires one argument".to_owned());
@@ -2838,6 +2982,76 @@ fn constant_type(constant: &Constant) -> Type {
     }
 }
 
+fn constant_value_matches(expected: &Type, value: &ConstantValue) -> bool {
+    match expected {
+        Type::Mixed | Type::Parameter { .. } => true,
+        Type::Union(members) => members
+            .iter()
+            .any(|member| constant_value_matches(member, value)),
+        Type::Int => matches!(value, ConstantValue::Integer(_)),
+        Type::Float => matches!(value, ConstantValue::Float(_)),
+        Type::Bool => matches!(value, ConstantValue::Bool(_)),
+        Type::String => matches!(value, ConstantValue::String(_)),
+        Type::Null => matches!(value, ConstantValue::Null),
+        Type::Vector(element) => matches!(
+            value,
+            ConstantValue::Vector(values)
+                if values.iter().all(|value| constant_value_matches(element, value))
+        ),
+        Type::Map(key, element) => matches!(
+            value,
+            ConstantValue::Map(entries)
+                if entries.iter().all(|(actual_key, value)| {
+                    constant_value_matches(key, actual_key)
+                        && constant_value_matches(element, value)
+                })
+        ),
+        Type::Void | Type::Never | Type::Object(_) | Type::Nominal { .. } => false,
+    }
+}
+
+fn valid_checked_narrow(program: &Program, source: &Type, narrowed: &Type) -> bool {
+    let canonical = matches!(
+        narrowed,
+        Type::String | Type::Int | Type::Float | Type::Null
+    ) || matches!(
+        narrowed,
+        Type::Vector(element) if element.as_ref() == &Type::Mixed
+    ) || matches!(
+        narrowed,
+        Type::Map(key, value)
+            if key.as_ref() == &Type::Mixed && value.as_ref() == &Type::Mixed
+    ) || matches!(
+        narrowed,
+        Type::Union(members) if members.as_slice() == [Type::Int, Type::Float, Type::String]
+    ) || matches!(
+        narrowed,
+        Type::Object(name)
+            if class_by_name(program, name).is_some_and(|class| {
+                class.type_parameters.is_empty()
+                    && matches!(class.kind, NominalKind::Class | NominalKind::Interface)
+            })
+    );
+    (source == &Type::Mixed || type_accepts(program, source, narrowed))
+        && (canonical
+            || (source != &Type::Mixed
+                && match narrowed {
+                    Type::String
+                    | Type::Int
+                    | Type::Float
+                    | Type::Null
+                    | Type::Vector(_)
+                    | Type::Map(_, _)
+                    | Type::Object(_)
+                    | Type::Nominal { .. }
+                    | Type::Parameter { .. } => true,
+                    Type::Union(members) => members
+                        .iter()
+                        .all(|member| valid_checked_narrow(program, source, member)),
+                    Type::Mixed | Type::Bool | Type::Void | Type::Never => false,
+                }))
+}
+
 fn global_error(message: impl Into<String>) -> VerificationError {
     VerificationError {
         function: None,
@@ -3008,6 +3222,82 @@ $box = new Box("\x00\xff");
         let decoded = decode(&encode(&program)).unwrap();
         verify(&decoded).unwrap();
         assert!(decoded.classes.iter().any(|class| class.name == "Box"));
+    }
+
+    #[test]
+    fn dynamic_construction_metadata_and_instructions_round_trip() {
+        let program = compile(
+            r#"<?thp
+class Box {
+    public vector<int> $values = [1, 2];
+    public function __construct(string $name = "box", int ...$items) {}
+}
+$class: mixed = "Box";
+if (is_string($class)) { $box = new $class(name: "dynamic"); }
+"#,
+        );
+        let decoded = decode(&encode(&program)).unwrap();
+        verify(&decoded).unwrap();
+        let class = decoded
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        assert!(class.property_initializers[0].is_some());
+        let constructor = class
+            .methods
+            .iter()
+            .find(|method| method.name == "__construct")
+            .unwrap();
+        assert_eq!(constructor.parameters[0].name, "name");
+        assert!(constructor.parameters[0].default.is_some());
+        assert!(constructor.parameters[1].variadic);
+        assert!(
+            decoded.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction.kind,
+                    super::InstructionKind::NewDynamic { .. }
+                ))
+        );
+
+        let mut forged = decoded.clone();
+        let destination = {
+            let instruction = forged.functions[0]
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.instructions)
+                .find(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        super::InstructionKind::CheckedNarrow { .. }
+                    )
+                })
+                .unwrap();
+            instruction.kind = super::InstructionKind::CheckedNarrow {
+                value: match &instruction.kind {
+                    super::InstructionKind::CheckedNarrow { value, .. } => *value,
+                    _ => unreachable!(),
+                },
+                narrowed: thp_hir::Type::Bool,
+            };
+            instruction.ty = Some(thp_hir::Type::Bool);
+            instruction.destination.unwrap()
+        };
+        forged.functions[0].register_types[destination.0 as usize] = thp_hir::Type::Bool;
+        assert!(verify(&forged).is_err());
+        assert!(
+            decoded.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction.kind,
+                    super::InstructionKind::CheckedNarrow { .. }
+                ))
+        );
     }
 
     #[test]

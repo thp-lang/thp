@@ -966,6 +966,7 @@ dependencies = [
  "tempfile",
  "thp-bytecode",
  "thp-compiler",
+ "thp-config",
  "thp-jit",
  "thp-metrics",
  "thp-opcache",

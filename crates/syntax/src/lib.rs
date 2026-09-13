@@ -10,9 +10,9 @@ mod token;
 pub use ast::{
     Argument, BinaryOp, Block, CatchClause, ClassDecl, Expr, ExprKind, ForClause, ForClauseKind,
     FunctionDecl, InterfaceDecl, LoopBinding, MapEntry, MatchArm, MethodDecl, NameRef,
-    NamespaceDecl, NominalRef, Parameter, Program, PropertyDecl, QualifiedName, ScopeTarget, Stmt,
-    StmtKind, TraitAdaptation, TraitDecl, TraitUse, TypeParameterDecl, TypeSyntax, TypeSyntaxKind,
-    UnaryOp, UseDecl, UseKind, Visibility,
+    NamespaceDecl, NewTarget, NominalRef, Parameter, Program, PropertyDecl, QualifiedName,
+    ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitDecl, TraitUse, TypeParameterDecl,
+    TypeSyntax, TypeSyntaxKind, UnaryOp, UseDecl, UseKind, Visibility,
 };
 pub use lexer::{LexOutput, lex};
 pub use parser::{ParseOutput, parse, parse_tokens};

@@ -136,6 +136,15 @@ pub enum InstructionKind {
         arguments: Vec<Register>,
     },
     NewObject(ClassId),
+    NewDynamic {
+        target: Register,
+        type_arguments: Vec<Type>,
+        arguments: Vec<DynamicArgument>,
+    },
+    CheckedNarrow {
+        value: Register,
+        narrowed: Type,
+    },
     GetProperty {
         object: Register,
         property: PropertyId,
@@ -165,6 +174,13 @@ pub enum InstructionKind {
     RaiseUnhandledMatch(Register),
     Phi(Vec<(BlockId, Register)>),
     Print(Register),
+}
+
+#[derive(Clone, Debug)]
+pub struct DynamicArgument {
+    pub name: Option<String>,
+    pub value: Register,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1185,6 +1201,28 @@ impl<'hir> FunctionBuilder<'hir> {
                             );
                         }
                         return object;
+                    }
+                    TypedExprKind::DynamicNew {
+                        target,
+                        type_arguments,
+                        arguments,
+                    } => InstructionKind::NewDynamic {
+                        target: self.lower_expression(target),
+                        type_arguments: type_arguments.clone(),
+                        arguments: arguments
+                            .iter()
+                            .map(|argument| DynamicArgument {
+                                name: argument.name.clone(),
+                                value: self.lower_expression(&argument.value),
+                                span: argument.span,
+                            })
+                            .collect(),
+                    },
+                    TypedExprKind::CheckedNarrow { value, narrowed } => {
+                        InstructionKind::CheckedNarrow {
+                            value: self.lower_expression(value),
+                            narrowed: narrowed.clone(),
+                        }
                     }
                     TypedExprKind::Property { object, property } => InstructionKind::GetProperty {
                         object: self.lower_expression(object),

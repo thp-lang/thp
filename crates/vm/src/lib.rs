@@ -2,6 +2,7 @@
 
 #![allow(clippy::float_cmp, clippy::too_many_lines)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use thp_bytecode::{
     Function, Instruction, InstructionKind, Program, Terminator, VerificationError, verify,
 };
 use thp_diagnostics::Span;
-use thp_hir::{Builtin, CalledClass, Callee, ClassId, FunctionId, MethodSlot, Type};
+use thp_hir::{Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, MethodSlot, Type};
 use thp_mir::{BlockId, Constant, Register};
 use thp_runtime::{
     HeapStats, RequestHeap, RequestInput, RuntimeError, RuntimeErrorKind, StackFrame, Value,
@@ -277,6 +278,11 @@ pub fn execute_to(
     let active_heap = request_heap.activate();
     let mut state = ExecutionState {
         program,
+        classes_by_name: program
+            .classes
+            .iter()
+            .map(|class| (class.name.as_str(), class.id))
+            .collect(),
         output,
         output_bytes: 0,
         instructions: 0,
@@ -364,6 +370,7 @@ impl Write for FallibleCapture {
 
 struct ExecutionState<'program, 'output> {
     program: &'program Program,
+    classes_by_name: HashMap<&'program str, ClassId>,
     output: &'output mut dyn Write,
     output_bytes: u64,
     instructions: u64,
@@ -385,6 +392,242 @@ struct Frame {
 }
 
 impl ExecutionState<'_, '_> {
+    #[allow(clippy::too_many_arguments)]
+    fn dynamic_new(
+        &mut self,
+        target: &Value,
+        supplied_types: &[Type],
+        arguments: Vec<(Option<String>, Value, Type, Span)>,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let bytes = target.as_bytes().ok_or_else(|| {
+            runtime(
+                RuntimeErrorKind::TypeError("dynamic class target is not string".to_owned()),
+                instruction.span,
+            )
+        })?;
+        let name = std::str::from_utf8(bytes).map_err(|_| {
+            self.native_exception(
+                "ValueError",
+                b"dynamic class name is not valid UTF-8".to_vec(),
+                None,
+                0,
+                instruction.span,
+            )
+        })?;
+        let class_id = self.classes_by_name.get(name).copied().ok_or_else(|| {
+            self.native_exception(
+                "Error",
+                format!("unknown dynamic class `{name}`").into_bytes(),
+                None,
+                0,
+                instruction.span,
+            )
+        })?;
+        let class = self.program.classes[class_id.0 as usize].clone();
+        let fail = |message: String| {
+            self.native_exception("Error", message.into_bytes(), None, 0, instruction.span)
+        };
+        if class.kind != thp_hir::NominalKind::Class || class.abstract_class || class.native {
+            return Err(fail(format!(
+                "class `{name}` is not dynamically constructible"
+            )));
+        }
+        if supplied_types.len() > class.type_parameters.len() {
+            return Err(fail(format!(
+                "class `{name}` expects at most {} generic arguments, found {}",
+                class.type_parameters.len(),
+                supplied_types.len()
+            )));
+        }
+        let mut type_arguments = supplied_types.to_vec();
+        type_arguments.resize(class.type_parameters.len(), Type::Mixed);
+        let instance = thp_bytecode::NominalType {
+            class: class.id,
+            arguments: type_arguments.clone(),
+        };
+        for (parameter, argument) in class.type_parameters.iter().zip(&type_arguments) {
+            if let Some(bound) = &parameter.bound {
+                let bound = substitute_runtime_type(bound, Some(&instance), &class);
+                if argument == &Type::Mixed || !descriptor_accepts(self.program, &bound, argument) {
+                    return Err(fail(format!(
+                        "generic argument `{}` does not satisfy bound `{bound}`",
+                        parameter.name
+                    )));
+                }
+            }
+        }
+
+        let object = Value::try_object(class.id, class.properties.len())
+            .map_err(|kind| runtime(kind, instruction.span))?;
+        for (index, initializer) in class.property_initializers.iter().enumerate() {
+            let Some(initializer) = initializer else {
+                continue;
+            };
+            let property = &class.properties[index];
+            let declaring_instance =
+                runtime_instantiation_for_class(self.program, &instance, property.declaring_class);
+            let declaration = &self.program.classes[property.declaring_class.0 as usize];
+            let ty = substitute_runtime_type(
+                &substitute_runtime_type(&property.ty, Some(&instance), &class),
+                declaring_instance.as_ref(),
+                declaration,
+            );
+            object
+                .set_property(
+                    thp_hir::PropertyId(
+                        u32::try_from(index).expect("verified property count fits u32"),
+                    ),
+                    materialize_constant(initializer, &ty, instruction.span)?,
+                )
+                .map_err(|kind| runtime(kind, instruction.span))?;
+        }
+
+        let Some(method) = class
+            .methods
+            .iter()
+            .find(|method| method.name == "__construct")
+        else {
+            if arguments.is_empty() {
+                return Ok(object);
+            }
+            return Err(fail(format!("class `{name}` has no constructor arguments")));
+        };
+        let Some(callee) = method.callee else {
+            return Err(fail(format!("class `{name}` has no concrete constructor")));
+        };
+        if !runtime_member_accessible(
+            self.program,
+            calling_function.owner,
+            method.declaring_class,
+            method.visibility,
+        ) {
+            return Err(fail(format!(
+                "constructor for `{name}` is not accessible here"
+            )));
+        }
+        let declaring_instance =
+            runtime_instantiation_for_class(self.program, &instance, method.declaring_class);
+        let declaration = &self.program.classes[method.declaring_class.0 as usize];
+        let parameters = method
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let mut parameter = parameter.clone();
+                parameter.ty = substitute_runtime_type(
+                    &substitute_runtime_type(&parameter.ty, Some(&instance), &class),
+                    declaring_instance.as_ref(),
+                    declaration,
+                );
+                parameter
+            })
+            .collect::<Vec<_>>();
+        let variadic = parameters.iter().position(|parameter| parameter.variadic);
+        let mut bound = vec![None; parameters.len()];
+        let mut variadic_values = Vec::new();
+        let mut next = 0;
+        let mut named_seen = false;
+        for (argument_name, value, static_type, span) in arguments {
+            let target = if let Some(argument_name) = argument_name {
+                named_seen = true;
+                parameters
+                    .iter()
+                    .position(|parameter| parameter.name == argument_name && !parameter.variadic)
+                    .ok_or_else(|| {
+                        fail(format!("unknown constructor argument `{argument_name}`"))
+                    })?
+            } else {
+                if named_seen {
+                    return Err(fail(
+                        "positional constructor argument follows a named argument".to_owned(),
+                    ));
+                }
+                while next < parameters.len() && bound[next].is_some() {
+                    next += 1;
+                }
+                if Some(next) == variadic {
+                    let Type::Vector(element) = &parameters[next].ty else {
+                        unreachable!("verified variadic descriptor")
+                    };
+                    if !runtime_argument_matches(self.program, element, &static_type, &value) {
+                        return Err(runtime(
+                            RuntimeErrorKind::TypeError(format!(
+                                "constructor argument has type {}, expected `{element}`",
+                                value.type_name()
+                            )),
+                            span,
+                        ));
+                    }
+                    variadic_values.push(value);
+                    continue;
+                }
+                if next >= parameters.len() {
+                    return Err(fail("too many constructor arguments".to_owned()));
+                }
+                let target = next;
+                next += 1;
+                target
+            };
+            if bound[target].is_some() {
+                return Err(fail(format!(
+                    "constructor parameter `{}` is bound more than once",
+                    parameters[target].name
+                )));
+            }
+            if !runtime_argument_matches(self.program, &parameters[target].ty, &static_type, &value)
+            {
+                return Err(runtime(
+                    RuntimeErrorKind::TypeError(format!(
+                        "constructor argument has type {}, expected `{}`",
+                        value.type_name(),
+                        parameters[target].ty
+                    )),
+                    span,
+                ));
+            }
+            bound[target] = Some(value);
+        }
+        for (index, parameter) in parameters.iter().enumerate() {
+            if parameter.variadic {
+                let Type::Vector(element) = &parameter.ty else {
+                    unreachable!("verified variadic descriptor")
+                };
+                bound[index] = Some(
+                    Value::try_vector(
+                        element.as_ref().clone(),
+                        std::mem::take(&mut variadic_values),
+                    )
+                    .map_err(|kind| runtime(kind, instruction.span))?,
+                );
+            } else if bound[index].is_none() {
+                bound[index] = Some(
+                    parameter
+                        .default
+                        .as_ref()
+                        .map(|value| materialize_constant(value, &parameter.ty, instruction.span))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            fail(format!("missing constructor argument `{}`", parameter.name))
+                        })?,
+                );
+            }
+        }
+        let mut call_arguments = Vec::with_capacity(bound.len() + 1);
+        call_arguments.push(object.clone());
+        call_arguments.extend(bound.into_iter().map(Option::unwrap));
+        self.invoke_callee(
+            callee,
+            call_arguments,
+            depth,
+            Some(class.id),
+            calling_function,
+            instruction,
+        )?;
+        Ok(object)
+    }
+
     fn execute_function(
         &mut self,
         id: FunctionId,
@@ -713,6 +956,45 @@ impl ExecutionState<'_, '_> {
                     .map_err(|kind| runtime(kind, instruction.span))?,
                 )
             }
+            InstructionKind::NewDynamic {
+                target,
+                type_arguments,
+                arguments,
+            } => {
+                let target = get_register(frame, *target, instruction.span)?;
+                let values = arguments
+                    .iter()
+                    .map(|argument| {
+                        Ok((
+                            argument.name.clone(),
+                            get_register(frame, argument.value, argument.span)?,
+                            function.register_types[argument.value.0 as usize].clone(),
+                            argument.span,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, VmError>>()?;
+                Some(self.dynamic_new(
+                    &target,
+                    type_arguments,
+                    values,
+                    depth,
+                    function,
+                    instruction,
+                )?)
+            }
+            InstructionKind::CheckedNarrow { value, narrowed } => {
+                let value = get_register(frame, *value, instruction.span)?;
+                if !value_matches_type(self.program, &value, narrowed) {
+                    return Err(runtime(
+                        RuntimeErrorKind::TypeError(format!(
+                            "value of type {} failed checked narrowing to `{narrowed}`",
+                            value.type_name()
+                        )),
+                        instruction.span,
+                    ));
+                }
+                Some(value)
+            }
             InstructionKind::GetProperty { object, property } => {
                 let object = get_register(frame, *object, instruction.span)?;
                 Some(
@@ -864,6 +1146,17 @@ impl ExecutionState<'_, '_> {
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
         match builtin {
+            Builtin::IsString => Ok(Value::bool(arguments[0].as_bytes().is_some())),
+            Builtin::IsInt => Ok(Value::bool(arguments[0].as_int().is_some())),
+            Builtin::IsFloat => Ok(Value::bool(arguments[0].as_float().is_some())),
+            Builtin::IsNull => Ok(Value::bool(arguments[0].is_null())),
+            Builtin::IsNumeric => Ok(Value::bool(
+                arguments[0].as_int().is_some()
+                    || arguments[0].as_float().is_some()
+                    || arguments[0].as_bytes().is_some_and(is_numeric_string),
+            )),
+            Builtin::IsVector => Ok(Value::bool(arguments[0].vector_values().is_some())),
+            Builtin::IsMap => Ok(Value::bool(arguments[0].map_entries().is_some())),
             Builtin::Count => {
                 let count = arguments[0].count().ok_or_else(|| {
                     runtime(
@@ -1298,6 +1591,337 @@ fn is_instance_of_name(program: &Program, actual: ClassId, expected: &str) -> bo
         .is_some_and(|expected| is_instance_of(program, actual, expected.id))
 }
 
+fn is_numeric_string(bytes: &[u8]) -> bool {
+    fn whitespace(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }
+    if !bytes.is_ascii() {
+        return false;
+    }
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && whitespace(bytes[start]) {
+        start += 1;
+    }
+    while end > start && whitespace(bytes[end - 1]) {
+        end -= 1;
+    }
+    let bytes = &bytes[start..end];
+    let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let before = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    let mut digits = index - before;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        digits += index - fraction;
+    }
+    if digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if exponent == index {
+            return false;
+        }
+    }
+    index == bytes.len()
+}
+
+fn value_matches_type(program: &Program, value: &Value, expected: &Type) -> bool {
+    match expected {
+        Type::Mixed => true,
+        Type::Int => value.as_int().is_some(),
+        Type::Float => value.as_float().is_some(),
+        Type::Bool => value.as_bool().is_some(),
+        Type::String => value.as_bytes().is_some(),
+        Type::Null => value.is_null(),
+        Type::Vector(_) => value.vector_values().is_some(),
+        Type::Map(_, _) => value.map_entries().is_some(),
+        Type::Union(members) => members
+            .iter()
+            .any(|member| value_matches_type(program, value, member)),
+        Type::Object(name) | Type::Nominal { name, .. } => value.class_id().is_some_and(|actual| {
+            program
+                .classes
+                .iter()
+                .find(|class| &class.name == name)
+                .is_some_and(|expected| is_instance_of(program, actual, expected.id))
+        }),
+        Type::Parameter { id, .. } => program
+            .classes
+            .get(id.owner.0 as usize)
+            .and_then(|class| class.type_parameters.get(id.index as usize))
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| value_matches_type(program, value, bound)),
+        Type::Void | Type::Never => false,
+    }
+}
+
+fn descriptor_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
+    expected == &Type::Mixed
+        || actual == &Type::Never
+        || expected == actual
+        || matches!(actual, Type::Parameter { id, .. } if program
+            .classes
+            .get(id.owner.0 as usize)
+            .and_then(|class| class.type_parameters.get(id.index as usize))
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| descriptor_accepts(program, expected, bound)))
+        || matches!(
+            actual,
+            Type::Union(members)
+                if members.iter().all(|member| descriptor_accepts(program, expected, member))
+        )
+        || matches!(
+            expected,
+            Type::Union(members)
+                if members.iter().any(|member| descriptor_accepts(program, member, actual))
+        )
+        || match (expected, actual) {
+            (Type::Object(expected), Type::Object(actual) | Type::Nominal { name: actual, .. }) => {
+                let expected = program.classes.iter().find(|class| &class.name == expected);
+                let actual = program.classes.iter().find(|class| &class.name == actual);
+                expected.zip(actual).is_some_and(|(expected, actual)| {
+                    is_instance_of(program, actual.id, expected.id)
+                })
+            }
+            (
+                Type::Nominal {
+                    name: expected,
+                    arguments: expected_arguments,
+                },
+                Type::Nominal {
+                    name: actual,
+                    arguments: actual_arguments,
+                },
+            ) => {
+                let expected_class = program.classes.iter().find(|class| &class.name == expected);
+                let actual_class = program.classes.iter().find(|class| &class.name == actual);
+                expected_class
+                    .zip(actual_class)
+                    .is_some_and(|(expected, actual)| {
+                        runtime_instantiation_for_class(
+                            program,
+                            &thp_bytecode::NominalType {
+                                class: actual.id,
+                                arguments: actual_arguments.clone(),
+                            },
+                            expected.id,
+                        )
+                        .is_some_and(|instantiated| instantiated.arguments == *expected_arguments)
+                    })
+            }
+            (Type::Vector(expected), Type::Vector(actual)) => {
+                descriptor_accepts(program, expected, actual)
+            }
+            (Type::Map(expected_key, expected_value), Type::Map(actual_key, actual_value)) => {
+                descriptor_accepts(program, expected_key, actual_key)
+                    && descriptor_accepts(program, expected_value, actual_value)
+            }
+            _ => false,
+        }
+}
+
+fn runtime_argument_matches(
+    program: &Program,
+    expected: &Type,
+    static_type: &Type,
+    value: &Value,
+) -> bool {
+    if !matches!(static_type, Type::Mixed | Type::Union(_)) {
+        return descriptor_accepts(program, expected, static_type);
+    }
+    match expected {
+        Type::Nominal { .. } | Type::Parameter { .. } => false,
+        Type::Vector(element) if element.as_ref() != &Type::Mixed => false,
+        Type::Map(key, value) if key.as_ref() != &Type::Mixed || value.as_ref() != &Type::Mixed => {
+            false
+        }
+        _ => value_matches_type(program, value, expected),
+    }
+}
+
+fn substitute_runtime_type(
+    ty: &Type,
+    instantiated: Option<&thp_bytecode::NominalType>,
+    declaration: &thp_bytecode::Class,
+) -> Type {
+    fn apply(
+        ty: &Type,
+        substitutions: &std::collections::BTreeMap<thp_hir::TypeParameterId, Type>,
+    ) -> Type {
+        match ty {
+            Type::Parameter { id, .. } => {
+                substitutions.get(id).cloned().unwrap_or_else(|| ty.clone())
+            }
+            Type::Vector(element) => Type::Vector(Box::new(apply(element, substitutions))),
+            Type::Map(key, value) => Type::Map(
+                Box::new(apply(key, substitutions)),
+                Box::new(apply(value, substitutions)),
+            ),
+            Type::Union(members) => Type::Union(
+                members
+                    .iter()
+                    .map(|member| apply(member, substitutions))
+                    .collect(),
+            ),
+            Type::Nominal { name, arguments } => Type::Nominal {
+                name: name.clone(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| apply(argument, substitutions))
+                    .collect(),
+            },
+            _ => ty.clone(),
+        }
+    }
+    let substitutions = instantiated
+        .into_iter()
+        .flat_map(|instantiated| {
+            declaration
+                .type_parameters
+                .iter()
+                .zip(&instantiated.arguments)
+                .map(|(parameter, argument)| (parameter.id, argument.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    apply(ty, &substitutions)
+}
+
+fn runtime_instantiation_for_class(
+    program: &Program,
+    instantiated: &thp_bytecode::NominalType,
+    target: ClassId,
+) -> Option<thp_bytecode::NominalType> {
+    if instantiated.class == target {
+        return Some(instantiated.clone());
+    }
+    let class = &program.classes[instantiated.class.0 as usize];
+    class
+        .parent_type
+        .iter()
+        .chain(&class.interface_types)
+        .map(|edge| thp_bytecode::NominalType {
+            class: edge.class,
+            arguments: edge
+                .arguments
+                .iter()
+                .map(|argument| substitute_runtime_type(argument, Some(instantiated), class))
+                .collect(),
+        })
+        .find_map(|edge| runtime_instantiation_for_class(program, &edge, target))
+}
+
+fn runtime_member_accessible(
+    program: &Program,
+    owner: Option<ClassId>,
+    declaring: ClassId,
+    visibility: thp_syntax::Visibility,
+) -> bool {
+    match visibility {
+        thp_syntax::Visibility::Public => true,
+        thp_syntax::Visibility::Private => owner == Some(declaring),
+        thp_syntax::Visibility::Protected => owner
+            .is_some_and(|owner| owner == declaring || is_instance_of(program, owner, declaring)),
+    }
+}
+
+fn materialize_constant(
+    value: &ConstantValue,
+    expected: &Type,
+    span: Span,
+) -> Result<Value, VmError> {
+    if !runtime_constant_matches(expected, value) {
+        return Err(runtime(
+            RuntimeErrorKind::TypeError(format!(
+                "constant default is incompatible with `{expected}`"
+            )),
+            span,
+        ));
+    }
+    match value {
+        ConstantValue::Integer(value) => Ok(Value::integer(*value)),
+        ConstantValue::Float(value) => Ok(Value::float(*value)),
+        ConstantValue::Bool(value) => Ok(Value::bool(*value)),
+        ConstantValue::Null => Ok(Value::NULL),
+        ConstantValue::String(value) => {
+            Value::try_bytes(value.clone()).map_err(|kind| runtime(kind, span))
+        }
+        ConstantValue::Vector(values) => {
+            let element = match expected {
+                Type::Vector(element) => element.as_ref().clone(),
+                _ => Type::Mixed,
+            };
+            let values = values
+                .iter()
+                .map(|value| materialize_constant(value, &element, span))
+                .collect::<Result<Vec<_>, _>>()?;
+            Value::try_vector(element, values).map_err(|kind| runtime(kind, span))
+        }
+        ConstantValue::Map(entries) => {
+            let (key, element) = match expected {
+                Type::Map(key, element) => (key.as_ref().clone(), element.as_ref().clone()),
+                _ => (Type::Mixed, Type::Mixed),
+            };
+            let entries = entries
+                .iter()
+                .map(|(actual_key, value)| {
+                    Ok((
+                        materialize_constant(actual_key, &key, span)?,
+                        materialize_constant(value, &element, span)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, VmError>>()?;
+            Value::try_map(key, element, entries).map_err(|kind| runtime(kind, span))
+        }
+    }
+}
+
+fn runtime_constant_matches(expected: &Type, value: &ConstantValue) -> bool {
+    match expected {
+        Type::Mixed => true,
+        Type::Union(members) => members
+            .iter()
+            .any(|member| runtime_constant_matches(member, value)),
+        Type::Int => matches!(value, ConstantValue::Integer(_)),
+        Type::Float => matches!(value, ConstantValue::Float(_)),
+        Type::Bool => matches!(value, ConstantValue::Bool(_)),
+        Type::String => matches!(value, ConstantValue::String(_)),
+        Type::Null => matches!(value, ConstantValue::Null),
+        Type::Vector(element) => matches!(
+            value,
+            ConstantValue::Vector(values)
+                if values.iter().all(|value| runtime_constant_matches(element, value))
+        ),
+        Type::Map(key, element) => matches!(
+            value,
+            ConstantValue::Map(entries)
+                if entries.iter().all(|(actual_key, value)| {
+                    runtime_constant_matches(key, actual_key)
+                        && runtime_constant_matches(element, value)
+                })
+        ),
+        Type::Void
+        | Type::Never
+        | Type::Object(_)
+        | Type::Nominal { .. }
+        | Type::Parameter { .. } => false,
+    }
+}
+
 fn is_instance_of(
     program: &Program,
     mut actual: thp_hir::ClassId,
@@ -1542,7 +2166,40 @@ mod tests {
     use thp_runtime::{RequestInput, RuntimeError, RuntimeErrorKind};
     use thp_syntax::parse;
 
-    use super::{ExecutionContext, Limits, VmError, execute, execute_captured, execute_to};
+    use super::{
+        ExecutionContext, Limits, VmError, execute, execute_captured, execute_to, is_numeric_string,
+    };
+
+    #[test]
+    fn numeric_string_grammar_covers_boundaries() {
+        for accepted in [
+            b"0".as_slice(),
+            b"+42",
+            b"-1.5",
+            b".5",
+            b"1.",
+            b"6.02e23",
+            b"\t -2E-3 \r\n",
+        ] {
+            assert!(is_numeric_string(accepted), "{accepted:?}");
+        }
+        for rejected in [
+            b"".as_slice(),
+            b"  ",
+            b"+",
+            b".",
+            b"1e",
+            b"1x",
+            b"0x10",
+            b"0b10",
+            b"1_0",
+            b"INF",
+            b"NAN",
+            &[0xff],
+        ] {
+            assert!(!is_numeric_string(rejected), "{rejected:?}");
+        }
+    }
 
     fn run(source: &str) -> Result<super::Execution, VmError> {
         let source = SourceFile::new("test.thp", source);
@@ -1568,6 +2225,118 @@ while ($index < 3) {
         .unwrap();
         assert_eq!(execution.output, b"0\n2\n4\n");
         assert!(execution.instructions > 0);
+    }
+
+    #[test]
+    fn dynamically_constructs_after_direct_narrowing() {
+        let execution = run(r#"<?thp
+class Greeter {
+    public string $prefix = "hello";
+    public function __construct(string $name = "world") { $this->prefix = $this->prefix . " " . $name; }
+    public final function message(): string { return $this->prefix; }
+}
+$class: mixed = "Greeter";
+if (is_string($class)) {
+    $value = new $class(name: "THP");
+    if ($value instanceof Greeter) { echo $value->message() . "\n"; }
+}
+$other = new ("Greeter")();
+if ($other instanceof Greeter) { echo $other->message() . "\n"; }
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"hello THP\nhello world\n");
+    }
+
+    #[test]
+    fn guards_match_values_and_php_numeric_strings() {
+        let execution = run(r#"<?thp
+$value: mixed = " -1.25e+2 ";
+if (is_numeric($value)) { var_dump(is_string($value)); }
+var_dump(is_numeric("1."));
+var_dump(is_numeric(".5"));
+var_dump(is_numeric("0x10"));
+var_dump(is_numeric("1_0"));
+var_dump(is_numeric("INF"));
+var_dump(is_int(1));
+var_dump(is_float(1.0));
+var_dump(is_null(null));
+var_dump(is_vector([1]));
+var_dump(is_map({"a" => 1}));
+"#)
+        .unwrap();
+        assert_eq!(
+            execution.output,
+            b"bool(true)\nbool(true)\nbool(true)\nbool(false)\nbool(false)\nbool(false)\nbool(true)\nbool(true)\nbool(true)\nbool(true)\nbool(true)\n"
+        );
+    }
+
+    #[test]
+    fn dynamic_new_preserves_order_and_binds_generic_variadics() {
+        let execution = run(r#"<?thp
+function target(): string { echo "target\n"; return "Box"; }
+function argument(): string { echo "argument\n"; return "value"; }
+class Box<T> {
+    public T $value;
+    public function __construct(T $value, string $suffix = "!", int ...$numbers) {
+        $this->value = $value;
+        echo $suffix . count($numbers) . "\n";
+    }
+}
+$box = new (target())<string>(argument(), "?", 1, 2);
+var_dump($box instanceof Box);
+class Entity {}
+class Named extends Entity {}
+class Pair<T extends Entity, U> {
+    public function __construct(T $first, U $second) {}
+}
+$pairClass: string = "Pair";
+$pair = new $pairClass<Named>(new Named(), "second");
+var_dump($pair instanceof Pair);
+class ParentBox<T> { public function __construct(T $value) {} }
+class ChildBox<U> extends ParentBox<U> {}
+$childClass: string = "ChildBox";
+$child = new $childClass<string>("inherited");
+var_dump($child instanceof ChildBox);
+"#)
+        .unwrap();
+        assert_eq!(
+            execution.output,
+            b"target\nargument\n?2\nbool(true)\nbool(true)\nbool(true)\n"
+        );
+    }
+
+    #[test]
+    fn dynamic_new_reports_lookup_constructibility_and_type_failures() {
+        let execution = run(r#"<?thp
+abstract class AbstractThing {}
+interface Contract {}
+class Secret { private function __construct() {} }
+function attempt(string $name): void {
+    try { $value = new $name(); } catch (Error $error) { echo "error\n"; }
+}
+attempt("Missing");
+attempt("AbstractThing");
+attempt("Contract");
+attempt("Secret");
+$invalid: string = "\xff";
+try { $value = new $invalid(); } catch (ValueError $error) { echo "utf8\n"; }
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"error\nerror\nerror\nerror\nutf8\n");
+
+        let error = run(r#"<?thp
+class TakesInt { public function __construct(int $value) {} }
+$class: string = "TakesInt";
+$value = new $class("wrong");
+"#)
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            VmError::Runtime(RuntimeError {
+                kind: RuntimeErrorKind::TypeError(_),
+                ..
+            })
+        ));
     }
 
     #[test]

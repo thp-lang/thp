@@ -8,15 +8,24 @@ order: 20
 status: experimental
 availability: proposed
 notice: >-
-  The executable runtime implements the core object, throwable, and stream
-  contracts described by their individual notices. Other base-type APIs remain
-  proposals.
+  The executable runtime implements the type guards and the core object,
+  throwable, and stream contracts described by their individual notices. Other
+  base-type APIs remain proposals.
 ---
 
 Base contains foundational values that support other standard-library APIs.
 Engine-defined interfaces and throwable classes belong to the
 Language Reference
 rather than this library section.
+
+The [`is_string()`](thp:std.baseTypes.is_string),
+[`is_int()`](thp:std.baseTypes.is_int),
+[`is_float()`](thp:std.baseTypes.is_float),
+[`is_null()`](thp:std.baseTypes.is_null),
+[`is_numeric()`](thp:std.baseTypes.is_numeric),
+[`is_vector()`](thp:std.baseTypes.is_vector), and
+[`is_map()`](thp:std.baseTypes.is_map) runtime guards accept `mixed` and refine
+a directly guarded local inside a positive `if` or `elseif` branch.
 
 | Type                                                           | Description                                     |
 | -------------------------------------------------------------- | ----------------------------------------------- |

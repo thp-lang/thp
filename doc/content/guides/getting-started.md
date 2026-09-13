@@ -191,10 +191,12 @@ thp run --opcache=.thp-cache --metrics=human hello.thp
 thp cache-prune --opcache=.thp-cache --max-bytes=268435456
 ```
 
-Project deployments can warm a complete linked artifact and then run it
-without scanning mapped source directories:
+Project deployments first lock resolved configuration and package mappings,
+then warm a complete linked artifact and run it without scanning mapped source
+directories:
 
 ```sh
+thp lock --project=examples/project
 thp cache-warm --project=examples/project --opcache=.thp-cache main.thp
 thp run --frozen --project=examples/project --opcache=.thp-cache main.thp
 ```

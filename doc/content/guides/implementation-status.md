@@ -45,10 +45,12 @@ compiler if used as though it were available.
 | `break`, `continue`                                                               | partial      | Level one only; numeric levels are rejected                                                                      |
 | Scalar operators                                                                  | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing |
 | Classes and interfaces                                                            | partial      | Erased generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported  |
+| Dynamic `new`                                                                     | implemented  | Exact compiled canonical class lookup; no runtime loading, autoloading, or reflection                            |
+| `is_*` guards and direct-positive narrowing                                       | implemented  | Direct local guards in `if`/`elseif`; no negation, composition, loop, or branch-join inference                   |
 | Traits                                                                            | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                        |
 | `Throwable`, `Exception`, `Error`, `UnhandledMatchError`                          | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures         |
 | `try`, `catch`, `finally`, `throw`, `using`                                       | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                  |
-| Namespaces, imports, and project autoload discovery                               | implemented  | Semicolon namespaces and deterministic configured source maps; no runtime include/autoload callbacks             |
+| Namespaces, imports, and project/package autoload discovery                       | implemented  | Deterministic configured and installed-package source maps; no downloading or runtime source loading             |
 | OPcache, frozen projects, metrics, embedding, C ABI                               | implemented  | Generic metadata is hashed and schema-versioned; the public C ABI remains version 1                              |
 | Cranelift JIT                                                                     | partial      | Safe scalar subset; automatic mode falls back to the VM                                                          |
 
@@ -132,6 +134,9 @@ execute with identical semantics and falls back to the VM for heap operations,
 control-flow graphs, checked arithmetic, output, objects, method dispatch,
 exception regions, cleanup instructions, or instruction limits.
 
+Dynamic construction, guards over `mixed`, and checked narrowing remain outside
+the JIT subset, so automatic mode executes them in the VM.
+
 ## Deliberately rejected or pending
 
 The current executable subset rejects unsupported syntax instead of inheriting
@@ -142,9 +147,10 @@ PHP behavior. Pending work includes:
   `foreach`, and numeric `break`/`continue` levels;
 - generic and multiple-parent interfaces, interface state, trait constants,
   static properties, property hooks, magic methods, anonymous classes, enums,
-  reflection, and flow narrowing after `instanceof`;
-- global constants, dynamic names, runtime includes/autoload callbacks,
-  attributes, generators, reflection, and cooperative async;
+  reflection;
+- global constants, general dynamic calls and member names, attributes,
+  generators, reflection, and
+  cooperative async;
 - the broader standard library, extension registration/dispatch, concrete
   FastCGI and web-server SAPI adapters, relocatable module code generation,
   dependency-minimal incremental invalidation, broader JIT coverage, hotness
