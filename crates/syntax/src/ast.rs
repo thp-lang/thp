@@ -351,8 +351,7 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     New {
-        class_name: String,
-        class_span: Span,
+        target: NewTarget,
         type_arguments: Vec<TypeSyntax>,
         arguments: Vec<Argument>,
     },
@@ -389,6 +388,15 @@ pub enum ExprKind {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NewTarget {
+    Static {
+        class_name: String,
+        class_span: Span,
+    },
+    Dynamic(Box<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

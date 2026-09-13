@@ -5,6 +5,24 @@ All notable user-visible changes to THP are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). GitHub releases
 remain marked as prereleases while THP is experimental.
 
+## [Unreleased]
+
+### Added
+
+- lang: Implemented exact compiled-class dynamic construction with constructor
+  defaults, named and variadic arguments, inheritance, visibility checks, and
+  runtime generic-bound validation.
+- std: Implemented `is_string`, `is_int`, `is_float`, `is_null`, `is_numeric`,
+  `is_vector`, and `is_map`, with direct positive-branch narrowing for guards
+  and `instanceof`. Narrowing preserves compatible union members and is
+  invalidated by assignment.
+
+### Changed
+
+- bytecode: Bumped the bytecode schema from version 2 to 3 for dynamic
+  construction metadata and checked narrowing; older cached or frozen bytecode
+  must be regenerated.
+
 ## [0.2.0] - 2026-09-02
 
 ### Changed
