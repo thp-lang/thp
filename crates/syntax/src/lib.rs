@@ -14,6 +14,6 @@ pub use ast::{
     StmtKind, TraitAdaptation, TraitDecl, TraitUse, TypeParameterDecl, TypeSyntax, TypeSyntaxKind,
     UnaryOp, UseDecl, UseKind, Visibility,
 };
-pub use lexer::{LexOutput, lex};
-pub use parser::{ParseOutput, parse, parse_tokens};
+pub use lexer::{DocblockSpan, LexOutput, lex, lex_with_docblocks};
+pub use parser::{ParseOutput, TypeParseOutput, parse, parse_tokens, parse_type_prefix};
 pub use token::{Token, TokenKind};

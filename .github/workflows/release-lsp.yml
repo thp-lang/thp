@@ -1,0 +1,134 @@
+name: Release thp-lsp
+
+on:
+  push:
+    tags:
+      - "thp-lsp-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    name: ${{ matrix.archive }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: linux-x86_64
+            extension: tar.gz
+            exe: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: macos-x86_64
+            extension: tar.gz
+            exe: ""
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: macos-arm64
+            extension: tar.gz
+            exe: ""
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: windows-x86_64
+            extension: zip
+            exe: .exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.8.4
+          fallback: none
+      - name: Build language server
+        run: cargo build --locked --release --target ${{ matrix.target }} -p thp-lsp
+      - name: Exercise binary
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/thp-lsp${{ matrix.exe }}"
+          $expected = $env:GITHUB_REF_NAME.Substring("thp-lsp-v".Length)
+          $actual = (& $binary --version) -join "`n"
+          if ($actual -ne "thp-lsp $expected") { throw "tag/version mismatch: $actual" }
+          & $binary --help
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+          & $binary --stdio --version
+          if ($LASTEXITCODE -ne 0) { throw "--stdio failed" }
+      - name: Stage archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#thp-lsp-v}"
+          name="thp-lsp-${version}-${{ matrix.archive }}"
+          mkdir -p "$name/bin"
+          cp "target/${{ matrix.target }}/release/thp-lsp${{ matrix.exe }}" "$name/bin/"
+          cp LICENSE LICENSE-BINARY LICENSING.md NOTICE release/INSTALL-LSP.md "$name/"
+          cargo about generate about.hbs > "$name/THIRD-PARTY-NOTICES"
+          if [[ "${{ matrix.extension }}" == "zip" ]]; then
+            7z a "$name.zip" "$name"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+      - name: Verify extracted archive
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP "thp-lsp-install"
+          New-Item -ItemType Directory -Force $destination | Out-Null
+          $archive = Get-ChildItem "thp-lsp-*.${{ matrix.extension }}" | Select-Object -First 1
+          if ("${{ matrix.extension }}" -eq "zip") {
+            Expand-Archive $archive.FullName -DestinationPath $destination
+          } else {
+            tar -xzf $archive.FullName -C $destination
+            if ($LASTEXITCODE -ne 0) { throw "archive extraction failed" }
+          }
+          $binary = Get-ChildItem $destination -Recurse -File -Filter "thp-lsp${{ matrix.exe }}" | Select-Object -First 1
+          & $binary.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "extracted --version failed" }
+          & $binary.FullName --help
+          if ($LASTEXITCODE -ne 0) { throw "extracted --help failed" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.archive }}
+          path: thp-lsp-*.${{ matrix.extension }}
+          if-no-files-found: error
+
+  publish:
+    needs: archive
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum thp-lsp-* > SHA256SUMS
+      - uses: sigstore/cosign-installer@v4.1.2
+      - name: Sign checksums with GitHub OIDC
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+      - name: Verify checksum signature bundle
+        working-directory: dist
+        run: >-
+          cosign verify-blob
+          --bundle SHA256SUMS.sigstore.json
+          --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-lsp.yml@${GITHUB_REF}"
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          SHA256SUMS
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/thp-lsp-*
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json
