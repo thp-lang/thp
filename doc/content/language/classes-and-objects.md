@@ -56,7 +56,8 @@ replace even a private parent property. Concrete classes are flattened with
 parent slots first, then composed-trait properties, then class properties.
 Inherited slots keep their index. Constant defaults for all flattened
 properties run before the effective constructor, and reading a property that
-was never initialized is a runtime error.
+was never initialized is a runtime error. Property defaults may nest at most
+128 vector or map levels.
 
 ## Interfaces and inheritance
 

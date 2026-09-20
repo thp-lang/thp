@@ -559,7 +559,14 @@ fn parse_layer(path: &Path, source: &str) -> Result<DocumentLayer, Diagnostic> {
                     Diagnostic::at_field(path, source, "autoload.packages", message)
                 })?;
             }
-            package_roots = Some(directories.into_iter().map(PathBuf::from).collect());
+            let mut roots = Vec::new();
+            for directory in directories {
+                let directory = PathBuf::from(directory);
+                if !roots.contains(&directory) {
+                    roots.push(directory);
+                }
+            }
+            package_roots = Some(roots);
         } else {
             validate_namespace_prefix(&prefix).map_err(|message| {
                 Diagnostic::at_field(path, source, format!("autoload.{prefix}"), message)
@@ -715,7 +722,9 @@ fn discover_packages(
                             if directory.components().any(|component| {
                                 matches!(
                                     component,
-                                    std::path::Component::RootDir | std::path::Component::Prefix(_)
+                                    std::path::Component::ParentDir
+                                        | std::path::Component::RootDir
+                                        | std::path::Component::Prefix(_)
                                 )
                             }) {
                                 Err(Diagnostic::at_field(

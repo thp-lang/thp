@@ -8,8 +8,9 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId, MethodSlot,
-    NominalKind, PropertyId, RuntimeParameter, Type, TypeParameter,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId,
+    MAX_CONSTANT_NESTING, MethodSlot, NominalKind, PropertyId, RuntimeParameter, Type,
+    TypeParameter,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
@@ -787,6 +788,14 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
         for (property, initializer) in class.properties.iter().zip(&class.property_initializers) {
             if initializer
                 .as_ref()
+                .is_some_and(|value| !constant_value_within_nesting_limit(value, 0))
+            {
+                return Err(global_error(format!(
+                    "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                )));
+            }
+            if initializer
+                .as_ref()
                 .is_some_and(|value| !constant_value_matches(&property.ty, value))
             {
                 return Err(global_error(format!(
@@ -815,6 +824,15 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
             let mut optional = false;
             for (index, parameter) in method.parameters.iter().enumerate() {
                 verify_encoded_type(program, &parameter.ty)?;
+                if parameter
+                    .default
+                    .as_ref()
+                    .is_some_and(|value| !constant_value_within_nesting_limit(value, 0))
+                {
+                    return Err(global_error(format!(
+                        "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                    )));
+                }
                 if parameter.name.is_empty()
                     || parameter
                         .default
@@ -3010,6 +3028,25 @@ fn constant_value_matches(expected: &Type, value: &ConstantValue) -> bool {
     }
 }
 
+fn constant_value_within_nesting_limit(value: &ConstantValue, depth: usize) -> bool {
+    match value {
+        ConstantValue::Vector(values) => {
+            depth < MAX_CONSTANT_NESTING
+                && values
+                    .iter()
+                    .all(|value| constant_value_within_nesting_limit(value, depth + 1))
+        }
+        ConstantValue::Map(entries) => {
+            depth < MAX_CONSTANT_NESTING
+                && entries.iter().all(|(key, value)| {
+                    constant_value_within_nesting_limit(key, depth + 1)
+                        && constant_value_within_nesting_limit(value, depth + 1)
+                })
+        }
+        _ => true,
+    }
+}
+
 fn valid_checked_narrow(program: &Program, source: &Type, narrowed: &Type) -> bool {
     let canonical = matches!(
         narrowed,
@@ -3298,6 +3335,67 @@ if (is_string($class)) { $box = new $class(name: "dynamic"); }
                     super::InstructionKind::CheckedNarrow { .. }
                 ))
         );
+    }
+
+    #[test]
+    fn typed_constant_defaults_enforce_the_collection_nesting_limit() {
+        fn nested(levels: usize) -> thp_hir::ConstantValue {
+            let mut value = thp_hir::ConstantValue::Null;
+            for level in 0..levels {
+                value = if level % 2 == 0 {
+                    thp_hir::ConstantValue::Vector(vec![value])
+                } else {
+                    thp_hir::ConstantValue::Map(vec![(thp_hir::ConstantValue::Integer(0), value)])
+                };
+            }
+            value
+        }
+
+        let mut program = compile(
+            "<?thp\nclass Box { public mixed $value = null; public function __construct(mixed $value = null) {} }",
+        );
+        let class = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        class.property_initializers[0] = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        class
+            .methods
+            .iter_mut()
+            .find(|method| method.name == "__construct")
+            .unwrap()
+            .parameters[0]
+            .default = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        verify(&program).unwrap();
+
+        let decoded = decode(&encode(&program)).expect("verified bytecode must round-trip");
+        verify(&decoded).unwrap();
+
+        program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap()
+            .property_initializers[0] = Some(nested(thp_hir::MAX_CONSTANT_NESTING + 1));
+        let error = verify(&program).unwrap_err();
+        assert!(error.message.contains("at most 128 collection levels"));
+
+        let class = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        class.property_initializers[0] = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        class
+            .methods
+            .iter_mut()
+            .find(|method| method.name == "__construct")
+            .unwrap()
+            .parameters[0]
+            .default = Some(nested(thp_hir::MAX_CONSTANT_NESTING + 1));
+        let error = verify(&program).unwrap_err();
+        assert!(error.message.contains("at most 128 collection levels"));
     }
 
     #[test]

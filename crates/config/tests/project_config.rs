@@ -389,6 +389,21 @@ fn parses_and_locally_merges_package_roots() {
 }
 
 #[test]
+fn duplicate_project_package_roots_keep_their_first_position() {
+    let root = project("[autoload]\npackages = [\"vendor/\", \"vendor/\"]\n");
+    let package = root.path().join("vendor/acme/library");
+    fs::create_dir_all(&package).expect("package");
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\n\"Acme\\\\Library\\\\\" = \"src/\"\n",
+    )
+    .expect("manifest");
+
+    let config = ProjectConfig::load(root.path()).expect("deduplicate package roots");
+    assert_eq!(config.package_roots(), [PathBuf::from("vendor/")]);
+}
+
+#[test]
 fn discovers_package_mappings_relative_to_each_package_only() {
     let root = project("[autoload]\npackages = \"vendor/\"\n\"App\\\\\" = \"src/\"\n");
     let package = root.path().join("vendor/acme/library");
@@ -415,6 +430,22 @@ fn discovers_package_mappings_relative_to_each_package_only() {
         ]
     );
     assert!(!config.resolved_autoload().contains_key("Ignored\\"));
+}
+
+#[test]
+fn rejects_package_autoload_paths_that_escape_the_package() {
+    let root = project("[autoload]\npackages = \"vendor/\"\n");
+    let package = root.path().join("vendor/acme/library");
+    fs::create_dir_all(&package).expect("package");
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\n\"Escape\\\\\" = \"../outside/\"\n",
+    )
+    .expect("manifest");
+
+    let error = ProjectConfig::load(root.path()).expect_err("escaping package path");
+    assert_eq!(error.field.as_deref(), Some("autoload.Escape\\"));
+    assert!(error.message.contains("relative to the package"));
 }
 
 #[test]

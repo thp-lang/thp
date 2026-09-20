@@ -273,6 +273,8 @@ pub struct RuntimeParameter {
     pub variadic: bool,
 }
 
+pub const MAX_CONSTANT_NESTING: usize = 128;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConstantValue {
     Integer(i64),
@@ -1254,6 +1256,18 @@ impl TypeChecker {
                     &mut self.diagnostics,
                 )
                 .unwrap_or(Type::Mixed);
+                if let Some(initializer) = &property.initializer
+                    && exceeds_constant_nesting_limit(initializer, 0)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0311",
+                        initializer.span,
+                        format!(
+                            "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                        ),
+                    ));
+                }
                 properties.push(Property {
                     id: PropertyId(
                         u32::try_from(properties.len())
@@ -4503,6 +4517,18 @@ fn resolve_parameters(
                     "a required parameter cannot follow a parameter with a default",
                 ));
             }
+            if let Some(default) = &parameter.default
+                && exceeds_constant_nesting_limit(default, 0)
+            {
+                diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0311",
+                    default.span,
+                    format!(
+                        "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                    ),
+                ));
+            }
             ParameterSignature {
                 name: parameter.name.clone(),
                 ty: if parameter.variadic {
@@ -4545,6 +4571,26 @@ fn is_default_constant(expression: &Expr) -> bool {
             .iter()
             .all(|entry| is_default_constant(&entry.key) && is_default_constant(&entry.value)),
         ExprKind::Unary { operand, .. } => is_default_constant(operand),
+        _ => false,
+    }
+}
+
+fn exceeds_constant_nesting_limit(expression: &Expr, depth: usize) -> bool {
+    match &expression.kind {
+        ExprKind::Vector(values) => {
+            depth >= MAX_CONSTANT_NESTING
+                || values
+                    .iter()
+                    .any(|value| exceeds_constant_nesting_limit(value, depth + 1))
+        }
+        ExprKind::Map(entries) => {
+            depth >= MAX_CONSTANT_NESTING
+                || entries.iter().any(|entry| {
+                    exceeds_constant_nesting_limit(&entry.key, depth + 1)
+                        || exceeds_constant_nesting_limit(&entry.value, depth + 1)
+                })
+        }
+        ExprKind::Unary { operand, .. } => exceeds_constant_nesting_limit(operand, depth),
         _ => false,
     }
 }
@@ -6292,10 +6338,10 @@ fn count_loop_clause(clause: &LoopClause) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use thp_diagnostics::SourceFile;
-    use thp_syntax::parse;
+    use thp_diagnostics::{SourceFile, Span};
+    use thp_syntax::{Expr, ExprKind, StmtKind, parse};
 
-    use super::{Type, lower};
+    use super::{MAX_CONSTANT_NESTING, Type, lower};
 
     fn typecheck(source: &str) -> super::LowerOutput {
         let source = SourceFile::new("test.thp", source);
@@ -6310,6 +6356,77 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect()
+    }
+
+    fn check_default_nesting(levels: usize) -> (Vec<thp_diagnostics::Diagnostic>, Span, Span) {
+        let source = SourceFile::new(
+            "test.thp",
+            "<?thp\nclass Box { public mixed $value = null; }\nfunction example(mixed $value = true): void {}",
+        );
+        let mut parsed = parse(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut property_span = None;
+        let mut parameter_span = None;
+        for statement in &mut parsed.program.statements {
+            let default = match &mut statement.kind {
+                StmtKind::Class(class) => {
+                    let default = class.properties[0].initializer.as_mut().unwrap();
+                    property_span = Some(default.span);
+                    default
+                }
+                StmtKind::Function(function) => {
+                    let default = function.parameters[0].default.as_mut().unwrap();
+                    parameter_span = Some(default.span);
+                    default
+                }
+                _ => continue,
+            };
+            for _ in 0..levels {
+                let span = default.span;
+                let value = std::mem::replace(
+                    default,
+                    Expr {
+                        kind: ExprKind::Null,
+                        span,
+                    },
+                );
+                *default = Expr {
+                    kind: ExprKind::Vector(vec![value]),
+                    span,
+                };
+            }
+        }
+        let mut checker = super::TypeChecker::new(&parsed.program);
+        checker.collect_nominal_names(&parsed.program);
+        checker.collect_signatures(&parsed.program);
+        (
+            checker.diagnostics,
+            property_span.unwrap(),
+            parameter_span.unwrap(),
+        )
+    }
+
+    #[test]
+    fn typed_constant_defaults_enforce_the_collection_nesting_limit() {
+        let (accepted, _, _) = check_default_nesting(MAX_CONSTANT_NESTING);
+        assert!(accepted.is_empty(), "{accepted:?}");
+
+        let (rejected, property_span, parameter_span) =
+            check_default_nesting(MAX_CONSTANT_NESTING + 1);
+        let diagnostics = rejected
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "T0311")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.message == "typed constant defaults may nest at most 128 collection levels"
+        }));
+        let locations = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.labels[0].span)
+            .collect::<Vec<_>>();
+        assert!(locations.contains(&property_span));
+        assert!(locations.contains(&parameter_span));
     }
 
     #[test]

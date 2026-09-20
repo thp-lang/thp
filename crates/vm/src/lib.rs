@@ -460,8 +460,12 @@ impl ExecutionState<'_, '_> {
             }
         }
 
-        let object = Value::try_object(class.id, class.properties.len())
-            .map_err(|kind| runtime(kind, instruction.span))?;
+        let object = if is_instance_of_name(self.program, class.id, "Throwable") {
+            Value::try_throwable_object(class.id, class.properties.len())
+        } else {
+            Value::try_object(class.id, class.properties.len())
+        }
+        .map_err(|kind| runtime(kind, instruction.span))?;
         for (index, initializer) in class.property_initializers.iter().enumerate() {
             let Some(initializer) = initializer else {
                 continue;

@@ -2,8 +2,9 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId, MethodSlot,
-    NominalKind, PropertyId, RuntimeParameter, Type, TypeParameter, TypeParameterId,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId,
+    MAX_CONSTANT_NESTING, MethodSlot, NominalKind, PropertyId, RuntimeParameter, Type,
+    TypeParameter, TypeParameterId,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
@@ -1191,8 +1192,10 @@ impl Decoder<'_> {
     }
 
     fn constant_value(&mut self, depth: usize) -> Result<ConstantValue, DecodeError> {
-        if depth > 128 {
-            return Err(self.error("constant nesting exceeds 128 levels"));
+        if depth > MAX_CONSTANT_NESTING {
+            return Err(self.error(format!(
+                "constant nesting exceeds {MAX_CONSTANT_NESTING} levels"
+            )));
         }
         Ok(match self.u8()? {
             0 => ConstantValue::Integer(i64::from_ne_bytes(self.u64()?.to_ne_bytes())),
