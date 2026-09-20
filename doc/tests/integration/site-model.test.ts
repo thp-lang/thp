@@ -347,7 +347,7 @@ describe("documentation site model", () => {
       basePath: "/",
       siteUrl: "https://example.github.io",
     });
-    expect(rootModel.pages).toHaveLength(494);
+    expect(rootModel.pages).toHaveLength(495);
     const subpathModel = await build({
       root,
       basePath: "/typed-php/",
