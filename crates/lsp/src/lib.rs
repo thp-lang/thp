@@ -42,7 +42,7 @@ use thp_modules::{
     ModuleSourceProvider, resolve_type_syntax_in_namespace,
 };
 use thp_syntax::{
-    ClassDecl, DocblockSpan, ExprKind, FunctionDecl, InterfaceDecl, MethodDecl, Program,
+    ClassDecl, DocblockSpan, ExprKind, FunctionDecl, InterfaceDecl, MethodDecl, NewTarget, Program,
     PropertyDecl, Stmt, StmtKind, Token, TokenKind, TraitDecl, TypeSyntax, TypeSyntaxKind, UseKind,
     lex, lex_with_docblocks, parse_tokens, parse_type_prefix,
 };
@@ -1916,7 +1916,11 @@ fn block_local_type(statements: &[Stmt], name: &str, offset: usize) -> Option<St
                 value,
             } if assigned == name => {
                 found = annotation.as_ref().map(ToString::to_string).or_else(|| {
-                    let ExprKind::New { class_name, .. } = &value.kind else {
+                    let ExprKind::New {
+                        target: NewTarget::Static { class_name, .. },
+                        ..
+                    } = &value.kind
+                    else {
                         return None;
                     };
                     Some(class_name.clone())
