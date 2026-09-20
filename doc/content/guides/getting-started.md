@@ -18,7 +18,9 @@ through PHP, install into a PHP server, or provide a production web stack.
 
 Download the archive for your platform from the project's
 [GitHub Releases](https://github.com/thp-lang/thp/releases) page. Extract it and
-add the archive's `bin` directory to `PATH`.
+add the archive's `bin` directory to `PATH`. Main `v*` archives contain the
+`thp` compiler/runtime. The language server has independent `thp-lsp-v*`
+archives on the same releases page.
 
 Open a new terminal and confirm which binary will run:
 
@@ -37,8 +39,9 @@ To work from a source checkout, install Rust 1.88 or newer and build the CLI
 crate from the repository root:
 
 ```sh
-cargo build --release -p thp-cli
+cargo build --release -p thp-cli -p thp-lsp
 target/release/thp --version
+target/release/thp-lsp --version
 ```
 
 During compiler development, `cargo run` can build and invoke the same CLI in

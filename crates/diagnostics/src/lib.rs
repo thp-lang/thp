@@ -27,7 +27,7 @@ impl SourceMap {
             u32::try_from(self.sources.len())
                 .expect("a compilation is limited to u32::MAX sources"),
         );
-        self.sources.push(source);
+        self.sources.push(source.with_source_id(id));
         id
     }
 
@@ -48,6 +48,7 @@ impl SourceMap {
 pub struct Span {
     pub start: u32,
     pub end: u32,
+    pub source: Option<SourceId>,
 }
 
 impl Span {
@@ -61,11 +62,23 @@ impl Span {
         Self {
             start: u32::try_from(start).expect("THP source files are limited to 4 GiB"),
             end: u32::try_from(end).expect("THP source files are limited to 4 GiB"),
+            source: None,
+        }
+    }
+
+    pub fn in_source(source: SourceId, start: usize, end: usize) -> Self {
+        Self {
+            source: Some(source),
+            ..Self::new(start, end)
         }
     }
 
     pub fn empty(offset: usize) -> Self {
         Self::new(offset, offset)
+    }
+
+    pub fn empty_in(source: SourceId, offset: usize) -> Self {
+        Self::in_source(source, offset, offset)
     }
 
     pub fn range(self) -> Range<usize> {
@@ -74,9 +87,14 @@ impl Span {
 
     #[must_use]
     pub fn join(self, other: Self) -> Self {
+        debug_assert!(
+            self.source.is_none() || other.source.is_none() || self.source == other.source,
+            "cannot join spans from different sources"
+        );
         Self {
             start: self.start.min(other.start),
             end: self.end.max(other.end),
+            source: self.source.or(other.source),
         }
     }
 }
@@ -87,6 +105,7 @@ pub struct SourceFile {
     path: Arc<PathBuf>,
     text: Arc<str>,
     line_starts: Arc<[u32]>,
+    source_id: Option<SourceId>,
 }
 
 impl SourceFile {
@@ -109,7 +128,28 @@ impl SourceFile {
             path: Arc::new(path.into()),
             text,
             line_starts: line_starts.into(),
+            source_id: None,
         }
+    }
+
+    fn with_source_id(mut self, source_id: SourceId) -> Self {
+        self.source_id = Some(source_id);
+        self
+    }
+
+    pub fn source_id(&self) -> Option<SourceId> {
+        self.source_id
+    }
+
+    pub fn span(&self, start: usize, end: usize) -> Span {
+        self.source_id.map_or_else(
+            || Span::new(start, end),
+            |source| Span::in_source(source, start, end),
+        )
+    }
+
+    pub fn empty_span(&self, offset: usize) -> Span {
+        self.span(offset, offset)
     }
 
     pub fn path(&self) -> &Path {
@@ -197,7 +237,7 @@ impl Diagnostic {
             severity: Severity::Error,
             message: message.into(),
             labels: vec![Label {
-                source: None,
+                source: span.source,
                 span,
                 message: None,
             }],
@@ -208,7 +248,7 @@ impl Diagnostic {
     #[must_use]
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.labels.push(Label {
-            source: None,
+            source: span.source,
             span,
             message: Some(message.into()),
         });

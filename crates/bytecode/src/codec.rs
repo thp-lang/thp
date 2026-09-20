@@ -808,7 +808,11 @@ impl Decoder<'_> {
         if end < start {
             return Err(self.error("source span ends before it starts"));
         }
-        Ok(Span { start, end })
+        Ok(Span {
+            start,
+            end,
+            source: None,
+        })
     }
 
     fn ty(&mut self, depth: usize) -> Result<Type, DecodeError> {

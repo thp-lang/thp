@@ -316,6 +316,36 @@ pub enum TypeSyntaxKind {
     Union(Vec<TypeSyntax>),
 }
 
+impl std::fmt::Display for TypeSyntax {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            TypeSyntaxKind::Named { name, arguments } if arguments.is_empty() => {
+                formatter.write_str(name)
+            }
+            TypeSyntaxKind::Named { name, arguments } => {
+                write!(formatter, "{name}<")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{argument}")?;
+                }
+                formatter.write_str(">")
+            }
+            TypeSyntaxKind::Nullable(inner) => write!(formatter, "?{inner}"),
+            TypeSyntaxKind::Union(members) => {
+                for (index, member) in members.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str("|")?;
+                    }
+                    write!(formatter, "{member}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,

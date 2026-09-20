@@ -19,6 +19,86 @@ pub struct ParseOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TypeParseOutput {
+    pub ty: Option<TypeSyntax>,
+    pub consumed: Span,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Parses one THP type at the start of `span`, leaving any following text alone.
+pub fn parse_type_prefix(source: &SourceFile, span: Span) -> TypeParseOutput {
+    let start = span.start as usize;
+    let end = (span.end as usize).min(source.len());
+    if start > end || !source.text().is_char_boundary(start) || !source.text().is_char_boundary(end)
+    {
+        return TypeParseOutput {
+            ty: None,
+            consumed: source.empty_span(start.min(source.len())),
+            diagnostics: vec![Diagnostic::error(
+                "parsing",
+                "P0901",
+                source.empty_span(start.min(source.len())),
+                "type span must lie on UTF-8 boundaries",
+            )],
+        };
+    }
+    let fragment = SourceFile::new(source.path(), &source.text()[start..end]);
+    let lexed = lex(&fragment);
+    let mut tokens = lexed.tokens;
+    shift_tokens(&mut tokens, start);
+    let mut lexical_diagnostics = lexed.diagnostics;
+    shift_diagnostics(&mut lexical_diagnostics, start);
+    let mut parser = Parser {
+        source: source.text(),
+        tokens: &tokens,
+        current: 0,
+        diagnostics: Vec::new(),
+    };
+    let ty = parser.parse_type();
+    let consumed = ty.as_ref().map_or(source.empty_span(start), |ty| ty.span);
+    if ty.is_some() {
+        lexical_diagnostics.retain(|diagnostic| {
+            diagnostic
+                .labels
+                .iter()
+                .any(|label| label.span.start < consumed.end)
+        });
+    }
+    lexical_diagnostics.extend(parser.diagnostics);
+    TypeParseOutput {
+        ty,
+        consumed,
+        diagnostics: lexical_diagnostics,
+    }
+}
+
+fn shift_tokens(tokens: &mut [Token], offset: usize) {
+    for token in tokens {
+        token.span.start = token
+            .span
+            .start
+            .saturating_add(u32::try_from(offset).expect("THP source files are limited to 4 GiB"));
+        token.span.end = token
+            .span
+            .end
+            .saturating_add(u32::try_from(offset).expect("THP source files are limited to 4 GiB"));
+    }
+}
+
+fn shift_diagnostics(diagnostics: &mut [Diagnostic], offset: usize) {
+    for diagnostic in diagnostics {
+        for label in &mut diagnostic.labels {
+            label.span.start = label.span.start.saturating_add(
+                u32::try_from(offset).expect("THP source files are limited to 4 GiB"),
+            );
+            label.span.end = label.span.end.saturating_add(
+                u32::try_from(offset).expect("THP source files are limited to 4 GiB"),
+            );
+        }
+    }
+}
+
 pub fn parse(source: &SourceFile) -> ParseOutput {
     let LexOutput {
         tokens,
@@ -2100,7 +2180,7 @@ const fn binary_operator(kind: TokenKind) -> Option<(u8, BinaryOp)> {
 
 #[cfg(test)]
 mod tests {
-    use thp_diagnostics::SourceFile;
+    use thp_diagnostics::{SourceFile, Span};
 
     use super::parse;
     use crate::{BinaryOp, ExprKind, NewTarget, StmtKind};
@@ -2405,5 +2485,32 @@ function build(\Vendor\Contracts\Client $client): Client {
                 output.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn parses_a_nested_type_prefix() {
+        let source = SourceFile::new(
+            "test.thp",
+            "prefix ?map<string, vector<App\\User>> description",
+        );
+        let output = super::parse_type_prefix(&source, Span::new("prefix ".len(), source.len()));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(
+            output.ty.unwrap().to_string(),
+            "?map<string, vector<App\\User>>"
+        );
+        assert_eq!(
+            &source.text()[output.consumed.range()],
+            "?map<string, vector<App\\User>>"
+        );
+    }
+
+    #[test]
+    fn type_prefix_ignores_lex_errors_in_following_text() {
+        let source = SourceFile::new("test.thp", "int described @ runtime");
+        let output = super::parse_type_prefix(&source, Span::new(0, source.len()));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(output.ty.unwrap().to_string(), "int");
+        assert_eq!(output.consumed, Span::new(0, 3));
     }
 }

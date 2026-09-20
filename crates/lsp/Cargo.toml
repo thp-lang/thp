@@ -1,0 +1,32 @@
+[package]
+name = "thp-lsp"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Language Server Protocol support for THP"
+
+[[bin]]
+name = "thp-lsp"
+path = "src/main.rs"
+
+[dependencies]
+lsp-server.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thp-compiler = { path = "../compiler" }
+thp-config = { path = "../config" }
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+thp-modules = { path = "../modules" }
+thp-syntax = { path = "../syntax" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+thp-bytecode = { path = "../bytecode" }
+thp-vm = { path = "../vm" }

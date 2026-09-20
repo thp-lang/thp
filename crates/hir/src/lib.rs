@@ -295,6 +295,31 @@ impl Module {
             .map(|function| count_expressions(&function.body))
             .sum()
     }
+
+    /// Reports nominal inheritance using the resolved class graph retained in HIR.
+    pub fn is_nominal_subtype(&self, actual: &str, expected: &str) -> bool {
+        fn visit(
+            module: &Module,
+            actual: &str,
+            expected: &str,
+            seen: &mut BTreeSet<String>,
+        ) -> bool {
+            if actual == expected {
+                return true;
+            }
+            let Some(class) = module.classes.iter().find(|class| class.name == actual) else {
+                return false;
+            };
+            seen.insert(actual.to_owned())
+                && class
+                    .parent
+                    .iter()
+                    .chain(&class.interfaces)
+                    .any(|parent| visit(module, parent, expected, seen))
+        }
+
+        visit(self, actual, expected, &mut BTreeSet::new())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -620,6 +645,15 @@ struct PendingMethod {
 /// Resolves names and produces typed HIR. A module may be inspected when
 /// diagnostics exist, but must not be lowered to executable code.
 pub fn lower(program: &Program) -> LowerOutput {
+    lower_project(program)
+}
+
+/// Lowers a linked project whose syntax spans already carry their [`SourceId`]
+/// provenance. Declarations, callables, locals, expressions, and diagnostics
+/// retain those source-qualified spans in the resulting HIR.
+///
+/// [`SourceId`]: thp_diagnostics::SourceId
+pub fn lower_project(program: &Program) -> LowerOutput {
     TypeChecker::new(program).lower(program)
 }
 

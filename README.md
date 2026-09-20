@@ -43,9 +43,14 @@ To build from source, install Rust 1.88 or newer and run:
 ```sh
 git clone https://github.com/thp-lang/thp.git
 cd thp
-cargo build --release -p thp-cli
+cargo build --release -p thp-cli -p thp-lsp
 target/release/thp run examples/hello.thp
+target/release/thp-lsp --version
 ```
+
+`thp-lsp` 0.1.0 is released independently under `thp-lsp-v*` tags. Its signed
+archives contain only the experimental language server; editor plugins remain
+separate projects. See the [editor support guide](doc/content/guides/editor-support.md).
 
 The tested [`examples/project`](examples/project) program shows namespaces,
 typed interfaces and classes, collections, project autoloading, and structured

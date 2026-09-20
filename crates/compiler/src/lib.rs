@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use thp_bytecode::{Program as BytecodeProgram, lower as lower_bytecode, verify};
 use thp_config::{AutoloadConfig, LOCK_FILE_NAME, LockFile, ProjectConfig};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, SourceMap, Span};
-use thp_hir::{Module as HirModule, lower as lower_hir};
+use thp_hir::{Module as HirModule, lower as lower_hir, lower_project as lower_project_hir};
 use thp_metrics::{Metrics, Stage};
 use thp_mir::{Module as MirModule, lower as lower_mir};
 use thp_modules::{
@@ -327,6 +327,13 @@ pub fn compile_project_with_provider(
                 metrics: Metrics::default(),
             })?;
         let source_id = sources.add(source.clone());
+        let Some(source) = sources.get(source_id).cloned() else {
+            return Err(LoadError {
+                path: module.path,
+                message: "source map rejected an inserted source".to_owned(),
+                metrics,
+            });
+        };
         let lexed = metrics.measure(Stage::Lexing, || lex(&source));
         let parsed = metrics.measure(Stage::Parsing, || {
             parse_tokens(&source, lexed.tokens, lexed.diagnostics)
@@ -515,16 +522,17 @@ pub fn compile_project_with_provider(
         statements,
         span: entry.ast.span,
     };
-    let lowered_hir = metrics.measure(Stage::Hir, || lower_hir(&linked_ast));
-    diagnostics.extend(
-        lowered_hir
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| ProjectDiagnostic {
-                source: entry.source_id,
-                diagnostic,
-            }),
-    );
+    let lowered_hir = metrics.measure(Stage::Hir, || lower_project_hir(&linked_ast));
+    diagnostics.extend(lowered_hir.diagnostics.into_iter().map(|diagnostic| {
+        ProjectDiagnostic {
+            source: diagnostic
+                .labels
+                .first()
+                .and_then(|label| label.source)
+                .unwrap_or(entry.source_id),
+            diagnostic,
+        }
+    }));
     let hir = lowered_hir.module;
     if !diagnostics.is_empty() {
         return Ok(ProjectCompilation {
@@ -547,7 +555,7 @@ pub fn compile_project_with_provider(
             diagnostic: Diagnostic::error(
                 "bytecode_verification",
                 "B0001",
-                Span::empty(0),
+                Span::empty_in(entry.source_id, 0),
                 error.to_string(),
             ),
         });
@@ -1518,5 +1526,47 @@ class Box<T extends Right> {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn project_hir_and_diagnostics_retain_their_source_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\n\"App\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        let library = directory.path().join("src/Broken.thp");
+        std::fs::write(
+            &library,
+            "<?thp\nnamespace App;\nfunction broken(): int { return \"no\"; }\n",
+        )
+        .unwrap();
+        let entry = directory.path().join("main.thp");
+        std::fs::write(&entry, "<?thp\necho \"entry\";\n").unwrap();
+
+        let compilation = compile_project(&ProjectRequest::new(directory.path(), &entry)).unwrap();
+        let library_id = compilation
+            .units
+            .iter()
+            .find(|unit| unit.source.path() == library)
+            .unwrap()
+            .source_id;
+        assert!(
+            compilation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.source == library_id)
+        );
+        let function = compilation
+            .hir
+            .as_ref()
+            .unwrap()
+            .functions
+            .iter()
+            .find(|function| function.name == "App\\broken")
+            .unwrap();
+        assert_eq!(function.span.source, Some(library_id));
     }
 }
