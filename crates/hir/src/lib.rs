@@ -163,6 +163,25 @@ pub struct PropertyId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MethodSlot(pub u32);
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstantValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+    String(Vec<u8>),
+    Vector(Vec<Self>),
+    Map(Vec<(Self, Self)>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParameterMetadata {
+    pub name: String,
+    pub ty: Type,
+    pub default: Option<ConstantValue>,
+    pub variadic: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NominalKind {
     Class,
@@ -194,6 +213,185 @@ pub enum Builtin {
     ExceptionGetTarget,
     ExceptionGetSystemCode,
     ExceptionGetSuppressed,
+    Reflection(ReflectionBuiltin),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ReflectionBuiltin {
+    TypeAllowsNull,
+    TypeGetDisplayName,
+    TypeEquals,
+    TypeIsAssignableFrom,
+    NamedTypeGetName,
+    NamedTypeIsBuiltin,
+    NamedTypeIsTypeParameter,
+    NamedTypeGetTypeArguments,
+    UnionTypeGetTypes,
+    ClassConstruct,
+    ClassGetName,
+    ClassGetShortName,
+    ClassGetNamespaceName,
+    ClassGetModuleName,
+    ClassGetType,
+    ClassIsAbstract,
+    ClassIsFinal,
+    ClassIsInterface,
+    ClassIsTrait,
+    ClassIsInternal,
+    ClassIsUserDefined,
+    ClassIsInstantiable,
+    ClassGetParentClass,
+    ClassGetInterfaces,
+    ClassGetTraits,
+    ClassGetConstructor,
+    ClassGetDeclaredMethods,
+    ClassGetDeclaredMethod,
+    ClassGetMethods,
+    ClassGetMethod,
+    ClassHasMethod,
+    ClassGetDeclaredProperties,
+    ClassGetDeclaredProperty,
+    ClassGetProperties,
+    ClassGetProperty,
+    ClassHasProperty,
+    ClassNewInstanceArgs,
+    CallableGetName,
+    CallableGetShortName,
+    CallableGetNamespaceName,
+    CallableGetModuleName,
+    CallableGetNumberOfParameters,
+    CallableGetNumberOfRequiredParameters,
+    CallableGetParameters,
+    CallableGetReturnType,
+    CallableIsVariadic,
+    CallableIsInternal,
+    CallableIsUserDefined,
+    FunctionConstruct,
+    MethodConstruct,
+    PropertyConstruct,
+    ParameterConstruct,
+    FunctionInvokeArgs,
+    MethodGetDeclaringClass,
+    MethodGetOriginTrait,
+    MethodGetOriginMethod,
+    MethodIsPublic,
+    MethodIsProtected,
+    MethodIsPrivate,
+    MethodIsStatic,
+    MethodIsAbstract,
+    MethodIsFinal,
+    MethodIsConstructor,
+    MethodInvokeArgs,
+    PropertyGetName,
+    PropertyGetDeclaringClass,
+    PropertyGetOriginTrait,
+    PropertyGetType,
+    PropertyHasDefaultValue,
+    PropertyGetDefaultValue,
+    PropertyIsPublic,
+    PropertyIsProtected,
+    PropertyIsPrivate,
+    PropertyIsStatic,
+    PropertyGetValue,
+    PropertySetValue,
+    ParameterGetName,
+    ParameterGetPosition,
+    ParameterGetType,
+    ParameterGetDeclaringFunction,
+    ParameterIsDefaultValueAvailable,
+    ParameterGetDefaultValue,
+    ParameterIsOptional,
+    ParameterIsVariadic,
+}
+
+impl ReflectionBuiltin {
+    pub const ALL: &'static [Self] = &[
+        Self::TypeAllowsNull,
+        Self::TypeGetDisplayName,
+        Self::TypeEquals,
+        Self::TypeIsAssignableFrom,
+        Self::NamedTypeGetName,
+        Self::NamedTypeIsBuiltin,
+        Self::NamedTypeIsTypeParameter,
+        Self::NamedTypeGetTypeArguments,
+        Self::UnionTypeGetTypes,
+        Self::ClassConstruct,
+        Self::ClassGetName,
+        Self::ClassGetShortName,
+        Self::ClassGetNamespaceName,
+        Self::ClassGetModuleName,
+        Self::ClassGetType,
+        Self::ClassIsAbstract,
+        Self::ClassIsFinal,
+        Self::ClassIsInterface,
+        Self::ClassIsTrait,
+        Self::ClassIsInternal,
+        Self::ClassIsUserDefined,
+        Self::ClassIsInstantiable,
+        Self::ClassGetParentClass,
+        Self::ClassGetInterfaces,
+        Self::ClassGetTraits,
+        Self::ClassGetConstructor,
+        Self::ClassGetDeclaredMethods,
+        Self::ClassGetDeclaredMethod,
+        Self::ClassGetMethods,
+        Self::ClassGetMethod,
+        Self::ClassHasMethod,
+        Self::ClassGetDeclaredProperties,
+        Self::ClassGetDeclaredProperty,
+        Self::ClassGetProperties,
+        Self::ClassGetProperty,
+        Self::ClassHasProperty,
+        Self::ClassNewInstanceArgs,
+        Self::CallableGetName,
+        Self::CallableGetShortName,
+        Self::CallableGetNamespaceName,
+        Self::CallableGetModuleName,
+        Self::CallableGetNumberOfParameters,
+        Self::CallableGetNumberOfRequiredParameters,
+        Self::CallableGetParameters,
+        Self::CallableGetReturnType,
+        Self::CallableIsVariadic,
+        Self::CallableIsInternal,
+        Self::CallableIsUserDefined,
+        Self::FunctionConstruct,
+        Self::MethodConstruct,
+        Self::PropertyConstruct,
+        Self::ParameterConstruct,
+        Self::FunctionInvokeArgs,
+        Self::MethodGetDeclaringClass,
+        Self::MethodGetOriginTrait,
+        Self::MethodGetOriginMethod,
+        Self::MethodIsPublic,
+        Self::MethodIsProtected,
+        Self::MethodIsPrivate,
+        Self::MethodIsStatic,
+        Self::MethodIsAbstract,
+        Self::MethodIsFinal,
+        Self::MethodIsConstructor,
+        Self::MethodInvokeArgs,
+        Self::PropertyGetName,
+        Self::PropertyGetDeclaringClass,
+        Self::PropertyGetOriginTrait,
+        Self::PropertyGetType,
+        Self::PropertyHasDefaultValue,
+        Self::PropertyGetDefaultValue,
+        Self::PropertyIsPublic,
+        Self::PropertyIsProtected,
+        Self::PropertyIsPrivate,
+        Self::PropertyIsStatic,
+        Self::PropertyGetValue,
+        Self::PropertySetValue,
+        Self::ParameterGetName,
+        Self::ParameterGetPosition,
+        Self::ParameterGetType,
+        Self::ParameterGetDeclaringFunction,
+        Self::ParameterIsDefaultValueAvailable,
+        Self::ParameterGetDefaultValue,
+        Self::ParameterIsOptional,
+        Self::ParameterIsVariadic,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,16 +414,21 @@ pub struct Class {
     pub kind: NominalKind,
     pub abstract_class: bool,
     pub final_class: bool,
+    pub module_name: String,
+    pub native: bool,
     pub type_parameters: Vec<TypeParameter>,
     pub parent: Option<String>,
     pub parent_type: Option<Type>,
     pub interfaces: Vec<String>,
     pub interface_types: Vec<Type>,
     pub properties: Vec<Property>,
+    pub declared_properties: Vec<Property>,
     pub methods: Vec<Method>,
+    pub declared_methods: Vec<Method>,
     pub method_slots: Vec<MethodSlot>,
     pub dispatch: Vec<Option<Callee>>,
     pub constructor: Option<Callee>,
+    pub traits: Vec<ClassId>,
     pub span: Span,
 }
 
@@ -236,6 +439,8 @@ pub struct Property {
     pub ty: Type,
     pub visibility: Visibility,
     pub declaring_class: ClassId,
+    pub default: Option<ConstantValue>,
+    pub origin_trait: Option<ClassId>,
     pub span: Span,
 }
 
@@ -250,7 +455,10 @@ pub struct Method {
     pub abstract_method: bool,
     pub final_method: bool,
     pub parameter_types: Vec<Type>,
+    pub parameters: Vec<ParameterMetadata>,
     pub return_type: Type,
+    pub origin_trait: Option<ClassId>,
+    pub origin_name: String,
     pub span: Span,
 }
 
@@ -271,7 +479,9 @@ impl Module {
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub module_name: String,
     pub parameters: Vec<LocalId>,
+    pub parameter_metadata: Vec<ParameterMetadata>,
     pub locals: Vec<Local>,
     pub return_type: Type,
     pub owner: Option<ClassId>,
@@ -541,6 +751,7 @@ struct ClassSignature {
     kind: NominalKind,
     abstract_class: bool,
     final_class: bool,
+    module_name: String,
     type_parameters: Vec<TypeParameter>,
     type_parameter_syntax: Vec<SyntaxTypeParameter>,
     parent: Option<String>,
@@ -553,6 +764,7 @@ struct ClassSignature {
     declared_properties: Vec<Property>,
     declared_property_initializers: Vec<Option<Expr>>,
     declared_methods: BTreeMap<String, MethodSignature>,
+    declared_method_order: Vec<String>,
     properties: Vec<Property>,
     property_initializers: Vec<Option<Expr>>,
     methods: BTreeMap<String, MethodSignature>,
@@ -574,7 +786,14 @@ struct PendingMethod {
 /// Resolves names and produces typed HIR. A module may be inspected when
 /// diagnostics exist, but must not be lowered to executable code.
 pub fn lower(program: &Program) -> LowerOutput {
-    TypeChecker::new(program).lower(program)
+    lower_with_modules(program, &BTreeMap::new())
+}
+
+pub fn lower_with_modules(
+    program: &Program,
+    declaration_modules: &BTreeMap<String, String>,
+) -> LowerOutput {
+    TypeChecker::new(program, declaration_modules).lower(program)
 }
 
 struct TypeChecker {
@@ -584,10 +803,11 @@ struct TypeChecker {
     functions: Vec<Option<Function>>,
     pending_methods: Vec<PendingMethod>,
     method_slots: BTreeMap<String, MethodSlot>,
+    declaration_modules: BTreeMap<String, String>,
 }
 
 impl TypeChecker {
-    fn new(_program: &Program) -> Self {
+    fn new(_program: &Program, declaration_modules: &BTreeMap<String, String>) -> Self {
         Self {
             diagnostics: Vec::new(),
             signatures: BTreeMap::new(),
@@ -595,6 +815,7 @@ impl TypeChecker {
             functions: vec![None],
             pending_methods: Vec::new(),
             method_slots: BTreeMap::new(),
+            declaration_modules: declaration_modules.clone(),
         }
     }
 
@@ -625,6 +846,9 @@ impl TypeChecker {
             &mut self.diagnostics,
             entry,
             "<main>",
+            self.declaration_modules
+                .get("<main>")
+                .map_or("@entry", String::as_str),
             Type::Void,
             program.span,
             None,
@@ -646,6 +870,9 @@ impl TypeChecker {
                 &mut self.diagnostics,
                 signature.id,
                 &declaration.name,
+                self.declaration_modules
+                    .get(&declaration.name)
+                    .map_or("@entry", String::as_str),
                 signature.return_type.clone(),
                 statement.span,
                 None,
@@ -672,6 +899,7 @@ impl TypeChecker {
                 &mut self.diagnostics,
                 pending.id,
                 &format!("{}::{}", class.name, pending.declaration.function.name),
+                &class.module_name,
                 pending.signature.return_type.clone(),
                 pending.span,
                 Some(class.id),
@@ -696,7 +924,9 @@ impl TypeChecker {
                         u32::try_from(index).expect("function count is limited to u32::MAX"),
                     ),
                     name: format!("<invalid-{index}>"),
+                    module_name: "@entry".to_owned(),
                     parameters: Vec::new(),
+                    parameter_metadata: Vec::new(),
                     locals: Vec::new(),
                     return_type: Type::Never,
                     owner: None,
@@ -706,54 +936,80 @@ impl TypeChecker {
                 })
             })
             .collect();
+        let class_ids = self
+            .classes
+            .iter()
+            .map(|(name, class)| (name.clone(), class.id))
+            .collect::<BTreeMap<_, _>>();
         let mut classes = self
             .classes
             .into_values()
-            .map(|class| Class {
-                id: class.id,
-                name: class.name,
-                kind: class.kind,
-                abstract_class: class.abstract_class,
-                final_class: class.final_class,
-                type_parameters: class.type_parameters,
-                parent: class.parent,
-                parent_type: class.parent_type,
-                interfaces: class.interfaces,
-                interface_types: class.interface_types,
-                properties: class.properties,
-                methods: class
+            .map(|class| {
+                let methods = class
                     .methods
-                    .clone()
-                    .into_iter()
-                    .map(|(name, method)| Method {
-                        name,
-                        callee: method.callee,
-                        slot: method.slot,
-                        declaring_class: method.declaring_class,
-                        visibility: method.visibility,
-                        static_method: method.static_method,
-                        abstract_method: method.abstract_method,
-                        final_method: method.final_method,
-                        parameter_types: method
-                            .signature
-                            .parameters
-                            .iter()
-                            .map(|parameter| parameter.ty.clone())
-                            .collect(),
-                        return_type: method.signature.return_type,
-                        span: method.span,
+                    .iter()
+                    .map(|(name, method)| method_metadata(name, method, &class_ids))
+                    .collect::<Vec<_>>();
+                let mut declared_methods = class
+                    .declared_method_order
+                    .iter()
+                    .filter_map(|name| {
+                        class
+                            .methods
+                            .get(name)
+                            .filter(|method| method.declaring_class == class.id)
+                            .map(|method| method_metadata(name, method, &class_ids))
                     })
-                    .collect(),
-                method_slots: class.methods.values().map(|method| method.slot).collect(),
-                dispatch: {
-                    let mut dispatch = vec![None; self.method_slots.len()];
-                    for method in class.methods.values() {
-                        dispatch[method.slot.0 as usize] = method.callee;
+                    .collect::<Vec<_>>();
+                for (name, method) in &class.methods {
+                    if method.declaring_class == class.id
+                        && !declared_methods
+                            .iter()
+                            .any(|existing| existing.name == *name)
+                    {
+                        declared_methods.push(method_metadata(name, method, &class_ids));
                     }
-                    dispatch
-                },
-                constructor: class.constructor,
-                span: class.span,
+                }
+                let declared_properties = class
+                    .properties
+                    .iter()
+                    .filter(|property| property.declaring_class == class.id)
+                    .cloned()
+                    .collect();
+                Class {
+                    id: class.id,
+                    name: class.name,
+                    kind: class.kind,
+                    abstract_class: class.abstract_class,
+                    final_class: class.final_class,
+                    module_name: class.module_name,
+                    native: class.native,
+                    type_parameters: class.type_parameters,
+                    parent: class.parent,
+                    parent_type: class.parent_type,
+                    interfaces: class.interfaces,
+                    interface_types: class.interface_types,
+                    traits: class
+                        .trait_uses
+                        .iter()
+                        .flat_map(|use_site| &use_site.traits)
+                        .filter_map(|used| class_ids.get(&used.name).copied())
+                        .collect(),
+                    declared_properties,
+                    properties: class.properties,
+                    declared_methods,
+                    methods,
+                    method_slots: class.methods.values().map(|method| method.slot).collect(),
+                    dispatch: {
+                        let mut dispatch = vec![None; self.method_slots.len()];
+                        for method in class.methods.values() {
+                            dispatch[method.slot.0 as usize] = method.callee;
+                        }
+                        dispatch
+                    },
+                    constructor: class.constructor,
+                    span: class.span,
+                }
             })
             .collect::<Vec<_>>();
         classes.sort_by_key(|class| class.id);
@@ -877,6 +1133,11 @@ impl TypeChecker {
                     kind,
                     abstract_class,
                     final_class,
+                    module_name: self
+                        .declaration_modules
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| "@entry".to_owned()),
                     type_parameters,
                     type_parameter_syntax,
                     parent,
@@ -889,6 +1150,7 @@ impl TypeChecker {
                     declared_properties: Vec::new(),
                     declared_property_initializers: Vec::new(),
                     declared_methods: BTreeMap::new(),
+                    declared_method_order: Vec::new(),
                     properties: Vec::new(),
                     property_initializers: Vec::new(),
                     methods: BTreeMap::new(),
@@ -1166,6 +1428,8 @@ impl TypeChecker {
                     ty,
                     visibility: property.visibility,
                     declaring_class: existing.id,
+                    default: property.initializer.as_ref().and_then(constant_value),
+                    origin_trait: (existing.kind == NominalKind::Trait).then_some(existing.id),
                     span: property.span,
                 });
                 property_initializers.push(property.initializer.clone());
@@ -1272,6 +1536,10 @@ impl TypeChecker {
             class.declared_properties = properties;
             class.declared_property_initializers = property_initializers;
             class.declared_methods = methods;
+            class.declared_method_order = source_methods
+                .iter()
+                .map(|method| method.function.name.clone())
+                .collect();
         }
     }
 
@@ -1376,6 +1644,7 @@ impl TypeChecker {
             properties.clone_from(&parent.properties);
             initializers.clone_from(&parent.property_initializers);
             methods = parent.methods.clone();
+            methods.retain(|_, method| method.visibility != Visibility::Private);
             let parent_type = current
                 .parent_type
                 .clone()
@@ -1399,13 +1668,16 @@ impl TypeChecker {
             }
         }
 
+        let mut trait_method_order = Vec::new();
         if current.kind != NominalKind::Interface {
             let (trait_properties, trait_initializers, trait_methods) =
-                self.compose_traits(&current);
+                self.compose_traits(&current, &mut trait_method_order);
             for (property, initializer) in trait_properties.into_iter().zip(trait_initializers) {
                 if let Some(inherited) = properties
                     .iter()
+                    .rev()
                     .find(|inherited: &&Property| inherited.name == property.name)
+                    .filter(|inherited| inherited.visibility != Visibility::Private)
                 {
                     self.diagnostics.push(
                         Diagnostic::error(
@@ -1440,7 +1712,12 @@ impl TypeChecker {
         {
             if let Some(previous) = properties
                 .iter()
+                .rev()
                 .find(|previous| previous.name == property.name)
+                .filter(|previous| {
+                    previous.visibility != Visibility::Private
+                        || previous.declaring_class == current.id
+                })
             {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -1625,6 +1902,11 @@ impl TypeChecker {
         }
         let constructor = methods.get("__construct").and_then(|method| method.callee);
         let class = self.classes.get_mut(name).expect("nominal type exists");
+        for method in trait_method_order {
+            if !class.declared_method_order.contains(&method) {
+                class.declared_method_order.push(method);
+            }
+        }
         class.properties = properties;
         class.property_initializers = initializers;
         class.methods = methods;
@@ -1638,6 +1920,7 @@ impl TypeChecker {
     fn compose_traits(
         &mut self,
         consumer: &ClassSignature,
+        method_order: &mut Vec<String>,
     ) -> (
         Vec<Property>,
         Vec<Option<Expr>>,
@@ -1648,6 +1931,7 @@ impl TypeChecker {
         let mut methods: BTreeMap<String, MethodSignature> = BTreeMap::new();
         for trait_use in &consumer.trait_uses {
             let mut candidates = BTreeMap::<String, Vec<(String, MethodSignature)>>::new();
+            let mut candidate_order = Vec::new();
             for used in &trait_use.traits {
                 let Some(trait_type) = self
                     .classes
@@ -1690,8 +1974,18 @@ impl TypeChecker {
                         initializers.push(initializer);
                     }
                 }
-                for (name, mut method) in trait_type.methods {
+                let mut names = trait_type.declared_method_order.clone();
+                for name in trait_type.methods.keys() {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+                for name in names {
+                    let mut method = trait_type.methods[&name].clone();
                     method.origin_trait = Some(used.name.clone());
+                    if !candidate_order.contains(&name) {
+                        candidate_order.push(name.clone());
+                    }
                     candidates
                         .entry(name)
                         .or_default()
@@ -1860,10 +2154,18 @@ impl TypeChecker {
                         .with_label(previous.span, "existing method is here"),
                     );
                 } else {
+                    candidate_order.push(target_name.clone());
                     selected.insert(target_name, adapted);
                 }
             }
-            for (name, mut method) in selected {
+            let mut ordered = Vec::new();
+            for name in candidate_order {
+                if let Some(method) = selected.remove(&name) {
+                    ordered.push((name, method));
+                }
+            }
+            ordered.extend(selected);
+            for (name, mut method) in ordered {
                 method.declaring_class = consumer.id;
                 method.slot = self.method_slots[&name];
                 if consumer.kind == NominalKind::Class
@@ -1898,6 +2200,7 @@ impl TypeChecker {
                         .with_label(previous.span, "first contribution is here"),
                     );
                 } else {
+                    method_order.push(name.clone());
                     methods.insert(name, method);
                 }
             }
@@ -1912,19 +2215,6 @@ impl TypeChecker {
         replacement: &MethodSignature,
         parent: &MethodSignature,
     ) {
-        if parent.visibility == Visibility::Private {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "typing",
-                    "T0028",
-                    replacement.span,
-                    format!(
-                        "`{class_name}::{method_name}` redeclares a parent-private method name"
-                    ),
-                )
-                .with_label(parent.span, "private method is declared here"),
-            );
-        }
         if parent.final_method {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -1967,11 +2257,13 @@ struct FunctionChecker<'signatures, 'diagnostics> {
     diagnostics: &'diagnostics mut Vec<Diagnostic>,
     id: FunctionId,
     name: String,
+    module_name: String,
     return_type: Type,
     span: Span,
     locals: Vec<Local>,
     names: HashMap<String, LocalId>,
     parameters: Vec<LocalId>,
+    parameter_metadata: Vec<ParameterMetadata>,
     loop_depth: usize,
     owner: Option<ClassId>,
     static_method: bool,
@@ -1986,6 +2278,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         diagnostics: &'diagnostics mut Vec<Diagnostic>,
         id: FunctionId,
         name: &str,
+        module_name: &str,
         return_type: Type,
         span: Span,
         owner: Option<ClassId>,
@@ -2002,11 +2295,13 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             diagnostics,
             id,
             name: name.to_owned(),
+            module_name: module_name.to_owned(),
             return_type,
             span,
             locals: Vec::new(),
             names: HashMap::new(),
             parameters: Vec::new(),
+            parameter_metadata: Vec::new(),
             loop_depth: 0,
             owner,
             static_method,
@@ -2024,6 +2319,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         declaration: &FunctionDecl,
         signatures: &[ParameterSignature],
     ) {
+        self.parameter_metadata = signatures.iter().map(parameter_metadata).collect();
         for (parameter, signature) in declaration.parameters.iter().zip(signatures) {
             let ty = &signature.ty;
             if let Some(previous) = self.names.get(&parameter.name).copied() {
@@ -2709,6 +3005,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             ExprKind::Vector(values) => {
                 let expected_element = match expected {
                     Some(Type::Vector(element)) => Some(element.as_ref()),
+                    Some(Type::Union(members)) => members.iter().find_map(|member| {
+                        let Type::Vector(element) = member else {
+                            return None;
+                        };
+                        Some(element.as_ref())
+                    }),
                     _ => None,
                 };
                 let values = values
@@ -2743,6 +3045,15 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             ExprKind::Map(entries) => {
                 let (expected_key, expected_value) = match expected {
                     Some(Type::Map(key, value)) => (Some(key.as_ref()), Some(value.as_ref())),
+                    Some(Type::Union(members)) => members
+                        .iter()
+                        .find_map(|member| {
+                            let Type::Map(key, value) = member else {
+                                return None;
+                            };
+                            Some((Some(key.as_ref()), Some(value.as_ref())))
+                        })
+                        .unwrap_or((None, None)),
                     _ => (None, None),
                 };
                 let entries = entries
@@ -2897,7 +3208,17 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         format!("abstract class `{class_name}` cannot be instantiated"),
                     ));
                 }
-                if class.native && !is_nominal_subtype(self.classes, class_name, "Throwable") {
+                if class.native
+                    && !is_nominal_subtype(self.classes, class_name, "Throwable")
+                    && !matches!(
+                        class_name.as_str(),
+                        "ReflectionClass"
+                            | "ReflectionFunction"
+                            | "ReflectionMethod"
+                            | "ReflectionProperty"
+                            | "ReflectionParameter"
+                    )
+                {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0409",
@@ -3941,6 +4262,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         let Some(property) = class
             .properties
             .iter()
+            .rev()
             .find(|property| property.name == name)
         else {
             self.diagnostics.push(Diagnostic::error(
@@ -4054,7 +4376,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 }
             }
             BinaryOp::Equal | BinaryOp::StrictEqual | BinaryOp::NotEqual => {
-                if left.ty != right.ty {
+                if !types_overlap(&left.ty, &right.ty, self.classes) {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0503",
@@ -4128,7 +4450,9 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         Function {
             id: self.id,
             name: self.name,
+            module_name: self.module_name,
             parameters: self.parameters,
+            parameter_metadata: self.parameter_metadata,
             locals: self.locals,
             return_type: self.return_type,
             owner: self.owner,
@@ -4293,6 +4617,10 @@ fn type_accepts(
     expected == &Type::Mixed
         || actual == &Type::Never
         || expected == actual
+        || matches!((expected, actual), (Type::Vector(element), Type::Vector(_)) if element.as_ref() == &Type::Mixed)
+        || matches!((expected, actual), (Type::Map(expected_key, expected_value), Type::Map(actual_key, _))
+            if expected_value.as_ref() == &Type::Mixed
+                && type_accepts(expected_key, actual_key, classes))
         || matches!(actual, Type::Parameter { id, .. } if classes
             .values()
             .flat_map(|class| &class.type_parameters)
@@ -4346,6 +4674,15 @@ fn nominal_parts(ty: &Type) -> Option<(&str, &[Type])> {
 fn nominal_lookup_type(ty: &Type, classes: &BTreeMap<String, ClassSignature>) -> Option<Type> {
     match ty {
         Type::Object(_) | Type::Nominal { .. } => Some(ty.clone()),
+        Type::Union(members) => {
+            let mut non_null = members.iter().filter(|member| **member != Type::Null);
+            let only = non_null.next()?;
+            non_null
+                .next()
+                .is_none()
+                .then(|| only.clone())
+                .and_then(|only| nominal_lookup_type(&only, classes))
+        }
         Type::Parameter { id, .. } => classes
             .values()
             .flat_map(|class| &class.type_parameters)
@@ -5148,6 +5485,95 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Some("Error"),
             &[],
         ),
+        (
+            "TypeError",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Error"),
+            &[],
+        ),
+        (
+            "ArgumentCountError",
+            NominalKind::Class,
+            false,
+            false,
+            Some("TypeError"),
+            &[],
+        ),
+        (
+            "ReflectionException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Exception"),
+            &[],
+        ),
+        ("ReflectionType", NominalKind::Class, true, false, None, &[]),
+        (
+            "ReflectionNamedType",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionType"),
+            &[],
+        ),
+        (
+            "ReflectionUnionType",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionType"),
+            &[],
+        ),
+        (
+            "ReflectionClass",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &[],
+        ),
+        (
+            "ReflectionFunctionAbstract",
+            NominalKind::Class,
+            true,
+            false,
+            None,
+            &[],
+        ),
+        (
+            "ReflectionFunction",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionFunctionAbstract"),
+            &[],
+        ),
+        (
+            "ReflectionMethod",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionFunctionAbstract"),
+            &[],
+        ),
+        (
+            "ReflectionProperty",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &[],
+        ),
+        (
+            "ReflectionParameter",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &[],
+        ),
     ];
     let mut classes = specs
         .iter()
@@ -5165,6 +5591,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                         kind: *kind,
                         abstract_class: *abstract_class,
                         final_class: *final_class,
+                        module_name: "@native".to_owned(),
                         type_parameters: Vec::new(),
                         type_parameter_syntax: Vec::new(),
                         parent: parent.map(ToOwned::to_owned),
@@ -5183,6 +5610,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                         declared_properties: Vec::new(),
                         declared_property_initializers: Vec::new(),
                         declared_methods: BTreeMap::new(),
+                        declared_method_order: Vec::new(),
                         properties: Vec::new(),
                         property_initializers: Vec::new(),
                         methods: BTreeMap::new(),
@@ -5638,7 +6066,394 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             false,
         );
     }
+    add_reflection_api(&mut classes);
     classes
+}
+
+fn add_reflection_api(classes: &mut BTreeMap<String, ClassSignature>) {
+    use ReflectionBuiltin as R;
+
+    let object = |name: &str| Type::Object(name.to_owned());
+    let nullable = |name: &str| normalize_union(vec![object(name), Type::Null]);
+    let vector = |name: &str| Type::Vector(Box::new(object(name)));
+    let arguments = normalize_union(vec![
+        Type::Vector(Box::new(Type::Mixed)),
+        Type::Map(Box::new(Type::String), Box::new(Type::Mixed)),
+    ]);
+    let empty_arguments = Some(ExprKind::Vector(Vec::new()));
+    let p = |name: &str, ty: Type, default: Option<ExprKind>| {
+        native_parameter(name, ty, default, Span::empty(0))
+    };
+    let mut add = |class: &str,
+                   name: &str,
+                   operation: R,
+                   static_method: bool,
+                   parameters: Vec<ParameterSignature>,
+                   result: Type| {
+        add_native_method(
+            classes,
+            class,
+            name,
+            Some(Builtin::Reflection(operation)),
+            static_method,
+            parameters,
+            result,
+            false,
+        );
+    };
+
+    for (name, operation, parameters, result) in [
+        ("allowsNull", R::TypeAllowsNull, vec![], Type::Bool),
+        (
+            "getDisplayName",
+            R::TypeGetDisplayName,
+            vec![],
+            Type::String,
+        ),
+        (
+            "equals",
+            R::TypeEquals,
+            vec![p("other", object("ReflectionType"), None)],
+            Type::Bool,
+        ),
+        (
+            "isAssignableFrom",
+            R::TypeIsAssignableFrom,
+            vec![p("other", object("ReflectionType"), None)],
+            Type::Bool,
+        ),
+    ] {
+        add("ReflectionType", name, operation, false, parameters, result);
+    }
+    for (name, operation, result) in [
+        ("getName", R::NamedTypeGetName, Type::String),
+        ("isBuiltin", R::NamedTypeIsBuiltin, Type::Bool),
+        ("isTypeParameter", R::NamedTypeIsTypeParameter, Type::Bool),
+        (
+            "getTypeArguments",
+            R::NamedTypeGetTypeArguments,
+            vector("ReflectionType"),
+        ),
+    ] {
+        add(
+            "ReflectionNamedType",
+            name,
+            operation,
+            false,
+            vec![],
+            result,
+        );
+    }
+    add(
+        "ReflectionUnionType",
+        "getTypes",
+        R::UnionTypeGetTypes,
+        false,
+        vec![],
+        vector("ReflectionType"),
+    );
+
+    add(
+        "ReflectionClass",
+        "__construct",
+        R::ClassConstruct,
+        false,
+        vec![p("objectOrClass", Type::Mixed, None)],
+        Type::Void,
+    );
+    for (name, operation, result) in [
+        ("getName", R::ClassGetName, Type::String),
+        ("getShortName", R::ClassGetShortName, Type::String),
+        ("getNamespaceName", R::ClassGetNamespaceName, Type::String),
+        ("getModuleName", R::ClassGetModuleName, Type::String),
+        ("getType", R::ClassGetType, nullable("ReflectionNamedType")),
+        ("isAbstract", R::ClassIsAbstract, Type::Bool),
+        ("isFinal", R::ClassIsFinal, Type::Bool),
+        ("isInterface", R::ClassIsInterface, Type::Bool),
+        ("isTrait", R::ClassIsTrait, Type::Bool),
+        ("isInternal", R::ClassIsInternal, Type::Bool),
+        ("isUserDefined", R::ClassIsUserDefined, Type::Bool),
+        ("isInstantiable", R::ClassIsInstantiable, Type::Bool),
+        (
+            "getParentClass",
+            R::ClassGetParentClass,
+            nullable("ReflectionClass"),
+        ),
+        (
+            "getInterfaces",
+            R::ClassGetInterfaces,
+            vector("ReflectionClass"),
+        ),
+        ("getTraits", R::ClassGetTraits, vector("ReflectionClass")),
+        (
+            "getConstructor",
+            R::ClassGetConstructor,
+            nullable("ReflectionMethod"),
+        ),
+        (
+            "getDeclaredMethods",
+            R::ClassGetDeclaredMethods,
+            vector("ReflectionMethod"),
+        ),
+        ("getMethods", R::ClassGetMethods, vector("ReflectionMethod")),
+        (
+            "getDeclaredProperties",
+            R::ClassGetDeclaredProperties,
+            vector("ReflectionProperty"),
+        ),
+        (
+            "getProperties",
+            R::ClassGetProperties,
+            vector("ReflectionProperty"),
+        ),
+    ] {
+        add("ReflectionClass", name, operation, false, vec![], result);
+    }
+    for (name, operation, result) in [
+        (
+            "getDeclaredMethod",
+            R::ClassGetDeclaredMethod,
+            nullable("ReflectionMethod"),
+        ),
+        ("getMethod", R::ClassGetMethod, object("ReflectionMethod")),
+        ("hasMethod", R::ClassHasMethod, Type::Bool),
+        (
+            "getDeclaredProperty",
+            R::ClassGetDeclaredProperty,
+            object("ReflectionProperty"),
+        ),
+        (
+            "getProperty",
+            R::ClassGetProperty,
+            nullable("ReflectionProperty"),
+        ),
+        ("hasProperty", R::ClassHasProperty, Type::Bool),
+    ] {
+        add(
+            "ReflectionClass",
+            name,
+            operation,
+            false,
+            vec![p("name", Type::String, None)],
+            result,
+        );
+    }
+    add(
+        "ReflectionClass",
+        "newInstanceArgs",
+        R::ClassNewInstanceArgs,
+        false,
+        vec![p("arguments", arguments.clone(), empty_arguments.clone())],
+        Type::Mixed,
+    );
+
+    for (name, operation, result) in [
+        ("getName", R::CallableGetName, Type::String),
+        ("getShortName", R::CallableGetShortName, Type::String),
+        (
+            "getNamespaceName",
+            R::CallableGetNamespaceName,
+            Type::String,
+        ),
+        ("getModuleName", R::CallableGetModuleName, Type::String),
+        (
+            "getNumberOfParameters",
+            R::CallableGetNumberOfParameters,
+            Type::Int,
+        ),
+        (
+            "getNumberOfRequiredParameters",
+            R::CallableGetNumberOfRequiredParameters,
+            Type::Int,
+        ),
+        (
+            "getParameters",
+            R::CallableGetParameters,
+            vector("ReflectionParameter"),
+        ),
+        (
+            "getReturnType",
+            R::CallableGetReturnType,
+            object("ReflectionType"),
+        ),
+        ("isVariadic", R::CallableIsVariadic, Type::Bool),
+        ("isInternal", R::CallableIsInternal, Type::Bool),
+        ("isUserDefined", R::CallableIsUserDefined, Type::Bool),
+    ] {
+        add(
+            "ReflectionFunctionAbstract",
+            name,
+            operation,
+            false,
+            vec![],
+            result,
+        );
+    }
+    add(
+        "ReflectionFunction",
+        "__construct",
+        R::FunctionConstruct,
+        false,
+        vec![p("function", Type::String, None)],
+        Type::Void,
+    );
+    add(
+        "ReflectionFunction",
+        "invokeArgs",
+        R::FunctionInvokeArgs,
+        false,
+        vec![p("arguments", arguments.clone(), empty_arguments.clone())],
+        Type::Mixed,
+    );
+
+    for (name, operation, result) in [
+        (
+            "getDeclaringClass",
+            R::MethodGetDeclaringClass,
+            object("ReflectionClass"),
+        ),
+        (
+            "getOriginTrait",
+            R::MethodGetOriginTrait,
+            nullable("ReflectionClass"),
+        ),
+        (
+            "getOriginMethod",
+            R::MethodGetOriginMethod,
+            nullable("ReflectionMethod"),
+        ),
+        ("isPublic", R::MethodIsPublic, Type::Bool),
+        ("isProtected", R::MethodIsProtected, Type::Bool),
+        ("isPrivate", R::MethodIsPrivate, Type::Bool),
+        ("isStatic", R::MethodIsStatic, Type::Bool),
+        ("isAbstract", R::MethodIsAbstract, Type::Bool),
+        ("isFinal", R::MethodIsFinal, Type::Bool),
+        ("isConstructor", R::MethodIsConstructor, Type::Bool),
+    ] {
+        add("ReflectionMethod", name, operation, false, vec![], result);
+    }
+    add(
+        "ReflectionMethod",
+        "__construct",
+        R::MethodConstruct,
+        false,
+        vec![
+            p("objectOrClass", Type::Mixed, None),
+            p("method", Type::String, None),
+        ],
+        Type::Void,
+    );
+    add(
+        "ReflectionMethod",
+        "invokeArgs",
+        R::MethodInvokeArgs,
+        false,
+        vec![
+            p("receiver", Type::Mixed, None),
+            p("arguments", arguments.clone(), empty_arguments.clone()),
+        ],
+        Type::Mixed,
+    );
+
+    for (name, operation, result) in [
+        ("getName", R::PropertyGetName, Type::String),
+        (
+            "getDeclaringClass",
+            R::PropertyGetDeclaringClass,
+            object("ReflectionClass"),
+        ),
+        (
+            "getOriginTrait",
+            R::PropertyGetOriginTrait,
+            nullable("ReflectionClass"),
+        ),
+        ("getType", R::PropertyGetType, object("ReflectionType")),
+        ("hasDefaultValue", R::PropertyHasDefaultValue, Type::Bool),
+        ("getDefaultValue", R::PropertyGetDefaultValue, Type::Mixed),
+        ("isPublic", R::PropertyIsPublic, Type::Bool),
+        ("isProtected", R::PropertyIsProtected, Type::Bool),
+        ("isPrivate", R::PropertyIsPrivate, Type::Bool),
+        ("isStatic", R::PropertyIsStatic, Type::Bool),
+    ] {
+        add("ReflectionProperty", name, operation, false, vec![], result);
+    }
+    add(
+        "ReflectionProperty",
+        "__construct",
+        R::PropertyConstruct,
+        false,
+        vec![
+            p("objectOrClass", Type::Mixed, None),
+            p("property", Type::String, None),
+        ],
+        Type::Void,
+    );
+    add(
+        "ReflectionProperty",
+        "getValue",
+        R::PropertyGetValue,
+        false,
+        vec![p("receiver", Type::Mixed, None)],
+        Type::Mixed,
+    );
+    add(
+        "ReflectionProperty",
+        "setValue",
+        R::PropertySetValue,
+        false,
+        vec![
+            p("receiver", Type::Mixed, None),
+            p("value", Type::Mixed, None),
+        ],
+        Type::Void,
+    );
+
+    for (name, operation, result) in [
+        ("getName", R::ParameterGetName, Type::String),
+        ("getPosition", R::ParameterGetPosition, Type::Int),
+        ("getType", R::ParameterGetType, object("ReflectionType")),
+        (
+            "getDeclaringFunction",
+            R::ParameterGetDeclaringFunction,
+            object("ReflectionFunctionAbstract"),
+        ),
+        (
+            "isDefaultValueAvailable",
+            R::ParameterIsDefaultValueAvailable,
+            Type::Bool,
+        ),
+        ("getDefaultValue", R::ParameterGetDefaultValue, Type::Mixed),
+        ("isOptional", R::ParameterIsOptional, Type::Bool),
+        ("isVariadic", R::ParameterIsVariadic, Type::Bool),
+    ] {
+        add(
+            "ReflectionParameter",
+            name,
+            operation,
+            false,
+            vec![],
+            result,
+        );
+    }
+    add(
+        "ReflectionParameter",
+        "__construct",
+        R::ParameterConstruct,
+        false,
+        vec![
+            p(
+                "function",
+                normalize_union(vec![Type::String, Type::Vector(Box::new(Type::Mixed))]),
+                None,
+            ),
+            p(
+                "parameter",
+                normalize_union(vec![Type::Int, Type::String]),
+                None,
+            ),
+        ],
+        Type::Void,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5656,6 +6471,7 @@ fn add_native_method(
         .get_mut(class_name)
         .expect("native nominal metadata names an existing type");
     let span = Span::empty(0);
+    class.declared_method_order.push(name.to_owned());
     class.declared_methods.insert(
         name.to_owned(),
         MethodSignature {
@@ -5677,6 +6493,91 @@ fn add_native_method(
             span,
         },
     );
+}
+
+fn parameter_metadata(parameter: &ParameterSignature) -> ParameterMetadata {
+    ParameterMetadata {
+        name: parameter.name.clone(),
+        ty: if parameter.variadic {
+            match &parameter.ty {
+                Type::Vector(element) => element.as_ref().clone(),
+                _ => parameter.ty.clone(),
+            }
+        } else {
+            parameter.ty.clone()
+        },
+        default: parameter.default.as_ref().and_then(constant_value),
+        variadic: parameter.variadic,
+    }
+}
+
+fn method_metadata(
+    name: &str,
+    method: &MethodSignature,
+    class_ids: &BTreeMap<String, ClassId>,
+) -> Method {
+    Method {
+        name: name.to_owned(),
+        callee: method.callee,
+        slot: method.slot,
+        declaring_class: method.declaring_class,
+        visibility: method.visibility,
+        static_method: method.static_method,
+        abstract_method: method.abstract_method,
+        final_method: method.final_method,
+        parameter_types: method
+            .signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.ty.clone())
+            .collect(),
+        parameters: method
+            .signature
+            .parameters
+            .iter()
+            .map(parameter_metadata)
+            .collect(),
+        return_type: method.signature.return_type.clone(),
+        origin_trait: method
+            .origin_trait
+            .as_ref()
+            .and_then(|name| class_ids.get(name))
+            .copied(),
+        origin_name: method
+            .source
+            .as_ref()
+            .map_or_else(|| name.to_owned(), |source| source.function.name.clone()),
+        span: method.span,
+    }
+}
+
+fn constant_value(expression: &Expr) -> Option<ConstantValue> {
+    match &expression.kind {
+        ExprKind::Integer(value) => Some(ConstantValue::Int(*value)),
+        ExprKind::Float(value) => Some(ConstantValue::Float(*value)),
+        ExprKind::Bool(value) => Some(ConstantValue::Bool(*value)),
+        ExprKind::Null => Some(ConstantValue::Null),
+        ExprKind::String(value) => Some(ConstantValue::String(value.clone())),
+        ExprKind::Vector(values) => values
+            .iter()
+            .map(constant_value)
+            .collect::<Option<Vec<_>>>()
+            .map(ConstantValue::Vector),
+        ExprKind::Map(entries) => entries
+            .iter()
+            .map(|entry| Some((constant_value(&entry.key)?, constant_value(&entry.value)?)))
+            .collect::<Option<Vec<_>>>()
+            .map(ConstantValue::Map),
+        ExprKind::Unary {
+            op: UnaryOp::Negate,
+            operand,
+        } => match constant_value(operand)? {
+            ConstantValue::Int(value) => value.checked_neg().map(ConstantValue::Int),
+            ConstantValue::Float(value) => Some(ConstantValue::Float(-value)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 const fn nominal_kind_name(kind: NominalKind) -> &'static str {
@@ -6347,8 +7248,6 @@ echo $parent->hidden();
 "#,
         );
         assert!(codes.contains(&"T0027"));
-        assert!(codes.contains(&"T0021"));
-        assert!(codes.contains(&"T0028"));
         assert!(codes.contains(&"T0414"));
     }
 

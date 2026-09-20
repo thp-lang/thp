@@ -8,15 +8,15 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type, TypeParameter,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId, MethodSlot,
+    NominalKind, ParameterMetadata, PropertyId, Type, TypeParameter,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 2;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -33,14 +33,19 @@ pub struct Class {
     pub kind: NominalKind,
     pub abstract_class: bool,
     pub final_class: bool,
+    pub module_name: String,
+    pub native: bool,
     pub type_parameters: Vec<TypeParameter>,
     pub properties: Vec<Property>,
+    pub declared_properties: Vec<Property>,
     pub methods: Vec<Method>,
+    pub declared_methods: Vec<Method>,
     pub dispatch: Vec<Option<Callee>>,
     pub interfaces: Vec<ClassId>,
     pub interface_types: Vec<NominalType>,
     pub parent: Option<ClassId>,
     pub parent_type: Option<NominalType>,
+    pub traits: Vec<ClassId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,12 +56,16 @@ pub struct NominalType {
 
 #[derive(Clone, Debug)]
 pub struct Property {
+    pub id: PropertyId,
+    pub name: String,
     pub ty: Type,
     pub visibility: thp_syntax::Visibility,
     pub declaring_class: ClassId,
+    pub default: Option<ConstantValue>,
+    pub origin_trait: Option<ClassId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Method {
     pub name: String,
     pub slot: MethodSlot,
@@ -67,7 +76,10 @@ pub struct Method {
     pub abstract_method: bool,
     pub final_method: bool,
     pub parameter_types: Vec<Type>,
+    pub parameters: Vec<ParameterMetadata>,
     pub return_type: Type,
+    pub origin_trait: Option<ClassId>,
+    pub origin_name: String,
 }
 
 impl Program {
@@ -84,7 +96,9 @@ impl Program {
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub module_name: String,
     pub parameters: Vec<LocalId>,
+    pub parameter_metadata: Vec<ParameterMetadata>,
     pub local_types: Vec<Type>,
     pub return_type: Type,
     pub owner: Option<ClassId>,
@@ -239,32 +253,17 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                 kind: class.kind,
                 abstract_class: class.abstract_class,
                 final_class: class.final_class,
+                module_name: class.module_name.clone(),
+                native: class.native,
                 type_parameters: class.type_parameters.clone(),
-                properties: class
-                    .properties
+                properties: class.properties.iter().map(lower_property).collect(),
+                declared_properties: class
+                    .declared_properties
                     .iter()
-                    .map(|property| Property {
-                        ty: property.ty.clone(),
-                        visibility: property.visibility,
-                        declaring_class: property.declaring_class,
-                    })
+                    .map(lower_property)
                     .collect(),
-                methods: class
-                    .methods
-                    .iter()
-                    .map(|method| Method {
-                        name: method.name.clone(),
-                        slot: method.slot,
-                        callee: method.callee,
-                        visibility: method.visibility,
-                        declaring_class: method.declaring_class,
-                        static_method: method.static_method,
-                        abstract_method: method.abstract_method,
-                        final_method: method.final_method,
-                        parameter_types: method.parameter_types.clone(),
-                        return_type: method.return_type.clone(),
-                    })
-                    .collect(),
+                methods: class.methods.iter().map(lower_method).collect(),
+                declared_methods: class.declared_methods.iter().map(lower_method).collect(),
                 dispatch: class.dispatch.clone(),
                 interfaces: class
                     .interfaces
@@ -293,6 +292,7 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                     .parent_type
                     .as_ref()
                     .and_then(|ty| lower_nominal_type(ty, &module.classes)),
+                traits: class.traits.clone(),
             })
             .collect(),
         functions: module
@@ -301,7 +301,9 @@ pub fn lower(module: &thp_mir::Module) -> Program {
             .map(|function| Function {
                 id: function.id,
                 name: function.name.clone(),
+                module_name: function.module_name.clone(),
                 parameters: function.parameters.clone(),
+                parameter_metadata: function.parameter_metadata.clone(),
                 local_types: function.local_types.clone(),
                 return_type: function.return_type.clone(),
                 owner: function.owner,
@@ -345,6 +347,36 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                     .collect(),
             })
             .collect(),
+    }
+}
+
+fn lower_property(property: &thp_hir::Property) -> Property {
+    Property {
+        id: property.id,
+        name: property.name.clone(),
+        ty: property.ty.clone(),
+        visibility: property.visibility,
+        declaring_class: property.declaring_class,
+        default: property.default.clone(),
+        origin_trait: property.origin_trait,
+    }
+}
+
+fn lower_method(method: &thp_hir::Method) -> Method {
+    Method {
+        name: method.name.clone(),
+        slot: method.slot,
+        callee: method.callee,
+        visibility: method.visibility,
+        declaring_class: method.declaring_class,
+        static_method: method.static_method,
+        abstract_method: method.abstract_method,
+        final_method: method.final_method,
+        parameter_types: method.parameter_types.clone(),
+        parameters: method.parameters.clone(),
+        return_type: method.return_type.clone(),
+        origin_trait: method.origin_trait,
+        origin_name: method.origin_name.clone(),
     }
 }
 
@@ -571,6 +603,12 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 class.id.0
             )));
         }
+        if class.module_name.is_empty() {
+            return Err(global_error(format!(
+                "class {} has no owning module",
+                class.name
+            )));
+        }
         if class
             .interfaces
             .iter()
@@ -679,6 +717,20 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 )));
             }
         }
+        for trait_id in &class.traits {
+            let Some(trait_class) = program.classes.get(trait_id.0 as usize) else {
+                return Err(global_error(format!(
+                    "{} has an out-of-bounds trait",
+                    class.name
+                )));
+            };
+            if trait_class.kind != NominalKind::Trait {
+                return Err(global_error(format!(
+                    "{} has a non-trait in its trait metadata",
+                    class.name
+                )));
+            }
+        }
         if class.kind == NominalKind::Class && !class.abstract_class {
             let has = |name: &str| {
                 class
@@ -725,21 +777,73 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 )));
             }
         }
-        for property in &class.properties {
+        for (property_index, property) in class.properties.iter().enumerate() {
             verify_encoded_type(program, &property.ty)?;
-            if property.declaring_class.0 as usize >= program.classes.len() {
+            if property.id.0 as usize != property_index
+                || property.name.is_empty()
+                || property.declaring_class.0 as usize >= program.classes.len()
+                || property.origin_trait.is_some_and(|origin| {
+                    program
+                        .classes
+                        .get(origin.0 as usize)
+                        .is_none_or(|origin| origin.kind != NominalKind::Trait)
+                })
+                || property
+                    .default
+                    .as_ref()
+                    .is_some_and(|value| !constant_matches_type(program, value, &property.ty))
+            {
                 return Err(global_error(format!(
-                    "{} has a property with an invalid declaring class",
+                    "{} has invalid property metadata",
                     class.name
                 )));
             }
+        }
+        if class.declared_properties.iter().any(|declared| {
+            declared.declaring_class != class.id
+                || class
+                    .properties
+                    .get(declared.id.0 as usize)
+                    .is_none_or(|property| {
+                        property.name != declared.name
+                            || property.declaring_class != declared.declaring_class
+                    })
+        }) {
+            return Err(global_error(format!(
+                "{} has inconsistent declared property metadata",
+                class.name
+            )));
         }
         for method in &class.methods {
             for ty in &method.parameter_types {
                 verify_encoded_type(program, ty)?;
             }
             verify_encoded_type(program, &method.return_type)?;
-            if method.slot.0 as usize >= class.dispatch.len()
+            if method.name.is_empty()
+                || method.origin_name.is_empty()
+                || method.parameters.len() != method.parameter_types.len()
+                || method
+                    .parameters
+                    .iter()
+                    .zip(&method.parameter_types)
+                    .any(|(parameter, ty)| {
+                        *ty != if parameter.variadic {
+                            Type::Vector(Box::new(parameter.ty.clone()))
+                        } else {
+                            parameter.ty.clone()
+                        }
+                    })
+                || !parameter_metadata_valid(program, &method.parameters)
+                || method.origin_trait.is_some_and(|origin| {
+                    program.classes.get(origin.0 as usize).is_none_or(|origin| {
+                        origin.kind != NominalKind::Trait
+                            || !origin
+                                .declared_methods
+                                .iter()
+                                .any(|candidate| candidate.name == method.origin_name)
+                    })
+                })
+                || method.slot.0 as usize >= class.dispatch.len()
                 || method.declaring_class.0 as usize >= program.classes.len()
             {
                 return Err(global_error(format!(
@@ -762,6 +866,15 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 )));
             }
         }
+        if class.declared_methods.iter().any(|declared| {
+            declared.declaring_class != class.id
+                || !class.methods.iter().any(|method| method == declared)
+        }) {
+            return Err(global_error(format!(
+                "{} has inconsistent declared method metadata",
+                class.name
+            )));
+        }
         if class.kind == NominalKind::Class
             && !class.abstract_class
             && class
@@ -783,6 +896,9 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 format!("function id {} does not match index {index}", function.id.0),
             ));
         }
+        if function.module_name.is_empty() {
+            return Err(function_error(function.id, "function has no owning module"));
+        }
         if function
             .owner
             .is_some_and(|owner| owner.0 as usize >= program.classes.len())
@@ -800,9 +916,74 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
         {
             verify_encoded_type(program, ty)?;
         }
+        let receiver_count = usize::from(function.owner.is_some() && !function.static_method);
+        if function.parameters.len() != function.parameter_metadata.len() + receiver_count
+            || !parameter_metadata_valid(program, &function.parameter_metadata)
+            || function
+                .parameters
+                .iter()
+                .skip(receiver_count)
+                .zip(&function.parameter_metadata)
+                .any(|(local, parameter)| {
+                    function.local_types.get(local.0 as usize).is_none_or(|ty| {
+                        *ty != if parameter.variadic {
+                            Type::Vector(Box::new(parameter.ty.clone()))
+                        } else {
+                            parameter.ty.clone()
+                        }
+                    })
+                })
+        {
+            return Err(function_error(
+                function.id,
+                "function has invalid parameter metadata",
+            ));
+        }
         verify_function(program, function)?;
     }
     Ok(())
+}
+
+fn parameter_metadata_valid(program: &Program, parameters: &[ParameterMetadata]) -> bool {
+    parameters.iter().enumerate().all(|(index, parameter)| {
+        !parameter.name.is_empty()
+            && !parameters[..index]
+                .iter()
+                .any(|previous| previous.name == parameter.name)
+            && (!parameter.variadic || index + 1 == parameters.len())
+            && (!parameter.variadic || parameter.default.is_none())
+            && verify_encoded_type(program, &parameter.ty).is_ok()
+            && parameter
+                .default
+                .as_ref()
+                .is_none_or(|value| constant_matches_type(program, value, &parameter.ty))
+    })
+}
+
+fn constant_matches_type(program: &Program, value: &ConstantValue, expected: &Type) -> bool {
+    if expected == &Type::Mixed {
+        return true;
+    }
+    if let Type::Union(members) = expected {
+        return members
+            .iter()
+            .any(|member| constant_matches_type(program, value, member));
+    }
+    match (value, expected) {
+        (ConstantValue::Vector(values), Type::Vector(element)) => values
+            .iter()
+            .all(|value| constant_matches_type(program, value, element)),
+        (ConstantValue::Map(entries), Type::Map(key, value)) => entries.iter().all(|entry| {
+            constant_matches_type(program, &entry.0, key)
+                && constant_matches_type(program, &entry.1, value)
+        }),
+        (ConstantValue::Int(_), _) => type_accepts(program, expected, &Type::Int),
+        (ConstantValue::Float(_), _) => type_accepts(program, expected, &Type::Float),
+        (ConstantValue::Bool(_), _) => type_accepts(program, expected, &Type::Bool),
+        (ConstantValue::Null, _) => type_accepts(program, expected, &Type::Null),
+        (ConstantValue::String(_), _) => type_accepts(program, expected, &Type::String),
+        (ConstantValue::Vector(_) | ConstantValue::Map(_), _) => false,
+    }
 }
 
 fn verify_nominal_type(program: &Program, nominal: &NominalType) -> Result<(), VerificationError> {
@@ -1031,6 +1212,9 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                 }
             }
             for inherited in &parent.methods {
+                if inherited.visibility == thp_syntax::Visibility::Private {
+                    continue;
+                }
                 let Some(method) = class
                     .methods
                     .iter()
@@ -1054,8 +1238,7 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                         class.name, inherited.name
                     )));
                 }
-                if (inherited.final_method
-                    || inherited.visibility == thp_syntax::Visibility::Private)
+                if inherited.final_method
                     && (method.callee != inherited.callee
                         || method.declaring_class != inherited.declaring_class)
                 {
@@ -1296,6 +1479,15 @@ fn encoded_nominal_parts(ty: &Type) -> Option<(&str, &[Type])> {
 fn encoded_nominal_lookup_type(program: &Program, ty: &Type) -> Option<Type> {
     match ty {
         Type::Object(_) | Type::Nominal { .. } => Some(ty.clone()),
+        Type::Union(members) => {
+            let mut non_null = members.iter().filter(|member| **member != Type::Null);
+            let only = non_null.next()?;
+            non_null
+                .next()
+                .is_none()
+                .then(|| only.clone())
+                .and_then(|only| encoded_nominal_lookup_type(program, &only))
+        }
         Type::Parameter { id, .. } => program
             .classes
             .get(id.owner.0 as usize)
@@ -2000,7 +2192,19 @@ fn verify_instruction(
             let Some(class) = program.classes.get(class.0 as usize) else {
                 return Err(error("allocated class is out of bounds"));
             };
-            if class.kind != NominalKind::Class || class.abstract_class {
+            if class.kind != NominalKind::Class
+                || class.abstract_class
+                || (class.native
+                    && !is_instance_of_name(program, &class.name, "Throwable")
+                    && !matches!(
+                        class.name.as_str(),
+                        "ReflectionClass"
+                            | "ReflectionFunction"
+                            | "ReflectionMethod"
+                            | "ReflectionProperty"
+                            | "ReflectionParameter"
+                    ))
+            {
                 return Err(error("only a concrete class can be allocated"));
             }
             if instruction
@@ -2608,6 +2812,36 @@ fn verify_builtin_call(
             }
             Ok(())
         }
+        Builtin::Reflection(operation) => {
+            let Some((class, method)) = program.classes.iter().find_map(|class| {
+                class
+                    .declared_methods
+                    .iter()
+                    .find(|method| {
+                        method.callee == Some(Callee::Builtin(Builtin::Reflection(operation)))
+                    })
+                    .map(|method| (class, method))
+            }) else {
+                return Err("reflection builtin has no native descriptor method".to_owned());
+            };
+            let receiver_count = usize::from(!method.static_method);
+            if arguments.len() != method.parameter_types.len() + receiver_count
+                || result != Some(&method.return_type)
+            {
+                return Err("invalid reflection builtin signature".to_owned());
+            }
+            if receiver_count == 1
+                && !type_accepts(program, &Type::Object(class.name.clone()), argument_type(0))
+            {
+                return Err("reflection builtin has the wrong receiver".to_owned());
+            }
+            for (index, expected) in method.parameter_types.iter().enumerate() {
+                if !type_accepts(program, expected, argument_type(index + receiver_count)) {
+                    return Err("reflection builtin argument has the wrong type".to_owned());
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2730,10 +2964,14 @@ fn check_block(
     }
 }
 
-fn type_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
+pub fn type_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
     expected == &Type::Mixed
         || actual == &Type::Never
         || expected == actual
+        || matches!((expected, actual), (Type::Vector(element), Type::Vector(_)) if element.as_ref() == &Type::Mixed)
+        || matches!((expected, actual), (Type::Map(expected_key, expected_value), Type::Map(actual_key, _))
+            if expected_value.as_ref() == &Type::Mixed
+                && type_accepts(program, expected_key, actual_key))
         || matches!(actual, Type::Parameter { id, .. } if program
             .classes
             .get(id.owner.0 as usize)
@@ -3003,11 +3241,80 @@ class Box {
     public function __construct(string $value) { $this->value = $value; }
 }
 $box = new Box("\x00\xff");
+$descriptor = new ReflectionClass($box);
 "#,
         );
         let decoded = decode(&encode(&program)).unwrap();
         verify(&decoded).unwrap();
         assert!(decoded.classes.iter().any(|class| class.name == "Box"));
+    }
+
+    #[test]
+    fn rejects_forged_reflection_metadata() {
+        let mut property = compile(
+            r"<?thp
+class Box { public int $value = 1; }
+",
+        );
+        property
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap()
+            .properties[0]
+            .id = thp_hir::PropertyId(99);
+        assert!(
+            verify(&property)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid property metadata")
+        );
+
+        let mut parameter = compile("<?thp\nfunction take(int $value = 1): void {}");
+        parameter
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "take")
+            .unwrap()
+            .parameter_metadata[0]
+            .default = Some(thp_hir::ConstantValue::String(b"wrong".to_vec()));
+        assert!(
+            verify(&parameter)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid parameter metadata")
+        );
+    }
+
+    #[test]
+    fn verifies_variadic_method_reflection_metadata() {
+        let program = compile(
+            r"<?thp
+class Values {
+    public function first(int ...$values): int { return $values[0]; }
+}
+",
+        );
+
+        verify(&program).unwrap();
+    }
+
+    #[test]
+    fn rejects_forged_declared_method_signature() {
+        let mut program = compile("<?thp\n$stream = MemoryStream::open();");
+        let method = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "MemoryStream")
+            .unwrap()
+            .declared_methods
+            .iter_mut()
+            .find(|method| method.name == "read")
+            .unwrap();
+        method.parameter_types[0] = thp_hir::Type::String;
+        method.parameters[0].ty = thp_hir::Type::String;
+
+        assert!(verify(&program).is_err());
     }
 
     #[test]
@@ -3231,12 +3538,8 @@ try {
         );
         assert_eq!(regions.functions[0].exception_handlers.len(), 2);
         regions.functions[0].exception_handlers.swap(0, 1);
-        assert!(
-            verify(&regions)
-                .unwrap_err()
-                .to_string()
-                .contains("innermost first")
-        );
+        let error = verify(&regions).unwrap_err();
+        assert!(error.to_string().contains("innermost first"), "{error}");
 
         let mut catches = compile(
             r"<?thp
@@ -3249,11 +3552,7 @@ try {
         catches.functions[0].exception_handlers[0]
             .catches
             .swap(0, 1);
-        assert!(
-            verify(&catches)
-                .unwrap_err()
-                .to_string()
-                .contains("subsumed")
-        );
+        let error = verify(&catches).unwrap_err();
+        assert!(error.to_string().contains("subsumed"), "{error}");
     }
 }

@@ -2,8 +2,9 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type, TypeParameter, TypeParameterId,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId, MethodSlot,
+    NominalKind, ParameterMetadata, PropertyId, ReflectionBuiltin, Type, TypeParameter,
+    TypeParameterId,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
@@ -191,6 +192,8 @@ impl Encoder {
         });
         self.u8(u8::from(class.abstract_class));
         self.u8(u8::from(class.final_class));
+        self.string(&class.module_name);
+        self.u8(u8::from(class.native));
         self.len(class.type_parameters.len());
         for parameter in &class.type_parameters {
             self.u32(parameter.id.owner.0);
@@ -207,25 +210,19 @@ impl Encoder {
         }
         self.len(class.properties.len());
         for property in &class.properties {
-            self.ty(&property.ty);
-            self.visibility(property.visibility);
-            self.u32(property.declaring_class.0);
+            self.property(property);
+        }
+        self.len(class.declared_properties.len());
+        for property in &class.declared_properties {
+            self.property(property);
         }
         self.len(class.methods.len());
         for method in &class.methods {
-            self.string(&method.name);
-            self.u32(method.slot.0);
-            self.optional_callee(method.callee);
-            self.visibility(method.visibility);
-            self.u32(method.declaring_class.0);
-            self.u8(u8::from(method.static_method));
-            self.u8(u8::from(method.abstract_method));
-            self.u8(u8::from(method.final_method));
-            self.len(method.parameter_types.len());
-            for ty in &method.parameter_types {
-                self.ty(ty);
-            }
-            self.ty(&method.return_type);
+            self.method(method);
+        }
+        self.len(class.declared_methods.len());
+        for method in &class.declared_methods {
+            self.method(method);
         }
         self.len(class.dispatch.len());
         for callee in &class.dispatch {
@@ -255,14 +252,109 @@ impl Encoder {
             }
             None => self.u8(0),
         }
+        self.len(class.traits.len());
+        for trait_id in &class.traits {
+            self.u32(trait_id.0);
+        }
+    }
+
+    fn property(&mut self, property: &Property) {
+        self.u32(property.id.0);
+        self.string(&property.name);
+        self.ty(&property.ty);
+        self.visibility(property.visibility);
+        self.u32(property.declaring_class.0);
+        self.optional_constant_value(property.default.as_ref());
+        self.u32(property.origin_trait.map_or(NONE, |origin| origin.0));
+    }
+
+    fn method(&mut self, method: &Method) {
+        self.string(&method.name);
+        self.u32(method.slot.0);
+        self.optional_callee(method.callee);
+        self.visibility(method.visibility);
+        self.u32(method.declaring_class.0);
+        self.u8(u8::from(method.static_method));
+        self.u8(u8::from(method.abstract_method));
+        self.u8(u8::from(method.final_method));
+        self.len(method.parameter_types.len());
+        for ty in &method.parameter_types {
+            self.ty(ty);
+        }
+        self.len(method.parameters.len());
+        for parameter in &method.parameters {
+            self.parameter_metadata(parameter);
+        }
+        self.ty(&method.return_type);
+        self.u32(method.origin_trait.map_or(NONE, |origin| origin.0));
+        self.string(&method.origin_name);
+    }
+
+    fn parameter_metadata(&mut self, parameter: &ParameterMetadata) {
+        self.string(&parameter.name);
+        self.ty(&parameter.ty);
+        self.optional_constant_value(parameter.default.as_ref());
+        self.u8(u8::from(parameter.variadic));
+    }
+
+    fn optional_constant_value(&mut self, value: Option<&ConstantValue>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.constant_value(value);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn constant_value(&mut self, value: &ConstantValue) {
+        match value {
+            ConstantValue::Int(value) => {
+                self.u8(0);
+                self.u64(u64::from_ne_bytes(value.to_ne_bytes()));
+            }
+            ConstantValue::Float(value) => {
+                self.u8(1);
+                self.u64(value.to_bits());
+            }
+            ConstantValue::Bool(value) => {
+                self.u8(2);
+                self.u8(u8::from(*value));
+            }
+            ConstantValue::Null => self.u8(3),
+            ConstantValue::String(value) => {
+                self.u8(4);
+                self.blob(value);
+            }
+            ConstantValue::Vector(values) => {
+                self.u8(5);
+                self.len(values.len());
+                for value in values {
+                    self.constant_value(value);
+                }
+            }
+            ConstantValue::Map(entries) => {
+                self.u8(6);
+                self.len(entries.len());
+                for (key, value) in entries {
+                    self.constant_value(key);
+                    self.constant_value(value);
+                }
+            }
+        }
     }
 
     fn function(&mut self, function: &Function) {
         self.u32(function.id.0);
         self.string(&function.name);
+        self.string(&function.module_name);
         self.len(function.parameters.len());
         for parameter in &function.parameters {
             self.u32(parameter.0);
+        }
+        self.len(function.parameter_metadata.len());
+        for parameter in &function.parameter_metadata {
+            self.parameter_metadata(parameter);
         }
         self.len(function.local_types.len());
         for ty in &function.local_types {
@@ -593,6 +685,10 @@ impl Encoder {
             Callee::Builtin(Builtin::ExceptionConstruct) => self.u8(20),
             Callee::Builtin(Builtin::ExceptionGetCode) => self.u8(21),
             Callee::Builtin(Builtin::ExceptionGetPrevious) => self.u8(22),
+            Callee::Builtin(Builtin::Reflection(operation)) => {
+                self.u8(23);
+                self.u8(operation as u8);
+            }
         }
     }
 
@@ -767,6 +863,8 @@ impl Decoder<'_> {
         };
         let abstract_class = self.boolean()?;
         let final_class = self.boolean()?;
+        let module_name = self.string()?;
+        let native = self.boolean()?;
         let type_parameters = self.vector(|decoder| {
             let id = TypeParameterId {
                 owner: ClassId(decoder.u32()?),
@@ -786,27 +884,10 @@ impl Decoder<'_> {
                 span,
             })
         })?;
-        let properties = self.vector(|decoder| {
-            Ok(Property {
-                ty: decoder.ty(0)?,
-                visibility: decoder.visibility()?,
-                declaring_class: ClassId(decoder.u32()?),
-            })
-        })?;
-        let methods = self.vector(|decoder| {
-            Ok(Method {
-                name: decoder.string()?,
-                slot: MethodSlot(decoder.u32()?),
-                callee: decoder.optional_callee()?,
-                visibility: decoder.visibility()?,
-                declaring_class: ClassId(decoder.u32()?),
-                static_method: decoder.boolean()?,
-                abstract_method: decoder.boolean()?,
-                final_method: decoder.boolean()?,
-                parameter_types: decoder.vector(|decoder| decoder.ty(0))?,
-                return_type: decoder.ty(0)?,
-            })
-        })?;
+        let properties = self.vector(Self::property)?;
+        let declared_properties = self.vector(Self::property)?;
+        let methods = self.vector(Self::method)?;
+        let declared_methods = self.vector(Self::method)?;
         let dispatch = self.vector(Self::optional_callee)?;
         let interfaces = self.vector(|decoder| Ok(ClassId(decoder.u32()?)))?;
         let interface_types = self.vector(|decoder| {
@@ -827,27 +908,112 @@ impl Decoder<'_> {
         } else {
             None
         };
+        let traits = self.vector(|decoder| Ok(ClassId(decoder.u32()?)))?;
         Ok(Class {
             id,
             name,
             kind,
             abstract_class,
             final_class,
+            module_name,
+            native,
             type_parameters,
             properties,
+            declared_properties,
             methods,
+            declared_methods,
             dispatch,
             interfaces,
             interface_types,
             parent,
             parent_type,
+            traits,
+        })
+    }
+
+    fn property(&mut self) -> Result<Property, DecodeError> {
+        Ok(Property {
+            id: PropertyId(self.u32()?),
+            name: self.string()?,
+            ty: self.ty(0)?,
+            visibility: self.visibility()?,
+            declaring_class: ClassId(self.u32()?),
+            default: self.optional_constant_value(0)?,
+            origin_trait: match self.u32()? {
+                NONE => None,
+                origin => Some(ClassId(origin)),
+            },
+        })
+    }
+
+    fn method(&mut self) -> Result<Method, DecodeError> {
+        Ok(Method {
+            name: self.string()?,
+            slot: MethodSlot(self.u32()?),
+            callee: self.optional_callee()?,
+            visibility: self.visibility()?,
+            declaring_class: ClassId(self.u32()?),
+            static_method: self.boolean()?,
+            abstract_method: self.boolean()?,
+            final_method: self.boolean()?,
+            parameter_types: self.vector(|decoder| decoder.ty(0))?,
+            parameters: self.vector(Self::parameter_metadata)?,
+            return_type: self.ty(0)?,
+            origin_trait: match self.u32()? {
+                NONE => None,
+                origin => Some(ClassId(origin)),
+            },
+            origin_name: self.string()?,
+        })
+    }
+
+    fn parameter_metadata(&mut self) -> Result<ParameterMetadata, DecodeError> {
+        Ok(ParameterMetadata {
+            name: self.string()?,
+            ty: self.ty(0)?,
+            default: self.optional_constant_value(0)?,
+            variadic: self.boolean()?,
+        })
+    }
+
+    fn optional_constant_value(
+        &mut self,
+        depth: usize,
+    ) -> Result<Option<ConstantValue>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.constant_value(depth).map(Some),
+            tag => Err(self.error(format!("invalid optional constant tag {tag}"))),
+        }
+    }
+
+    fn constant_value(&mut self, depth: usize) -> Result<ConstantValue, DecodeError> {
+        if depth > 128 {
+            return Err(self.error("constant nesting exceeds 128 levels"));
+        }
+        Ok(match self.u8()? {
+            0 => ConstantValue::Int(i64::from_ne_bytes(self.u64()?.to_ne_bytes())),
+            1 => ConstantValue::Float(f64::from_bits(self.u64()?)),
+            2 => ConstantValue::Bool(self.boolean()?),
+            3 => ConstantValue::Null,
+            4 => ConstantValue::String(self.blob()?),
+            5 => ConstantValue::Vector(self.vector(|decoder| decoder.constant_value(depth + 1))?),
+            6 => ConstantValue::Map(self.vector(|decoder| {
+                Ok((
+                    decoder.constant_value(depth + 1)?,
+                    decoder.constant_value(depth + 1)?,
+                ))
+            })?),
+            tag => return Err(self.error(format!("invalid constant metadata tag {tag}"))),
         })
     }
 
     fn function(&mut self) -> Result<Function, DecodeError> {
         let id = FunctionId(self.u32()?);
         let name = self.string()?;
+        let module_name = self.string()?;
         let parameters = self.vector(|decoder| Ok(LocalId(decoder.u32()?)))?;
+        let parameter_metadata = self.vector(Self::parameter_metadata)?;
         let local_types = self.vector(|decoder| decoder.ty(0))?;
         let return_type = self.ty(0)?;
         let owner = match self.u32()? {
@@ -863,7 +1029,9 @@ impl Decoder<'_> {
         Ok(Function {
             id,
             name,
+            module_name,
             parameters,
+            parameter_metadata,
             local_types,
             return_type,
             owner,
@@ -1098,6 +1266,11 @@ impl Decoder<'_> {
             20 => Ok(Callee::Builtin(Builtin::ExceptionConstruct)),
             21 => Ok(Callee::Builtin(Builtin::ExceptionGetCode)),
             22 => Ok(Callee::Builtin(Builtin::ExceptionGetPrevious)),
+            23 => ReflectionBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::Reflection(operation)))
+                .ok_or_else(|| self.error("unknown reflection builtin")),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }

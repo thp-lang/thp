@@ -34,23 +34,24 @@ extraction, incremental/cache work, linking, and prepared execution.
 `proposed` means the symbol is documentation-only and must be rejected by the
 compiler if used as though it were available.
 
-| Symbol or syntax                                                                  | Availability | Executable boundary                                                                                              |
-| --------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `<?thp`, comments, blocks, statements                                             | implemented  | UTF-8 source and ASCII identifiers                                                                               |
-| `int`, `float`, `bool`, `string`, `null`, `void`, `mixed`, nullable types, unions | implemented  | `string` values are arbitrary bytes at runtime                                                                   |
-| `vector<T>`, `map<K, V>`                                                          | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                         |
-| Variables and functions                                                           | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                  |
-| `if`, `match`, `while`, `for`, `return`, `echo`                                   | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                  |
-| `foreach (vector<T>)`, `foreach (map<K, V>)`                                      | implemented  | Native collections only; the source is evaluated once and traversal uses its captured COW snapshot               |
-| `break`, `continue`                                                               | partial      | Level one only; numeric levels are rejected                                                                      |
-| Scalar operators                                                                  | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing |
-| Classes and interfaces                                                            | partial      | Erased generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported  |
-| Traits                                                                            | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                        |
-| `Throwable`, `Exception`, `Error`, `UnhandledMatchError`                          | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures         |
-| `try`, `catch`, `finally`, `throw`, `using`                                       | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                  |
-| Namespaces, imports, and project autoload discovery                               | implemented  | Semicolon namespaces and deterministic configured source maps; no runtime include/autoload callbacks             |
-| OPcache, frozen projects, metrics, embedding, C ABI                               | implemented  | Generic metadata is hashed and schema-versioned; the public C ABI remains version 1                              |
-| Cranelift JIT                                                                     | partial      | Safe scalar subset; automatic mode falls back to the VM                                                          |
+| Symbol or syntax                                                                            | Availability | Executable boundary                                                                                              |
+| ------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `<?thp`, comments, blocks, statements                                                       | implemented  | UTF-8 source and ASCII identifiers                                                                               |
+| `int`, `float`, `bool`, `string`, `null`, `void`, `mixed`, nullable types, unions           | implemented  | `string` values are arbitrary bytes at runtime                                                                   |
+| `vector<T>`, `map<K, V>`                                                                    | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                         |
+| Variables and functions                                                                     | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                  |
+| `if`, `match`, `while`, `for`, `return`, `echo`                                             | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                  |
+| `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Native collections only; the source is evaluated once and traversal uses its captured COW snapshot               |
+| `break`, `continue`                                                                         | partial      | Level one only; numeric levels are rejected                                                                      |
+| Scalar operators                                                                            | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing |
+| Classes and interfaces                                                                      | partial      | Reified generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported |
+| Traits                                                                                      | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                        |
+| Reflection descriptor constructors                                                          | implemented  | Linked-program discovery, deterministic metadata, checked access/invocation, and reflective construction         |
+| `Throwable`, `Exception`, `Error`, `TypeError`, `ArgumentCountError`, `UnhandledMatchError` | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures         |
+| `try`, `catch`, `finally`, `throw`, `using`                                                 | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                  |
+| Namespaces, imports, and project autoload discovery                                         | implemented  | Semicolon namespaces and deterministic configured source maps; no runtime include/autoload callbacks             |
+| OPcache, frozen projects, metrics, embedding, C ABI                                         | implemented  | Reified generic and reflection metadata is schema-versioned; the public C ABI remains version 1                  |
+| Cranelift JIT                                                                               | partial      | Safe scalar subset; automatic mode falls back to the VM                                                          |
 
 ### Collection and iterator symbols
 
@@ -142,9 +143,9 @@ PHP behavior. Pending work includes:
   `foreach`, and numeric `break`/`continue` levels;
 - generic and multiple-parent interfaces, interface state, trait constants,
   static properties, property hooks, magic methods, anonymous classes, enums,
-  reflection, and flow narrowing after `instanceof`;
+  reflection attributes/source inspection, and flow narrowing after `instanceof`;
 - global constants, dynamic names, runtime includes/autoload callbacks,
-  attributes, generators, reflection, and cooperative async;
+  attributes, generators, closures, and cooperative async;
 - the broader standard library, extension registration/dispatch, concrete
   FastCGI and web-server SAPI adapters, relocatable module code generation,
   dependency-minimal incremental invalidation, broader JIT coverage, hotness

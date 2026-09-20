@@ -39,6 +39,7 @@ automatically THP behavior.
 | [Control structures](thp:guide.languageControlStructures)  | Branches, loops, matching, and transfers.  |
 | [Functions](thp:guide.languageFunctions)                   | Typed callables, parameters, and returns.  |
 | [Classes and objects](thp:guide.languageClassesAndObjects) | Classes, interfaces, and object members.   |
+| [Reflection](thp:guide.languageReflection)                 | Immutable linked-program metadata.         |
 | [Namespaces](thp:guide.languageNamespaces)                 | Qualified names and imports.               |
 | [Enumerations](thp:guide.languageEnumerations)             | Closed sets of named cases.                |
 | [Generators](thp:guide.languageGenerators)                 | Proposed resumable sequence producers.     |

@@ -47,4 +47,5 @@ try {
 ## See also
 
 - [`Exception`](thp:std.baseTypes.Exception)
+- [`TypeError`](thp:std.baseTypes.TypeError)
 - [`UnhandledMatchError`](thp:std.baseTypes.UnhandledMatchError)
