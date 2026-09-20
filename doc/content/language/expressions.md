@@ -11,7 +11,7 @@ availability: partial
 notice: >-
   Literals, variables, typed operators, statically resolved calls, object
   construction, native collection access and assignment, and `match` execute.
-  Ternaries, dynamic calls, and general reference expressions remain proposals.
+  Ternaries, general dynamic calls, and general reference expressions remain proposals.
 ---
 
 An expression produces a value or performs an operation. Literals, variables,
@@ -44,6 +44,12 @@ properties, and collection elements are checked against their expected types.
 
 Dynamic calls, capturing closures, and general reference expressions do not yet
 have stable THP contracts.
+
+Dynamic construction is the narrow exception: `new $class(...)` and
+`new (expression)<T>(...)` accept a statically narrowed `string` target and
+produce `mixed`. Parentheses are required around a dynamic target other than a
+single variable. This does not enable dynamic functions, methods, or static
+calls.
 
 ## Collection-element assignment
 

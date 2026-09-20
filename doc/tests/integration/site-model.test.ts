@@ -162,12 +162,12 @@ describe("documentation site model", () => {
     const byKind = (kind: string) =>
       standardLibraryPages.filter((page) => page.source.data.kind === kind);
 
-    expect(standardLibraryPages).toHaveLength(456);
+    expect(standardLibraryPages).toHaveLength(457);
     expect(byKind("module")).toHaveLength(9);
     expect(byKind("class").length + byKind("interface").length).toBe(91);
     expect(byKind("enum")).toHaveLength(3);
     expect(byKind("method")).toHaveLength(330);
-    expect(byKind("function")).toHaveLength(23);
+    expect(byKind("function")).toHaveLength(24);
     expect(
       byKind("module").map((page) => [page.source.data.id, page.route]),
     ).toEqual([
@@ -347,7 +347,7 @@ describe("documentation site model", () => {
       basePath: "/",
       siteUrl: "https://example.github.io",
     });
-    expect(rootModel.pages).toHaveLength(494);
+    expect(rootModel.pages).toHaveLength(495);
     const subpathModel = await build({
       root,
       basePath: "/typed-php/",

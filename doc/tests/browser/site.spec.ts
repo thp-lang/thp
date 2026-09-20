@@ -456,9 +456,9 @@ test("mobile navigation, search, and keyboard access", async ({
   await page.locator("[data-search-input]").fill("first-in first-out");
   await expect(page.locator("[data-search-results]")).toContainText("SplQueue");
   await page.locator("[data-search-kind]").selectOption("function");
-  await page.locator("[data-search-input]").fill("spl_autoload");
+  await page.locator("[data-search-input]").fill("class_implements");
   await expect(page.locator("[data-search-results]")).toContainText(
-    "spl_autoload",
+    "class_implements",
   );
   await page.locator("[data-search-kind]").selectOption("method");
   await page.locator("[data-search-input]").fill("dequeue");

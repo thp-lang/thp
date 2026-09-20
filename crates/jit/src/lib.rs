@@ -516,6 +516,12 @@ echo (new Value())->read() . "";
         assert!(!supports(&objects));
         assert!(execute(&objects).is_err());
 
+        let dynamic =
+            compile("<?thp\nclass Value {}\n$class: string = \"Value\";\n$value = new $class();");
+        assert!(!supports(&dynamic));
+        assert!(execute(&dynamic).is_err());
+        thp_vm::execute(&dynamic, thp_vm::Limits::default()).unwrap();
+
         let cleanup = compile(
             r#"<?thp
 try {

@@ -182,6 +182,7 @@ included file perform initialization. THP discovers a project statically from
 
 ```toml
 [autoload]
+packages = "vendor/"
 "App\\" = "src/"
 ```
 
@@ -192,8 +193,10 @@ reported before execution.
 
 Only the selected entry file may contain executable top-level statements.
 Put reusable initialization in a named function and call it from the entry.
-There is no current equivalent of Composer autoloading, `include`, `require`,
-or arbitrary user-defined runtime loading.
+THP can discover already-installed THP packages under Composer-shaped
+`vendor/name/package` directories, but it does not download them, resolve
+versions, or execute Composer/PHP autoloaders. There is no current equivalent
+of `include`, `require`, or arbitrary user-defined runtime loading.
 
 Name resolution is case-sensitive. Type imports and function imports use
 separate tables:
@@ -236,7 +239,7 @@ proposals rather than executable functions. Read the `availability` badge on
 each page and use [Implementation status](thp:guide.implementationStatus) as
 the detailed feature authority.
 
-THP also does not load PHP extensions, Composer packages, or framework code.
+THP also does not load PHP extensions, PHP Composer packages, or framework code.
 Choose PHP for an existing PHP application or production service; choose THP
 today for a greenfield command-line experiment in this language model.
 

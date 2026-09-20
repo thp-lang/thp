@@ -5,9 +5,9 @@ use thp_diagnostics::{Diagnostic, SourceFile, Span};
 use crate::{
     Argument, BinaryOp, Block, CatchClause, ClassDecl, Expr, ExprKind, ForClause, ForClauseKind,
     FunctionDecl, InterfaceDecl, LexOutput, LoopBinding, MapEntry, MatchArm, MethodDecl, NameRef,
-    NamespaceDecl, NominalRef, Parameter, Program, PropertyDecl, QualifiedName, ScopeTarget, Stmt,
-    StmtKind, Token, TokenKind, TraitAdaptation, TraitDecl, TraitUse, TypeParameterDecl,
-    TypeSyntax, TypeSyntaxKind, UnaryOp, UseDecl, UseKind, Visibility, lex,
+    NamespaceDecl, NewTarget, NominalRef, Parameter, Program, PropertyDecl, QualifiedName,
+    ScopeTarget, Stmt, StmtKind, Token, TokenKind, TraitAdaptation, TraitDecl, TraitUse,
+    TypeParameterDecl, TypeSyntax, TypeSyntaxKind, UnaryOp, UseDecl, UseKind, Visibility, lex,
 };
 
 type ParsedMembers = (Vec<TraitUse>, Vec<PropertyDecl>, Vec<MethodDecl>, Span);
@@ -1604,10 +1604,40 @@ impl Parser<'_, '_> {
                 span: token.span,
             },
             TokenKind::New => {
-                let class =
-                    self.parse_qualified_name(true, "P1104", "expected a class name after `new`")?;
+                let (mut target, target_span) = if self.at(TokenKind::Variable) {
+                    let variable = self.advance();
+                    (
+                        NewTarget::Dynamic(Box::new(Expr {
+                            kind: ExprKind::Variable(self.text(variable.span)[1..].to_owned()),
+                            span: variable.span,
+                        })),
+                        variable.span,
+                    )
+                } else if self.consume(TokenKind::LParen) {
+                    let target = self.parse_expression(0)?;
+                    let end = self.expect(
+                        TokenKind::RParen,
+                        "P1104",
+                        "expected `)` after dynamic class expression",
+                    )?;
+                    let span = target.span.join(end.span);
+                    (NewTarget::Dynamic(Box::new(target)), span)
+                } else {
+                    let class = self.parse_qualified_name(
+                        true,
+                        "P1104",
+                        "expected a class name, variable, or parenthesized expression after `new`",
+                    )?;
+                    let span = class.span;
+                    (
+                        NewTarget::Static {
+                            class_name: class.as_string(),
+                            class_span: span,
+                        },
+                        span,
+                    )
+                };
                 let mut type_arguments = Vec::new();
-                let mut class_span = class.span;
                 if self.consume(TokenKind::Less) {
                     loop {
                         type_arguments.push(self.parse_type()?);
@@ -1615,25 +1645,24 @@ impl Parser<'_, '_> {
                             break;
                         }
                     }
-                    class_span = class.span.join(
-                        self.expect(
-                            TokenKind::Greater,
-                            "P1107",
-                            "expected `>` after constructor type arguments",
-                        )?
-                        .span,
-                    );
+                    let end = self.expect(
+                        TokenKind::Greater,
+                        "P1107",
+                        "expected `>` after constructor type arguments",
+                    )?;
+                    if let NewTarget::Static { class_span, .. } = &mut target {
+                        *class_span = class_span.join(end.span);
+                    }
                 }
                 self.expect(TokenKind::LParen, "P1105", "expected constructor arguments")?;
                 let (arguments, end) = self.parse_arguments_after_open()?;
                 Expr {
                     kind: ExprKind::New {
-                        class_name: class.as_string(),
-                        class_span,
+                        target,
                         type_arguments,
                         arguments,
                     },
-                    span: token.span.join(end),
+                    span: token.span.join(target_span).join(end),
                 }
             }
             TokenKind::Variable => Expr {
@@ -2154,7 +2183,32 @@ mod tests {
     use thp_diagnostics::{SourceFile, Span};
 
     use super::parse;
-    use crate::{BinaryOp, ExprKind, StmtKind};
+    use crate::{BinaryOp, ExprKind, NewTarget, StmtKind};
+
+    #[test]
+    fn parses_dynamic_new_targets_and_generics() {
+        let output = parse(&SourceFile::new(
+            "dynamic-new.thp",
+            "<?thp\n$a = new $class<int>(value: 1);\n$b = new (name())<string>(2);",
+        ));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        for statement in &output.program.statements {
+            let StmtKind::Assign { value, .. } = &statement.kind else {
+                panic!("expected assignment")
+            };
+            let ExprKind::New {
+                target,
+                type_arguments,
+                arguments,
+            } = &value.kind
+            else {
+                panic!("expected dynamic new")
+            };
+            assert!(matches!(target, NewTarget::Dynamic(_)));
+            assert_eq!(type_arguments.len(), 1);
+            assert_eq!(arguments.len(), 1);
+        }
+    }
 
     #[test]
     fn parses_generic_nominals_and_explicit_access() {

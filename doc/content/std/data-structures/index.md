@@ -2,7 +2,7 @@
 kind: module
 id: std.dataStructures
 title: Data structures
-summary: Generic containers, observer contracts, autoloading, and object utilities.
+summary: Generic containers, observer contracts, and object utilities.
 module: data-structures
 order: 60
 status: experimental
@@ -39,52 +39,3 @@ wrapper require independently named contracts before implementation.
 
 [`SplObserver`](thp:std.spl.SplObserver) receives notifications from
 [`SplSubject`](thp:std.spl.SplSubject).
-
-## Autoloading and object utilities
-
-Autoloading lets an application defer loading a class, interface, or enum until
-the declaration is first needed. THP maintains an ordered, process-wide queue of
-loader callbacks, following PHP's SPL autoloading model.
-
-## Registry functions
-
-| Function                                                           | Description                                      |
-| ------------------------------------------------------------------ | ------------------------------------------------ |
-| [`spl_autoload_register()`](thp:std.spl.spl_autoload_register)     | Adds a callback to the autoload queue.           |
-| [`spl_autoload_unregister()`](thp:std.spl.spl_autoload_unregister) | Removes a callback from the autoload queue.      |
-| [`spl_autoload_functions()`](thp:std.spl.spl_autoload_functions)   | Returns the registered callbacks in queue order. |
-| [`spl_autoload_call()`](thp:std.spl.spl_autoload_call)             | Runs the queue for a requested type name.        |
-
-## Default loader
-
-| Function                                                           | Description                                       |
-| ------------------------------------------------------------------ | ------------------------------------------------- |
-| [`spl_autoload()`](thp:std.spl.spl_autoload)                       | Searches include paths using configured suffixes. |
-| [`spl_autoload_extensions()`](thp:std.spl.spl_autoload_extensions) | Reads or replaces the default loader's suffixes.  |
-
-## Example
-
-```thp
-spl_autoload_register(function (string $class): void {
-    $path = "./src/" . str_replace("\\", "/", $class) . ".thp";
-    require $path;
-});
-
-$service = new App\Services\ReportService();
-```
-
-When `ReportService` is not already declared, the runtime passes its qualified
-name to each registered loader until one defines it.
-
-## Design background
-
-The queue and callback signatures follow
-[PHP's class autoloading model](https://www.php.net/manual/en/language.oop5.autoload.php).
-THP preserves explicit collection typing when inspecting the queue and does not
-guarantee that PHP autoloaders registered by dependencies share the THP
-registry.
-
-## See also
-
-- [Standard PHP Library](thp:std.dataStructures)
-- [PHP SPL autoloading functions](https://www.php.net/manual/en/ref.spl.php)

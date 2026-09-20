@@ -2,15 +2,17 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type, TypeParameter, TypeParameterId,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId,
+    MAX_CONSTANT_NESTING, MethodSlot, NominalKind, PropertyId, RuntimeParameter, Type,
+    TypeParameter, TypeParameterId,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 use crate::{
-    BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, ExceptionHandler, Function, Instruction,
-    InstructionKind, Method, NominalType, Program, Property, Terminator, verify,
+    BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, DynamicArgument, ExceptionHandler,
+    Function, Instruction, InstructionKind, Method, NominalType, Program, Property, Terminator,
+    verify,
 };
 
 const MAGIC: &[u8; 8] = b"THPBC\0\0\0";
@@ -191,6 +193,7 @@ impl Encoder {
         });
         self.u8(u8::from(class.abstract_class));
         self.u8(u8::from(class.final_class));
+        self.u8(u8::from(class.native));
         self.len(class.type_parameters.len());
         for parameter in &class.type_parameters {
             self.u32(parameter.id.owner.0);
@@ -211,6 +214,16 @@ impl Encoder {
             self.visibility(property.visibility);
             self.u32(property.declaring_class.0);
         }
+        self.len(class.property_initializers.len());
+        for initializer in &class.property_initializers {
+            match initializer {
+                Some(value) => {
+                    self.u8(1);
+                    self.constant_value(value);
+                }
+                None => self.u8(0),
+            }
+        }
         self.len(class.methods.len());
         for method in &class.methods {
             self.string(&method.name);
@@ -224,6 +237,19 @@ impl Encoder {
             self.len(method.parameter_types.len());
             for ty in &method.parameter_types {
                 self.ty(ty);
+            }
+            self.len(method.parameters.len());
+            for parameter in &method.parameters {
+                self.string(&parameter.name);
+                self.ty(&parameter.ty);
+                match &parameter.default {
+                    Some(value) => {
+                        self.u8(1);
+                        self.constant_value(value);
+                    }
+                    None => self.u8(0),
+                }
+                self.u8(u8::from(parameter.variadic));
             }
             self.ty(&method.return_type);
         }
@@ -512,6 +538,34 @@ impl Encoder {
                 self.u32(property.0);
                 self.u32(value.0);
             }
+            InstructionKind::NewDynamic {
+                target,
+                type_arguments,
+                arguments,
+            } => {
+                self.u8(27);
+                self.u32(target.0);
+                self.len(type_arguments.len());
+                for ty in type_arguments {
+                    self.ty(ty);
+                }
+                self.len(arguments.len());
+                for argument in arguments {
+                    if let Some(name) = &argument.name {
+                        self.u8(1);
+                        self.string(name);
+                    } else {
+                        self.u8(0);
+                    }
+                    self.u32(argument.value.0);
+                    self.span(argument.span);
+                }
+            }
+            InstructionKind::CheckedNarrow { value, narrowed } => {
+                self.u8(28);
+                self.u32(value.0);
+                self.ty(narrowed);
+            }
         }
     }
 
@@ -533,6 +587,43 @@ impl Encoder {
             Constant::String(value) => {
                 self.u8(4);
                 self.blob(value);
+            }
+        }
+    }
+
+    fn constant_value(&mut self, constant: &ConstantValue) {
+        match constant {
+            ConstantValue::Integer(value) => {
+                self.u8(0);
+                self.u64(u64::from_ne_bytes(value.to_ne_bytes()));
+            }
+            ConstantValue::Float(value) => {
+                self.u8(1);
+                self.u64(value.to_bits());
+            }
+            ConstantValue::Bool(value) => {
+                self.u8(2);
+                self.u8(u8::from(*value));
+            }
+            ConstantValue::Null => self.u8(3),
+            ConstantValue::String(value) => {
+                self.u8(4);
+                self.blob(value);
+            }
+            ConstantValue::Vector(values) => {
+                self.u8(5);
+                self.len(values.len());
+                for value in values {
+                    self.constant_value(value);
+                }
+            }
+            ConstantValue::Map(entries) => {
+                self.u8(6);
+                self.len(entries.len());
+                for (key, value) in entries {
+                    self.constant_value(key);
+                    self.constant_value(value);
+                }
             }
         }
     }
@@ -593,6 +684,13 @@ impl Encoder {
             Callee::Builtin(Builtin::ExceptionConstruct) => self.u8(20),
             Callee::Builtin(Builtin::ExceptionGetCode) => self.u8(21),
             Callee::Builtin(Builtin::ExceptionGetPrevious) => self.u8(22),
+            Callee::Builtin(Builtin::IsString) => self.u8(23),
+            Callee::Builtin(Builtin::IsInt) => self.u8(24),
+            Callee::Builtin(Builtin::IsFloat) => self.u8(25),
+            Callee::Builtin(Builtin::IsNull) => self.u8(26),
+            Callee::Builtin(Builtin::IsNumeric) => self.u8(27),
+            Callee::Builtin(Builtin::IsVector) => self.u8(28),
+            Callee::Builtin(Builtin::IsMap) => self.u8(29),
         }
     }
 
@@ -771,6 +869,7 @@ impl Decoder<'_> {
         };
         let abstract_class = self.boolean()?;
         let final_class = self.boolean()?;
+        let native = self.boolean()?;
         let type_parameters = self.vector(|decoder| {
             let id = TypeParameterId {
                 owner: ClassId(decoder.u32()?),
@@ -797,6 +896,13 @@ impl Decoder<'_> {
                 declaring_class: ClassId(decoder.u32()?),
             })
         })?;
+        let property_initializers = self.vector(|decoder| {
+            if decoder.boolean()? {
+                Ok(Some(decoder.constant_value(0)?))
+            } else {
+                Ok(None)
+            }
+        })?;
         let methods = self.vector(|decoder| {
             Ok(Method {
                 name: decoder.string()?,
@@ -808,6 +914,18 @@ impl Decoder<'_> {
                 abstract_method: decoder.boolean()?,
                 final_method: decoder.boolean()?,
                 parameter_types: decoder.vector(|decoder| decoder.ty(0))?,
+                parameters: decoder.vector(|decoder| {
+                    Ok(RuntimeParameter {
+                        name: decoder.string()?,
+                        ty: decoder.ty(0)?,
+                        default: if decoder.boolean()? {
+                            Some(decoder.constant_value(0)?)
+                        } else {
+                            None
+                        },
+                        variadic: decoder.boolean()?,
+                    })
+                })?,
                 return_type: decoder.ty(0)?,
             })
         })?;
@@ -837,8 +955,10 @@ impl Decoder<'_> {
             kind,
             abstract_class,
             final_class,
+            native,
             type_parameters,
             properties,
+            property_initializers,
             methods,
             dispatch,
             interfaces,
@@ -1022,6 +1142,30 @@ impl Decoder<'_> {
                 property: PropertyId(self.u32()?),
                 value: Register(self.u32()?),
             },
+            27 => InstructionKind::NewDynamic {
+                target: Register(self.u32()?),
+                type_arguments: self.vector(|decoder| decoder.ty(0))?,
+                arguments: self.vector(|decoder| {
+                    let name = match decoder.u8()? {
+                        0 => None,
+                        1 => Some(decoder.string()?),
+                        tag => {
+                            return Err(
+                                decoder.error(format!("invalid optional argument-name tag {tag}"))
+                            );
+                        }
+                    };
+                    Ok(DynamicArgument {
+                        name,
+                        value: Register(decoder.u32()?),
+                        span: decoder.span()?,
+                    })
+                })?,
+            },
+            28 => InstructionKind::CheckedNarrow {
+                value: Register(self.u32()?),
+                narrowed: self.ty(0)?,
+            },
             tag => return Err(self.error(format!("unknown instruction tag {tag}"))),
         };
         Ok(Instruction {
@@ -1044,6 +1188,29 @@ impl Decoder<'_> {
             3 => Constant::Null,
             4 => Constant::String(self.blob()?),
             tag => return Err(self.error(format!("unknown constant tag {tag}"))),
+        })
+    }
+
+    fn constant_value(&mut self, depth: usize) -> Result<ConstantValue, DecodeError> {
+        if depth > MAX_CONSTANT_NESTING {
+            return Err(self.error(format!(
+                "constant nesting exceeds {MAX_CONSTANT_NESTING} levels"
+            )));
+        }
+        Ok(match self.u8()? {
+            0 => ConstantValue::Integer(i64::from_ne_bytes(self.u64()?.to_ne_bytes())),
+            1 => ConstantValue::Float(f64::from_bits(self.u64()?)),
+            2 => ConstantValue::Bool(self.boolean()?),
+            3 => ConstantValue::Null,
+            4 => ConstantValue::String(self.blob()?),
+            5 => ConstantValue::Vector(self.vector(|decoder| decoder.constant_value(depth + 1))?),
+            6 => ConstantValue::Map(self.vector(|decoder| {
+                Ok((
+                    decoder.constant_value(depth + 1)?,
+                    decoder.constant_value(depth + 1)?,
+                ))
+            })?),
+            tag => return Err(self.error(format!("unknown typed constant tag {tag}"))),
         })
     }
 
@@ -1102,6 +1269,13 @@ impl Decoder<'_> {
             20 => Ok(Callee::Builtin(Builtin::ExceptionConstruct)),
             21 => Ok(Callee::Builtin(Builtin::ExceptionGetCode)),
             22 => Ok(Callee::Builtin(Builtin::ExceptionGetPrevious)),
+            23 => Ok(Callee::Builtin(Builtin::IsString)),
+            24 => Ok(Callee::Builtin(Builtin::IsInt)),
+            25 => Ok(Callee::Builtin(Builtin::IsFloat)),
+            26 => Ok(Callee::Builtin(Builtin::IsNull)),
+            27 => Ok(Callee::Builtin(Builtin::IsNumeric)),
+            28 => Ok(Callee::Builtin(Builtin::IsVector)),
+            29 => Ok(Callee::Builtin(Builtin::IsMap)),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }

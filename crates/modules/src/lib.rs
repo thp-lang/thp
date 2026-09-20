@@ -11,8 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, Span};
 use thp_syntax::{
     Block, ClassDecl, Expr, ExprKind, ForClause, ForClauseKind, FunctionDecl, InterfaceDecl,
-    NameRef, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitDecl,
-    TraitUse, TypeSyntax, TypeSyntaxKind, UseKind,
+    NameRef, NewTarget, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation,
+    TraitDecl, TraitUse, TypeSyntax, TypeSyntaxKind, UseKind,
 };
 
 pub const INTERFACE_FORMAT_VERSION: u16 = 2;
@@ -976,11 +976,12 @@ fn collect_body_expr(expression: &Expr, output: &mut Vec<(bool, String)>) {
             }
         }
         ExprKind::New {
-            class_name,
-            arguments,
-            ..
+            target, arguments, ..
         } => {
-            output.push((false, class_name.clone()));
+            match target {
+                NewTarget::Static { class_name, .. } => output.push((false, class_name.clone())),
+                NewTarget::Dynamic(target) => collect_body_expr(target, output),
+            }
             for argument in arguments {
                 collect_body_expr(&argument.value, output);
             }
@@ -1484,12 +1485,19 @@ fn resolve_expr(
             }
         }
         ExprKind::New {
-            class_name,
+            target,
             type_arguments,
             arguments,
             ..
         } => {
-            *class_name = resolve_type_name(class_name, namespace, type_aliases);
+            match target {
+                NewTarget::Static { class_name, .. } => {
+                    *class_name = resolve_type_name(class_name, namespace, type_aliases);
+                }
+                NewTarget::Dynamic(target) => {
+                    resolve_expr(target, namespace, type_aliases, function_aliases, index);
+                }
+            }
             for argument in type_arguments {
                 resolve_type(argument, namespace, type_aliases);
             }
