@@ -56,3 +56,8 @@ modules:
     summary: Stream resources, filters, and transport operations.
     order: 70
     typeGroup: Types
+  reflection:
+    name: Reflection
+    summary: Runtime descriptors for linked types and declarations.
+    order: 75
+    typeGroup: Types

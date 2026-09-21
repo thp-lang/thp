@@ -1301,6 +1301,16 @@ impl Parser<'_, '_> {
                 kind: TypeSyntaxKind::Nullable(Box::new(inner)),
             });
         }
+        if self.consume(TokenKind::Null) {
+            let span = self.previous().span;
+            return Some(TypeSyntax {
+                kind: TypeSyntaxKind::Named {
+                    name: "null".to_owned(),
+                    arguments: Vec::new(),
+                },
+                span,
+            });
+        }
         let name = self.parse_qualified_name(true, "P0901", "expected a type name")?;
         let mut arguments = Vec::new();
         let mut end = name.span;
@@ -2290,6 +2300,20 @@ if ($answer > 40) {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_reflect_as_an_ordinary_function_call() {
+        let output = parse(&SourceFile::new("test.thp", "<?thp\nreflect(int);"));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let StmtKind::Expression(expression) = &output.program.statements[0].kind else {
+            panic!("expected expression statement");
+        };
+        let ExprKind::Call { callee, arguments } = &expression.kind else {
+            panic!("expected ordinary call");
+        };
+        assert!(matches!(&callee.kind, ExprKind::Name(name) if name == "reflect"));
+        assert!(matches!(&arguments[0].value.kind, ExprKind::Name(name) if name == "int"));
     }
 
     #[test]

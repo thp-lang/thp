@@ -32,6 +32,8 @@ a directly guarded local inside a positive `if` or `elseif` branch.
 | [`Throwable`](thp:std.baseTypes.Throwable)                     | Sealed interface for values accepted by throw.  |
 | [`Exception`](thp:std.baseTypes.Exception)                     | Base class for application failures.            |
 | [`Error`](thp:std.baseTypes.Error)                             | Base class for engine-detected language errors. |
+| [`TypeError`](thp:std.baseTypes.TypeError)                     | Reports a dynamic argument type mismatch.       |
+| [`ArgumentCountError`](thp:std.baseTypes.ArgumentCountError)   | Reports a dynamic argument count mismatch.      |
 | [`UnhandledMatchError`](thp:std.baseTypes.UnhandledMatchError) | Reports a `match` with no selected arm.         |
 | [`Option`](thp:std.baseTypes.Option)                           | Represents either one value or no value.        |
 | [`TraceLine`](thp:std.baseTypes.TraceLine)                     | Represents one frame in a captured stack trace. |

@@ -2,13 +2,14 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use thp_bytecode::{Program as BytecodeProgram, lower as lower_bytecode, verify};
 use thp_config::{AutoloadConfig, LOCK_FILE_NAME, LockFile, ProjectConfig};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, SourceMap, Span};
-use thp_hir::{Module as HirModule, lower as lower_hir, lower_project as lower_project_hir};
+use thp_hir::{Module as HirModule, lower_with_modules as lower_hir_with_modules};
 use thp_metrics::{Metrics, Stage};
 use thp_mir::{Module as MirModule, lower as lower_mir};
 use thp_modules::{
@@ -522,7 +523,14 @@ pub fn compile_project_with_provider(
         statements,
         span: entry.ast.span,
     };
-    let lowered_hir = metrics.measure(Stage::Hir, || lower_project_hir(&linked_ast));
+    let mut declaration_modules = BTreeMap::new();
+    declaration_modules.insert("<main>".to_owned(), entry.module.id.to_string());
+    for unit in &units {
+        collect_declaration_modules(&unit.ast, unit.module.id.as_str(), &mut declaration_modules);
+    }
+    let lowered_hir = metrics.measure(Stage::Hir, || {
+        lower_hir_with_modules(&linked_ast, &declaration_modules)
+    });
     diagnostics.extend(lowered_hir.diagnostics.into_iter().map(|diagnostic| {
         ProjectDiagnostic {
             source: diagnostic
@@ -1014,7 +1022,13 @@ fn compile_source_with_metrics(source: SourceFile, mut metrics: Metrics) -> Comp
         };
     }
 
-    let lowered_hir = metrics.measure(Stage::Hir, || lower_hir(&ast));
+    let module_name = ModuleId::synthetic_entry(source.path()).to_string();
+    let mut declaration_modules = BTreeMap::new();
+    declaration_modules.insert("<main>".to_owned(), module_name.clone());
+    collect_declaration_modules(&ast, &module_name, &mut declaration_modules);
+    let lowered_hir = metrics.measure(Stage::Hir, || {
+        lower_hir_with_modules(&ast, &declaration_modules)
+    });
     if let Some(measurement) = metrics.last_mut() {
         measurement.set_output(
             lowered_hir.module.expression_count(),
@@ -1069,6 +1083,25 @@ fn compile_source_with_metrics(source: SourceFile, mut metrics: Metrics) -> Comp
         bytecode: diagnostics.is_empty().then_some(bytecode),
         diagnostics,
         metrics,
+    }
+}
+
+fn collect_declaration_modules(
+    program: &AstProgram,
+    module: &str,
+    output: &mut BTreeMap<String, String>,
+) {
+    for statement in &program.statements {
+        let name = match &statement.kind {
+            thp_syntax::StmtKind::Function(declaration) => Some(&declaration.name),
+            thp_syntax::StmtKind::Class(declaration) => Some(&declaration.name),
+            thp_syntax::StmtKind::Interface(declaration) => Some(&declaration.name),
+            thp_syntax::StmtKind::Trait(declaration) => Some(&declaration.name),
+            _ => None,
+        };
+        if let Some(name) = name {
+            output.insert(name.clone(), module.to_owned());
+        }
     }
 }
 
@@ -1422,7 +1455,7 @@ echo $value->value()->name();
         .unwrap();
         std::fs::write(
             directory.path().join("main.thp"),
-            "<?thp\nuse function App\\message;\necho message();\n",
+            "<?thp\nuse function App\\message;\necho message();\necho (new ReflectionFunction(\"App\\\\message\"))->getName();\n",
         )
         .unwrap();
         let request = ProjectRequest::new(directory.path(), directory.path().join("main.thp"));
@@ -1434,6 +1467,13 @@ echo $value->value()->name();
         std::fs::remove_dir_all(directory.path().join("src")).unwrap();
         let prepared = load_frozen_project(&request, &store).unwrap();
         assert!(prepared.bytecode.instruction_count() > 0);
+        assert!(
+            prepared
+                .bytecode
+                .functions
+                .iter()
+                .any(|function| function.name == "App\\message" && !function.module_name.is_empty())
+        );
     }
 
     #[test]

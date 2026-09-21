@@ -4,7 +4,7 @@
 #![allow(clippy::match_same_arms)]
 
 use std::alloc::{Layout, alloc};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -15,7 +15,43 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use thp_diagnostics::Span;
-use thp_hir::{ClassId, PropertyId, Type};
+use thp_hir::{ClassId, FunctionId, PropertyId, Type};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReflectionCallable {
+    Function(FunctionId),
+    Method {
+        class: ClassId,
+        index: u32,
+        declared: bool,
+        type_arguments: Vec<Type>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReflectionValue {
+    Type(Type),
+    Class {
+        class: ClassId,
+        ty: Option<Type>,
+    },
+    Function(FunctionId),
+    Method {
+        class: ClassId,
+        index: u32,
+        declared: bool,
+        type_arguments: Vec<Type>,
+    },
+    Property {
+        class: ClassId,
+        slot: PropertyId,
+        type_arguments: Vec<Type>,
+    },
+    Parameter {
+        callable: ReflectionCallable,
+        position: u32,
+    },
+}
 
 const TAG_NULL: u64 = 0;
 const TAG_INT: u64 = 1;
@@ -839,6 +875,14 @@ impl Value {
     }
 
     pub fn try_object(class: ClassId, property_count: usize) -> Result<Self, RuntimeErrorKind> {
+        Self::try_typed_object(class, Vec::new(), property_count)
+    }
+
+    pub fn try_typed_object(
+        class: ClassId,
+        type_arguments: Vec<Type>,
+        property_count: usize,
+    ) -> Result<Self, RuntimeErrorKind> {
         let mut properties = Vec::new();
         properties
             .try_reserve_exact(property_count)
@@ -846,6 +890,7 @@ impl Value {
         properties.resize_with(property_count, || None);
         Self::try_allocate(HeapData::Object {
             class,
+            type_arguments,
             properties: RefCell::new(properties),
         })
     }
@@ -853,7 +898,25 @@ impl Value {
     pub fn object(class: ClassId, property_count: usize) -> Self {
         Self::allocate_unmanaged(HeapData::Object {
             class,
+            type_arguments: Vec::new(),
             properties: RefCell::new(vec![None; property_count]),
+        })
+    }
+
+    pub fn try_reflection(
+        class: ClassId,
+        value: ReflectionValue,
+    ) -> Result<Self, RuntimeErrorKind> {
+        Self::try_allocate(HeapData::Reflection {
+            class,
+            value: OnceCell::from(value),
+        })
+    }
+
+    pub fn try_uninitialized_reflection(class: ClassId) -> Result<Self, RuntimeErrorKind> {
+        Self::try_allocate(HeapData::Reflection {
+            class,
+            value: OnceCell::new(),
         })
     }
 
@@ -1142,7 +1205,8 @@ impl Value {
             | HeapData::Map { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
-            | HeapData::Exception { .. } => None,
+            | HeapData::Exception { .. }
+            | HeapData::Reflection { .. } => None,
         }
     }
 
@@ -1153,7 +1217,8 @@ impl Value {
             | HeapData::Map { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
-            | HeapData::Exception { .. } => None,
+            | HeapData::Exception { .. }
+            | HeapData::Reflection { .. } => None,
         }
     }
 
@@ -1164,7 +1229,41 @@ impl Value {
             | HeapData::Vector { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
-            | HeapData::Exception { .. } => None,
+            | HeapData::Exception { .. }
+            | HeapData::Reflection { .. } => None,
+        }
+    }
+
+    pub fn collection_types(&self) -> Option<(Type, Option<Type>)> {
+        match self.heap_data()? {
+            HeapData::Vector { element_type, .. } => Some((element_type.clone(), None)),
+            HeapData::Map {
+                key_type,
+                value_type,
+                ..
+            } => Some((key_type.clone(), Some(value_type.clone()))),
+            _ => None,
+        }
+    }
+
+    pub fn reflection(&self) -> Option<&ReflectionValue> {
+        match self.heap_data()? {
+            HeapData::Reflection { value, .. } => value.get(),
+            _ => None,
+        }
+    }
+
+    pub fn initialize_reflection(&self, reflection: ReflectionValue) -> bool {
+        match self.heap_data() {
+            Some(HeapData::Reflection { value, .. }) => value.set(reflection).is_ok(),
+            _ => false,
+        }
+    }
+
+    pub fn type_arguments(&self) -> Option<&[Type]> {
+        match self.heap_data()? {
+            HeapData::Object { type_arguments, .. } => Some(type_arguments),
+            _ => None,
         }
     }
 
@@ -1210,6 +1309,7 @@ impl Value {
                 HeapData::Object { .. } => "object",
                 HeapData::Stream { .. } => "stream",
                 HeapData::Exception { .. } => "exception",
+                HeapData::Reflection { .. } => "object",
             },
             _ => "invalid",
         }
@@ -1223,6 +1323,7 @@ impl Value {
             HeapData::Object { .. } => None,
             HeapData::Stream { .. } => None,
             HeapData::Exception { .. } => None,
+            HeapData::Reflection { .. } => None,
         }
     }
 
@@ -1304,7 +1405,8 @@ impl Value {
         match self.heap_data()? {
             HeapData::Object { class, .. }
             | HeapData::Stream { class, .. }
-            | HeapData::Exception { class, .. } => Some(*class),
+            | HeapData::Exception { class, .. }
+            | HeapData::Reflection { class, .. } => Some(*class),
             HeapData::Bytes(_) | HeapData::Vector { .. } | HeapData::Map { .. } => None,
         }
     }
@@ -1803,7 +1905,10 @@ impl Value {
                     })
             }
             Some(
-                HeapData::Object { .. } | HeapData::Stream { .. } | HeapData::Exception { .. },
+                HeapData::Object { .. }
+                | HeapData::Stream { .. }
+                | HeapData::Exception { .. }
+                | HeapData::Reflection { .. },
             )
             | None => Err(RuntimeErrorKind::TypeError(format!(
                 "{} cannot be indexed",
@@ -1883,7 +1988,8 @@ impl Value {
                 | HeapData::Map { .. }
                 | HeapData::Object { .. }
                 | HeapData::Stream { .. }
-                | HeapData::Exception { .. } => None,
+                | HeapData::Exception { .. }
+                | HeapData::Reflection { .. } => None,
             },
             _ => None,
         }
@@ -1922,6 +2028,9 @@ impl Value {
                 }
                 HeapData::Exception { class, .. } => {
                     format!("exception(class#{})\n", class.0).into_bytes()
+                }
+                HeapData::Reflection { class, .. } => {
+                    format!("object(class#{})\n", class.0).into_bytes()
                 }
             },
             _ => b"<invalid>\n".to_vec(),
@@ -2206,7 +2315,12 @@ enum HeapData {
     },
     Object {
         class: ClassId,
+        type_arguments: Vec<Type>,
         properties: RefCell<Vec<Option<Value>>>,
+    },
+    Reflection {
+        class: ClassId,
+        value: OnceCell<ReflectionValue>,
     },
     Stream {
         class: ClassId,
@@ -2249,6 +2363,7 @@ impl HeapData {
                     + target.as_ref().map_or(0, Vec::capacity)
                     + suppressed.borrow().capacity() * mem::size_of::<Value>()
             }
+            Self::Reflection { .. } => 0,
         }
     }
 
@@ -2298,7 +2413,7 @@ impl HeapData {
                     visit_value(value);
                 }
             }
-            Self::Bytes(_) | Self::Stream { .. } => {}
+            Self::Bytes(_) | Self::Stream { .. } | Self::Reflection { .. } => {}
         }
     }
 
@@ -2317,7 +2432,7 @@ impl HeapData {
                 drop(previous.get_mut().take());
                 suppressed.get_mut().clear();
             }
-            Self::Bytes(_) | Self::Stream { .. } => {}
+            Self::Bytes(_) | Self::Stream { .. } | Self::Reflection { .. } => {}
         }
     }
 }

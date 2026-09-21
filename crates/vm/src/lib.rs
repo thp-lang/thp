@@ -9,15 +9,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use thp_bytecode::{
-    Function, Instruction, InstructionKind, Program, Terminator, VerificationError, verify,
+    Function, Instruction, InstructionKind, Method, Program, Property, Terminator,
+    VerificationError, verify,
 };
 use thp_diagnostics::Span;
-use thp_hir::{Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, MethodSlot, Type};
+use thp_hir::{
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, MethodSlot,
+    ParameterMetadata, ReflectionBuiltin, Type,
+};
 use thp_mir::{BlockId, Constant, Register};
 use thp_runtime::{
-    HeapStats, RequestHeap, RequestInput, RuntimeError, RuntimeErrorKind, StackFrame, Value,
+    HeapStats, ReflectionCallable, ReflectionValue, RequestHeap, RequestInput, RuntimeError,
+    RuntimeErrorKind, StackFrame, Value,
 };
-use thp_syntax::{BinaryOp, UnaryOp};
+use thp_syntax::{BinaryOp, UnaryOp, Visibility};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Limits {
@@ -460,17 +465,16 @@ impl ExecutionState<'_, '_> {
             }
         }
 
-        let object = if is_instance_of_name(self.program, class.id, "Throwable") {
-            Value::try_throwable_object(class.id, class.properties.len())
-        } else {
-            Value::try_object(class.id, class.properties.len())
-        }
-        .map_err(|kind| runtime(kind, instruction.span))?;
-        for (index, initializer) in class.property_initializers.iter().enumerate() {
-            let Some(initializer) = initializer else {
+        let object = self.allocate_object(
+            class.id,
+            type_arguments,
+            class.properties.len(),
+            instruction.span,
+        )?;
+        for property in &class.properties {
+            let Some(initializer) = &property.default else {
                 continue;
             };
-            let property = &class.properties[index];
             let declaring_instance =
                 runtime_instantiation_for_class(self.program, &instance, property.declaring_class);
             let declaration = &self.program.classes[property.declaring_class.0 as usize];
@@ -481,10 +485,8 @@ impl ExecutionState<'_, '_> {
             );
             object
                 .set_property(
-                    thp_hir::PropertyId(
-                        u32::try_from(index).expect("verified property count fits u32"),
-                    ),
-                    materialize_constant(initializer, &ty, instruction.span)?,
+                    property.id,
+                    Self::materialize_constant(initializer, &ty, instruction.span)?,
                 )
                 .map_err(|kind| runtime(kind, instruction.span))?;
         }
@@ -552,9 +554,7 @@ impl ExecutionState<'_, '_> {
                     next += 1;
                 }
                 if Some(next) == variadic {
-                    let Type::Vector(element) = &parameters[next].ty else {
-                        unreachable!("verified variadic descriptor")
-                    };
+                    let element = &parameters[next].ty;
                     if !runtime_argument_matches(self.program, element, &static_type, &value) {
                         return Err(runtime(
                             RuntimeErrorKind::TypeError(format!(
@@ -595,22 +595,18 @@ impl ExecutionState<'_, '_> {
         }
         for (index, parameter) in parameters.iter().enumerate() {
             if parameter.variadic {
-                let Type::Vector(element) = &parameter.ty else {
-                    unreachable!("verified variadic descriptor")
-                };
                 bound[index] = Some(
-                    Value::try_vector(
-                        element.as_ref().clone(),
-                        std::mem::take(&mut variadic_values),
-                    )
-                    .map_err(|kind| runtime(kind, instruction.span))?,
+                    Value::try_vector(parameter.ty.clone(), std::mem::take(&mut variadic_values))
+                        .map_err(|kind| runtime(kind, instruction.span))?,
                 );
             } else if bound[index].is_none() {
                 bound[index] = Some(
                     parameter
                         .default
                         .as_ref()
-                        .map(|value| materialize_constant(value, &parameter.ty, instruction.span))
+                        .map(|value| {
+                            Self::materialize_constant(value, &parameter.ty, instruction.span)
+                        })
                         .transpose()?
                         .ok_or_else(|| {
                             fail(format!("missing constructor argument `{}`", parameter.name))
@@ -951,14 +947,39 @@ impl ExecutionState<'_, '_> {
             }
             InstructionKind::NewObject(class) => {
                 let class = &self.program.classes[class.0 as usize];
-                Some(
-                    if is_instance_of_name(self.program, class.id, "Throwable") {
-                        Value::try_throwable_object(class.id, class.properties.len())
-                    } else {
-                        Value::try_object(class.id, class.properties.len())
+                let type_arguments = match instruction.ty.as_ref() {
+                    Some(Type::Nominal { arguments, .. }) => {
+                        let receiver_arguments = function
+                            .owner
+                            .filter(|_| !function.static_method)
+                            .and_then(|_| function.parameters.first())
+                            .and_then(|receiver| frame.locals[receiver.0 as usize].as_ref())
+                            .and_then(Value::type_arguments)
+                            .unwrap_or_default();
+                        arguments
+                            .iter()
+                            .map(|argument| {
+                                function.owner.map_or_else(
+                                    || argument.clone(),
+                                    |owner| {
+                                        substitute_type_arguments(
+                                            argument,
+                                            owner,
+                                            receiver_arguments,
+                                        )
+                                    },
+                                )
+                            })
+                            .collect()
                     }
-                    .map_err(|kind| runtime(kind, instruction.span))?,
-                )
+                    _ => Vec::new(),
+                };
+                Some(self.allocate_object(
+                    class.id,
+                    type_arguments,
+                    class.properties.len(),
+                    instruction.span,
+                )?)
             }
             InstructionKind::NewDynamic {
                 target,
@@ -1118,7 +1139,9 @@ impl ExecutionState<'_, '_> {
                     Err(error) => Err(error),
                 }
             }
-            Callee::Builtin(builtin) => self.execute_builtin(builtin, arguments, instruction),
+            Callee::Builtin(builtin) => {
+                self.execute_builtin(builtin, arguments, depth, calling_function, instruction)
+            }
         }
     }
 
@@ -1147,6 +1170,8 @@ impl ExecutionState<'_, '_> {
         &mut self,
         builtin: Builtin,
         arguments: Vec<Value>,
+        depth: usize,
+        calling_function: &Function,
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
         match builtin {
@@ -1424,7 +1449,1351 @@ impl ExecutionState<'_, '_> {
                     .map_err(|kind| runtime(kind, instruction.span))?,
             )
             .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::Reflection(operation) => {
+                self.execute_reflection(operation, &arguments, depth, calling_function, instruction)
+            }
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_reflection(
+        &mut self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        use ReflectionBuiltin as R;
+
+        let span = instruction.span;
+        match operation {
+            R::ClassConstruct
+            | R::FunctionConstruct
+            | R::MethodConstruct
+            | R::PropertyConstruct
+            | R::ParameterConstruct => {
+                self.execute_reflection_constructor(operation, arguments, span)
+            }
+            R::TypeAllowsNull
+            | R::TypeGetDisplayName
+            | R::TypeEquals
+            | R::TypeIsAssignableFrom
+            | R::NamedTypeGetName
+            | R::NamedTypeIsBuiltin
+            | R::NamedTypeIsTypeParameter
+            | R::NamedTypeGetTypeArguments
+            | R::UnionTypeGetTypes => self.execute_reflection_type(operation, arguments, span),
+            R::ClassGetName
+            | R::ClassGetShortName
+            | R::ClassGetNamespaceName
+            | R::ClassGetModuleName
+            | R::ClassGetType
+            | R::ClassIsAbstract
+            | R::ClassIsFinal
+            | R::ClassIsInterface
+            | R::ClassIsTrait
+            | R::ClassIsInternal
+            | R::ClassIsUserDefined
+            | R::ClassIsInstantiable
+            | R::ClassGetParentClass
+            | R::ClassGetInterfaces
+            | R::ClassGetTraits
+            | R::ClassGetConstructor
+            | R::ClassGetDeclaredMethods
+            | R::ClassGetDeclaredMethod
+            | R::ClassGetMethods
+            | R::ClassGetMethod
+            | R::ClassHasMethod
+            | R::ClassGetDeclaredProperties
+            | R::ClassGetDeclaredProperty
+            | R::ClassGetProperties
+            | R::ClassGetProperty
+            | R::ClassHasProperty => self.execute_reflection_class(operation, arguments, span),
+            R::ClassNewInstanceArgs => {
+                self.reflection_new_instance(arguments, depth, calling_function, instruction)
+            }
+            R::FunctionInvokeArgs | R::MethodInvokeArgs => {
+                self.reflection_invoke(operation, arguments, depth, calling_function, instruction)
+            }
+            R::CallableGetName
+            | R::CallableGetShortName
+            | R::CallableGetNamespaceName
+            | R::CallableGetModuleName
+            | R::CallableGetNumberOfParameters
+            | R::CallableGetNumberOfRequiredParameters
+            | R::CallableGetParameters
+            | R::CallableGetReturnType
+            | R::CallableIsVariadic
+            | R::CallableIsInternal
+            | R::CallableIsUserDefined
+            | R::MethodGetDeclaringClass
+            | R::MethodGetOriginTrait
+            | R::MethodGetOriginMethod
+            | R::MethodIsPublic
+            | R::MethodIsProtected
+            | R::MethodIsPrivate
+            | R::MethodIsStatic
+            | R::MethodIsAbstract
+            | R::MethodIsFinal
+            | R::MethodIsConstructor => {
+                self.execute_reflection_callable(operation, arguments, span)
+            }
+            R::PropertyGetName
+            | R::PropertyGetDeclaringClass
+            | R::PropertyGetOriginTrait
+            | R::PropertyGetType
+            | R::PropertyHasDefaultValue
+            | R::PropertyGetDefaultValue
+            | R::PropertyIsPublic
+            | R::PropertyIsProtected
+            | R::PropertyIsPrivate
+            | R::PropertyIsStatic
+            | R::PropertyGetValue
+            | R::PropertySetValue => self.execute_reflection_property(operation, arguments, span),
+            R::ParameterGetName
+            | R::ParameterGetPosition
+            | R::ParameterGetType
+            | R::ParameterGetDeclaringFunction
+            | R::ParameterIsDefaultValueAvailable
+            | R::ParameterGetDefaultValue
+            | R::ParameterIsOptional
+            | R::ParameterIsVariadic => {
+                self.execute_reflection_parameter(operation, arguments, span)
+            }
+        }
+    }
+
+    fn execute_reflection_constructor(
+        &self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, VmError> {
+        use ReflectionBuiltin as R;
+
+        let value = match operation {
+            R::ClassConstruct => {
+                let (class, ty) = self.reflection_class_target(&arguments[1], span)?;
+                ReflectionValue::Class { class, ty }
+            }
+            R::FunctionConstruct => {
+                ReflectionValue::Function(self.reflection_function_target(&arguments[1], span)?)
+            }
+            R::MethodConstruct => {
+                let (class, ty) = self.reflection_class_target(&arguments[1], span)?;
+                let name = self.reflection_name(&arguments[2], "method", span)?;
+                let metadata = &self.program.classes[class.0 as usize];
+                let Some(index) = metadata
+                    .methods
+                    .iter()
+                    .position(|method| method.name == name)
+                else {
+                    return Err(self.reflection_error("method does not exist", span));
+                };
+                ReflectionValue::Method {
+                    class,
+                    index: u32::try_from(index).expect("method count fits u32"),
+                    declared: false,
+                    type_arguments: descriptor_type_arguments(ty.as_ref()),
+                }
+            }
+            R::PropertyConstruct => {
+                let (class, ty) = self.reflection_class_target(&arguments[1], span)?;
+                let name = self.reflection_name(&arguments[2], "property", span)?;
+                let metadata = &self.program.classes[class.0 as usize];
+                let Some(property) = metadata.properties.iter().rev().find(|property| {
+                    property.name == name
+                        && (property.declaring_class == class
+                            || property.visibility != Visibility::Private)
+                }) else {
+                    return Err(self.reflection_error("property does not exist", span));
+                };
+                ReflectionValue::Property {
+                    class,
+                    slot: property.id,
+                    type_arguments: descriptor_type_arguments(ty.as_ref()),
+                }
+            }
+            R::ParameterConstruct => {
+                let callable = if let Some(values) = arguments[1].vector_values() {
+                    if values.len() != 2 {
+                        return Err(self
+                            .type_error("method callables must contain exactly two values", span));
+                    }
+                    let (class, ty) = self.reflection_class_target(&values[0], span)?;
+                    let name = self.reflection_name(&values[1], "method", span)?;
+                    let metadata = &self.program.classes[class.0 as usize];
+                    let Some(index) = metadata
+                        .methods
+                        .iter()
+                        .position(|method| method.name == name)
+                    else {
+                        return Err(self.reflection_error("method does not exist", span));
+                    };
+                    ReflectionCallable::Method {
+                        class,
+                        index: u32::try_from(index).expect("method count fits u32"),
+                        declared: false,
+                        type_arguments: descriptor_type_arguments(ty.as_ref()),
+                    }
+                } else if arguments[1].as_bytes().is_some() {
+                    ReflectionCallable::Function(
+                        self.reflection_function_target(&arguments[1], span)?,
+                    )
+                } else {
+                    return Err(self.type_error(
+                        "function must be a function name or a two-value method callable",
+                        span,
+                    ));
+                };
+                let metadata = self.callable_metadata(&callable, span)?;
+                let position = if let Some(position) = arguments[2].as_int() {
+                    usize::try_from(position).ok()
+                } else if arguments[2].as_bytes().is_some() {
+                    let name = self.reflection_name(&arguments[2], "parameter", span)?;
+                    metadata
+                        .parameters
+                        .iter()
+                        .position(|parameter| parameter.name == name)
+                } else {
+                    return Err(self.type_error("parameter must be an int or string", span));
+                }
+                .filter(|position| *position < metadata.parameters.len())
+                .ok_or_else(|| self.reflection_error("parameter does not exist", span))?;
+                ReflectionValue::Parameter {
+                    callable,
+                    position: u32::try_from(position).expect("parameter count fits u32"),
+                }
+            }
+            _ => unreachable!(),
+        };
+        if !arguments[0].initialize_reflection(value) {
+            return Err(self.error("reflection descriptor is already initialized", span));
+        }
+        Ok(Value::NULL)
+    }
+
+    fn reflection_class_target(
+        &self,
+        target: &Value,
+        span: Span,
+    ) -> Result<(ClassId, Option<Type>), VmError> {
+        if let Some(bytes) = target.as_bytes() {
+            let name = std::str::from_utf8(bytes)
+                .map_err(|_| self.reflection_error("class name is not valid UTF-8", span))?;
+            let name = name.strip_prefix('\\').unwrap_or(name);
+            let class = self
+                .program
+                .classes
+                .iter()
+                .find(|class| class.name == name)
+                .ok_or_else(|| self.reflection_error("class does not exist", span))?;
+            let ty = class
+                .type_parameters
+                .is_empty()
+                .then(|| Type::Object(class.name.clone()));
+            return Ok((class.id, ty));
+        }
+        let class = target
+            .class_id()
+            .ok_or_else(|| self.type_error("class target must be an object or string", span))?;
+        let metadata = &self.program.classes[class.0 as usize];
+        let type_arguments = target.type_arguments().unwrap_or_default();
+        let ty = Some(if type_arguments.is_empty() {
+            Type::Object(metadata.name.clone())
+        } else {
+            Type::Nominal {
+                name: metadata.name.clone(),
+                arguments: type_arguments.to_vec(),
+            }
+        });
+        Ok((class, ty))
+    }
+
+    fn reflection_function_target(
+        &self,
+        target: &Value,
+        span: Span,
+    ) -> Result<FunctionId, VmError> {
+        let name = self.reflection_name(target, "function", span)?;
+        self.program
+            .functions
+            .iter()
+            .find(|function| {
+                function.owner.is_none()
+                    && function.id != self.program.entry
+                    && function.name == name
+            })
+            .map(|function| function.id)
+            .ok_or_else(|| self.reflection_error("function does not exist", span))
+    }
+
+    fn reflection_name<'value>(
+        &self,
+        value: &'value Value,
+        kind: &str,
+        span: Span,
+    ) -> Result<&'value str, VmError> {
+        let bytes = value
+            .as_bytes()
+            .ok_or_else(|| self.type_error(&format!("{kind} name must be a string"), span))?;
+        let name = std::str::from_utf8(bytes)
+            .map_err(|_| self.reflection_error(&format!("{kind} name is not valid UTF-8"), span))?;
+        Ok(name.strip_prefix('\\').unwrap_or(name))
+    }
+
+    fn execute_reflection_type(
+        &self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, VmError> {
+        use ReflectionBuiltin as R;
+        let ty = self.reflected_type(&arguments[0], span)?.clone();
+        match operation {
+            R::TypeAllowsNull => Ok(Value::bool(type_allows_null(&ty))),
+            R::TypeGetDisplayName => self.bytes(ty.to_string(), span),
+            R::TypeEquals => Ok(Value::bool(
+                ty == *self.reflected_type(&arguments[1], span)?,
+            )),
+            R::TypeIsAssignableFrom => Ok(Value::bool(thp_bytecode::type_accepts(
+                self.program,
+                &ty,
+                self.reflected_type(&arguments[1], span)?,
+            ))),
+            R::NamedTypeGetName => self.bytes(named_type_name(&ty), span),
+            R::NamedTypeIsBuiltin => Ok(Value::bool(!matches!(
+                ty,
+                Type::Object(_) | Type::Nominal { .. } | Type::Parameter { .. }
+            ))),
+            R::NamedTypeIsTypeParameter => Ok(Value::bool(matches!(ty, Type::Parameter { .. }))),
+            R::NamedTypeGetTypeArguments => {
+                let arguments = match ty {
+                    Type::Vector(element) => vec![*element],
+                    Type::Map(key, value) => vec![*key, *value],
+                    Type::Nominal { arguments, .. } => arguments,
+                    _ => Vec::new(),
+                };
+                let values = arguments
+                    .into_iter()
+                    .map(|ty| self.type_descriptor(ty, span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.vector("ReflectionType", values, span)
+            }
+            R::UnionTypeGetTypes => {
+                let Type::Union(types) = ty else {
+                    return Err(self.reflection_error("descriptor is not a union type", span));
+                };
+                let values = types
+                    .into_iter()
+                    .map(|ty| self.type_descriptor(ty, span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.vector("ReflectionType", values, span)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_reflection_class(
+        &self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, VmError> {
+        use ReflectionBuiltin as R;
+        let (class_id, reflected_type) = self.reflected_class(&arguments[0], span)?;
+        let class = &self.program.classes[class_id.0 as usize];
+        let descriptor_arguments = descriptor_type_arguments(reflected_type.as_ref());
+        match operation {
+            R::ClassGetName => self.bytes(&class.name, span),
+            R::ClassGetShortName => self.bytes(short_name(&class.name), span),
+            R::ClassGetNamespaceName => self.bytes(namespace_name(&class.name), span),
+            R::ClassGetModuleName => self.bytes(&class.module_name, span),
+            R::ClassGetType => {
+                reflected_type.map_or(Ok(Value::NULL), |ty| self.type_descriptor(ty, span))
+            }
+            R::ClassIsAbstract => Ok(Value::bool(class.abstract_class)),
+            R::ClassIsFinal => Ok(Value::bool(class.final_class)),
+            R::ClassIsInterface => Ok(Value::bool(class.kind == thp_hir::NominalKind::Interface)),
+            R::ClassIsTrait => Ok(Value::bool(class.kind == thp_hir::NominalKind::Trait)),
+            R::ClassIsInternal => Ok(Value::bool(class.native)),
+            R::ClassIsUserDefined => Ok(Value::bool(!class.native)),
+            R::ClassIsInstantiable => Ok(Value::bool(
+                class.kind == thp_hir::NominalKind::Class
+                    && !class.abstract_class
+                    && !class.native
+                    && (class.type_parameters.is_empty() || reflected_type.is_some()),
+            )),
+            R::ClassGetParentClass => class.parent.map_or(Ok(Value::NULL), |parent| {
+                let parent_class = &self.program.classes[parent.0 as usize];
+                let ty = class.parent_type.as_ref().map(|parent_type| {
+                    let arguments = parent_type
+                        .arguments
+                        .iter()
+                        .map(|argument| {
+                            substitute_type_arguments(argument, class.id, &descriptor_arguments)
+                        })
+                        .collect::<Vec<_>>();
+                    if arguments.is_empty() {
+                        Type::Object(parent_class.name.clone())
+                    } else {
+                        Type::Nominal {
+                            name: parent_class.name.clone(),
+                            arguments,
+                        }
+                    }
+                });
+                self.class_descriptor(parent, ty, span)
+            }),
+            R::ClassGetInterfaces => {
+                let values = class
+                    .interface_types
+                    .iter()
+                    .map(|interface| {
+                        let interface_class = &self.program.classes[interface.class.0 as usize];
+                        let arguments = interface
+                            .arguments
+                            .iter()
+                            .map(|argument| {
+                                substitute_type_arguments(argument, class.id, &descriptor_arguments)
+                            })
+                            .collect::<Vec<_>>();
+                        let ty = if arguments.is_empty() {
+                            Type::Object(interface_class.name.clone())
+                        } else {
+                            Type::Nominal {
+                                name: interface_class.name.clone(),
+                                arguments,
+                            }
+                        };
+                        self.class_descriptor(interface.class, Some(ty), span)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.vector("ReflectionClass", values, span)
+            }
+            R::ClassGetTraits => {
+                let values = class
+                    .traits
+                    .iter()
+                    .map(|trait_id| self.class_descriptor(*trait_id, None, span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.vector("ReflectionClass", values, span)
+            }
+            R::ClassGetConstructor => class
+                .methods
+                .iter()
+                .position(|method| method.name == "__construct")
+                .map_or(Ok(Value::NULL), |index| {
+                    self.method_descriptor(
+                        class.id,
+                        index,
+                        false,
+                        descriptor_arguments.clone(),
+                        span,
+                    )
+                }),
+            R::ClassGetDeclaredMethods | R::ClassGetMethods => {
+                let declared = operation == R::ClassGetDeclaredMethods;
+                let indexes = if declared {
+                    (0..class.declared_methods.len()).collect::<Vec<_>>()
+                } else {
+                    effective_method_indexes(self.program, class.id)
+                };
+                let values = indexes
+                    .into_iter()
+                    .map(|index| {
+                        self.method_descriptor(
+                            class.id,
+                            index,
+                            declared,
+                            descriptor_arguments.clone(),
+                            span,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.vector("ReflectionMethod", values, span)
+            }
+            R::ClassGetDeclaredMethod | R::ClassGetMethod | R::ClassHasMethod => {
+                let Some(name) = utf8_argument(arguments, 1) else {
+                    return if operation == R::ClassHasMethod {
+                        Ok(Value::bool(false))
+                    } else if operation == R::ClassGetDeclaredMethod {
+                        Ok(Value::NULL)
+                    } else {
+                        Err(self.reflection_error("method does not exist", span))
+                    };
+                };
+                let declared = operation == R::ClassGetDeclaredMethod;
+                let methods = if declared {
+                    &class.declared_methods
+                } else {
+                    &class.methods
+                };
+                let found = methods.iter().position(|method| method.name == name);
+                if operation == R::ClassHasMethod {
+                    Ok(Value::bool(found.is_some()))
+                } else if operation == R::ClassGetMethod && found.is_none() {
+                    Err(self.reflection_error("method does not exist", span))
+                } else {
+                    found.map_or(Ok(Value::NULL), |index| {
+                        self.method_descriptor(
+                            class.id,
+                            index,
+                            declared,
+                            descriptor_arguments.clone(),
+                            span,
+                        )
+                    })
+                }
+            }
+            R::ClassGetDeclaredProperties | R::ClassGetProperties => {
+                let slots = if operation == R::ClassGetDeclaredProperties {
+                    class
+                        .declared_properties
+                        .iter()
+                        .map(|property| property.id)
+                        .collect()
+                } else {
+                    effective_property_slots(self.program, class.id)
+                };
+                let values = slots
+                    .into_iter()
+                    .map(|slot| {
+                        self.property_descriptor(class.id, slot, descriptor_arguments.clone(), span)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.vector("ReflectionProperty", values, span)
+            }
+            R::ClassGetDeclaredProperty | R::ClassGetProperty | R::ClassHasProperty => {
+                let Some(name) = utf8_argument(arguments, 1) else {
+                    return if operation == R::ClassHasProperty {
+                        Ok(Value::bool(false))
+                    } else if operation == R::ClassGetDeclaredProperty {
+                        Ok(Value::NULL)
+                    } else {
+                        Err(self.reflection_error("property does not exist", span))
+                    };
+                };
+                let declared = operation == R::ClassGetDeclaredProperty;
+                let found = if declared {
+                    class
+                        .declared_properties
+                        .iter()
+                        .find(|property| property.name == name)
+                } else {
+                    class.properties.iter().rev().find(|property| {
+                        property.name == name
+                            && (property.declaring_class == class.id
+                                || property.visibility != Visibility::Private)
+                    })
+                };
+                if operation == R::ClassHasProperty {
+                    Ok(Value::bool(found.is_some()))
+                } else if operation == R::ClassGetProperty && found.is_none() {
+                    Err(self.reflection_error("property does not exist", span))
+                } else {
+                    found.map_or(Ok(Value::NULL), |property| {
+                        self.property_descriptor(
+                            class.id,
+                            property.id,
+                            descriptor_arguments.clone(),
+                            span,
+                        )
+                    })
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_reflection_callable(
+        &self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, VmError> {
+        use ReflectionBuiltin as R;
+        let callable = self.reflected_callable(&arguments[0], span)?;
+        let metadata = self.callable_metadata(&callable, span)?;
+        match operation {
+            R::CallableGetName => self.bytes(&metadata.name, span),
+            R::CallableGetShortName => self.bytes(short_name(&metadata.name), span),
+            R::CallableGetNamespaceName => self.bytes(namespace_name(&metadata.name), span),
+            R::CallableGetModuleName => self.bytes(&metadata.module_name, span),
+            R::CallableGetNumberOfParameters => Ok(Value::integer(
+                i64::try_from(metadata.parameters.len()).unwrap_or(i64::MAX),
+            )),
+            R::CallableGetNumberOfRequiredParameters => Ok(Value::integer(
+                i64::try_from(
+                    metadata
+                        .parameters
+                        .iter()
+                        .filter(|parameter| parameter.default.is_none() && !parameter.variadic)
+                        .count(),
+                )
+                .unwrap_or(i64::MAX),
+            )),
+            R::CallableGetParameters => {
+                let values = (0..metadata.parameters.len())
+                    .map(|position| {
+                        self.reflection_descriptor(
+                            "ReflectionParameter",
+                            ReflectionValue::Parameter {
+                                callable: callable.clone(),
+                                position: u32::try_from(position)
+                                    .expect("parameter count fits u32"),
+                            },
+                            span,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.vector("ReflectionParameter", values, span)
+            }
+            R::CallableGetReturnType => self.type_descriptor(metadata.return_type, span),
+            R::CallableIsVariadic => Ok(Value::bool(
+                metadata
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.variadic),
+            )),
+            R::CallableIsInternal => Ok(Value::bool(metadata.internal)),
+            R::CallableIsUserDefined => Ok(Value::bool(!metadata.internal)),
+            R::MethodGetDeclaringClass => self.class_descriptor(
+                metadata.declaring_class.expect("method owner"),
+                callable_descriptor_type(self.program, &callable, metadata.declaring_class),
+                span,
+            ),
+            R::MethodGetOriginTrait => metadata
+                .method
+                .as_ref()
+                .and_then(|method| method.origin_trait)
+                .map_or(Ok(Value::NULL), |origin| {
+                    self.class_descriptor(origin, None, span)
+                }),
+            R::MethodGetOriginMethod => {
+                let Some(method) = metadata.method.as_ref() else {
+                    return Err(self.reflection_error("descriptor is not a method", span));
+                };
+                let Some(origin) = method.origin_trait else {
+                    return Ok(Value::NULL);
+                };
+                let origin_class = &self.program.classes[origin.0 as usize];
+                origin_class
+                    .declared_methods
+                    .iter()
+                    .position(|candidate| candidate.name == method.origin_name)
+                    .map_or(Ok(Value::NULL), |index| {
+                        self.method_descriptor(origin, index, true, Vec::new(), span)
+                    })
+            }
+            R::MethodIsPublic | R::MethodIsProtected | R::MethodIsPrivate => {
+                let visibility = metadata.method.expect("method operation").visibility;
+                Ok(Value::bool(match operation {
+                    R::MethodIsPublic => visibility == Visibility::Public,
+                    R::MethodIsProtected => visibility == Visibility::Protected,
+                    _ => visibility == Visibility::Private,
+                }))
+            }
+            R::MethodIsStatic => Ok(Value::bool(metadata.method.expect("method").static_method)),
+            R::MethodIsAbstract => Ok(Value::bool(
+                metadata.method.expect("method").abstract_method,
+            )),
+            R::MethodIsFinal => Ok(Value::bool(metadata.method.expect("method").final_method)),
+            R::MethodIsConstructor => Ok(Value::bool(
+                metadata.method.expect("method").name == "__construct",
+            )),
+            _ => unreachable!(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_reflection_property(
+        &self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, VmError> {
+        use ReflectionBuiltin as R;
+        let (table_class, property, type_arguments) =
+            self.reflected_property(&arguments[0], span)?;
+        let property = property.clone();
+        let property_type = substitute_type_arguments(&property.ty, table_class, &type_arguments);
+        match operation {
+            R::PropertyGetName => self.bytes(&property.name, span),
+            R::PropertyGetDeclaringClass => {
+                let ty = (table_class == property.declaring_class)
+                    .then(|| descriptor_nominal_type(self.program, table_class, &type_arguments));
+                self.class_descriptor(property.declaring_class, ty, span)
+            }
+            R::PropertyGetOriginTrait => property.origin_trait.map_or(Ok(Value::NULL), |origin| {
+                self.class_descriptor(origin, None, span)
+            }),
+            R::PropertyGetType => self.type_descriptor(property_type.clone(), span),
+            R::PropertyHasDefaultValue => Ok(Value::bool(property.default.is_some())),
+            R::PropertyGetDefaultValue => {
+                property.default.as_ref().map_or(Ok(Value::NULL), |value| {
+                    Self::materialize_constant(value, &property_type, span)
+                })
+            }
+            R::PropertyIsPublic | R::PropertyIsProtected | R::PropertyIsPrivate => {
+                Ok(Value::bool(match operation {
+                    R::PropertyIsPublic => property.visibility == Visibility::Public,
+                    R::PropertyIsProtected => property.visibility == Visibility::Protected,
+                    _ => property.visibility == Visibility::Private,
+                }))
+            }
+            R::PropertyIsStatic => Ok(Value::bool(false)),
+            R::PropertyGetValue | R::PropertySetValue => {
+                let receiver = &arguments[1];
+                if receiver.class_id().is_none() {
+                    return Err(self.reflection_error("property receiver must be an object", span));
+                }
+                let expected = descriptor_nominal_type(self.program, table_class, &type_arguments);
+                if !value_matches(self.program, receiver, &expected) {
+                    return Err(self.reflection_error(
+                        "property receiver has the wrong class or generic arguments",
+                        span,
+                    ));
+                }
+                if operation == R::PropertyGetValue {
+                    receiver
+                        .property(property.id)
+                        .map_err(|kind| runtime(kind, span))
+                } else {
+                    let value = &arguments[2];
+                    if !value_matches(self.program, value, &property_type) {
+                        return Err(self.reflection_error(
+                            "assigned value does not match the property type",
+                            span,
+                        ));
+                    }
+                    receiver
+                        .set_property(property.id, value.clone())
+                        .map_err(|kind| runtime(kind, span))?;
+                    Ok(Value::NULL)
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn execute_reflection_parameter(
+        &self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, VmError> {
+        use ReflectionBuiltin as R;
+        let (callable, position) = self.reflected_parameter(&arguments[0], span)?;
+        let metadata = self.callable_metadata(&callable, span)?;
+        let parameter = metadata
+            .parameters
+            .get(position as usize)
+            .ok_or_else(|| self.reflection_error("parameter is out of bounds", span))?;
+        match operation {
+            R::ParameterGetName => self.bytes(&parameter.name, span),
+            R::ParameterGetPosition => Ok(Value::integer(i64::from(position))),
+            R::ParameterGetType => self.type_descriptor(parameter.ty.clone(), span),
+            R::ParameterGetDeclaringFunction => match callable {
+                ReflectionCallable::Function(function) => self.reflection_descriptor(
+                    "ReflectionFunction",
+                    ReflectionValue::Function(function),
+                    span,
+                ),
+                ReflectionCallable::Method {
+                    class,
+                    index,
+                    declared,
+                    type_arguments,
+                } => self.reflection_descriptor(
+                    "ReflectionMethod",
+                    ReflectionValue::Method {
+                        class,
+                        index,
+                        declared,
+                        type_arguments,
+                    },
+                    span,
+                ),
+            },
+            R::ParameterIsDefaultValueAvailable => Ok(Value::bool(parameter.default.is_some())),
+            R::ParameterGetDefaultValue => parameter.default.as_ref().map_or_else(
+                || Err(self.reflection_error("parameter has no default value", span)),
+                |value| Self::materialize_constant(value, &parameter.ty, span),
+            ),
+            R::ParameterIsOptional => Ok(Value::bool(
+                parameter.default.is_some() || parameter.variadic,
+            )),
+            R::ParameterIsVariadic => Ok(Value::bool(parameter.variadic)),
+            _ => unreachable!(),
+        }
+    }
+
+    fn reflection_descriptor(
+        &self,
+        class_name: &str,
+        value: ReflectionValue,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        Value::try_reflection(self.class_named(class_name, span)?, value)
+            .map_err(|kind| runtime(kind, span))
+    }
+
+    fn type_descriptor(&self, ty: Type, span: Span) -> Result<Value, VmError> {
+        let class = if matches!(ty, Type::Union(_)) {
+            "ReflectionUnionType"
+        } else {
+            "ReflectionNamedType"
+        };
+        self.reflection_descriptor(class, ReflectionValue::Type(ty), span)
+    }
+
+    fn class_descriptor(
+        &self,
+        class: ClassId,
+        ty: Option<Type>,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        self.reflection_descriptor(
+            "ReflectionClass",
+            ReflectionValue::Class { class, ty },
+            span,
+        )
+    }
+
+    fn method_descriptor(
+        &self,
+        class: ClassId,
+        index: usize,
+        declared: bool,
+        type_arguments: Vec<Type>,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        self.reflection_descriptor(
+            "ReflectionMethod",
+            ReflectionValue::Method {
+                class,
+                index: u32::try_from(index).expect("method count fits u32"),
+                declared,
+                type_arguments,
+            },
+            span,
+        )
+    }
+
+    fn property_descriptor(
+        &self,
+        class: ClassId,
+        slot: thp_hir::PropertyId,
+        type_arguments: Vec<Type>,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        self.reflection_descriptor(
+            "ReflectionProperty",
+            ReflectionValue::Property {
+                class,
+                slot,
+                type_arguments,
+            },
+            span,
+        )
+    }
+
+    fn reflected_type<'value>(
+        &self,
+        value: &'value Value,
+        span: Span,
+    ) -> Result<&'value Type, VmError> {
+        let Some(ReflectionValue::Type(ty)) = value.reflection() else {
+            return Err(self.reflection_error("descriptor is not a reflected type", span));
+        };
+        Ok(ty)
+    }
+
+    fn reflected_class(
+        &self,
+        value: &Value,
+        span: Span,
+    ) -> Result<(ClassId, Option<Type>), VmError> {
+        let Some(ReflectionValue::Class { class, ty }) = value.reflection() else {
+            return Err(self.reflection_error("descriptor is not a reflected class", span));
+        };
+        Ok((*class, ty.clone()))
+    }
+
+    fn reflected_callable(&self, value: &Value, span: Span) -> Result<ReflectionCallable, VmError> {
+        match value.reflection() {
+            Some(ReflectionValue::Function(function)) => {
+                Ok(ReflectionCallable::Function(*function))
+            }
+            Some(ReflectionValue::Method {
+                class,
+                index,
+                declared,
+                type_arguments,
+            }) => Ok(ReflectionCallable::Method {
+                class: *class,
+                index: *index,
+                declared: *declared,
+                type_arguments: type_arguments.clone(),
+            }),
+            _ => Err(self.reflection_error("descriptor is not callable", span)),
+        }
+    }
+
+    fn reflected_method(
+        &self,
+        callable: &ReflectionCallable,
+        span: Span,
+    ) -> Result<Method, VmError> {
+        let ReflectionCallable::Method {
+            class,
+            index,
+            declared,
+            ..
+        } = callable
+        else {
+            return Err(self.reflection_error("descriptor is not a method", span));
+        };
+        let class = &self.program.classes[class.0 as usize];
+        let methods = if *declared {
+            &class.declared_methods
+        } else {
+            &class.methods
+        };
+        methods
+            .get(*index as usize)
+            .cloned()
+            .ok_or_else(|| self.reflection_error("method descriptor is invalid", span))
+    }
+
+    fn reflected_property(
+        &self,
+        value: &Value,
+        span: Span,
+    ) -> Result<(ClassId, Property, Vec<Type>), VmError> {
+        let Some(ReflectionValue::Property {
+            class,
+            slot,
+            type_arguments,
+        }) = value.reflection()
+        else {
+            return Err(self.reflection_error("descriptor is not a property", span));
+        };
+        let property = self.program.classes[class.0 as usize]
+            .properties
+            .get(slot.0 as usize)
+            .cloned()
+            .ok_or_else(|| self.reflection_error("property descriptor is invalid", span))?;
+        Ok((*class, property, type_arguments.clone()))
+    }
+
+    fn reflected_parameter(
+        &self,
+        value: &Value,
+        span: Span,
+    ) -> Result<(ReflectionCallable, u32), VmError> {
+        let Some(ReflectionValue::Parameter { callable, position }) = value.reflection() else {
+            return Err(self.reflection_error("descriptor is not a parameter", span));
+        };
+        Ok((callable.clone(), *position))
+    }
+
+    fn callable_metadata(
+        &self,
+        callable: &ReflectionCallable,
+        span: Span,
+    ) -> Result<CallableMetadata, VmError> {
+        match callable {
+            ReflectionCallable::Function(function) => {
+                let function = self
+                    .program
+                    .functions
+                    .get(function.0 as usize)
+                    .ok_or_else(|| self.reflection_error("function descriptor is invalid", span))?;
+                Ok(CallableMetadata {
+                    name: function.name.clone(),
+                    module_name: function.module_name.clone(),
+                    parameters: function.parameter_metadata.clone(),
+                    return_type: function.return_type.clone(),
+                    internal: false,
+                    declaring_class: None,
+                    method: None,
+                })
+            }
+            ReflectionCallable::Method {
+                class,
+                type_arguments,
+                ..
+            } => {
+                let method = self.reflected_method(callable, span)?;
+                let parameters = method
+                    .parameters
+                    .iter()
+                    .cloned()
+                    .map(|mut parameter| {
+                        parameter.ty =
+                            substitute_type_arguments(&parameter.ty, *class, type_arguments);
+                        parameter
+                    })
+                    .collect();
+                let declaring = &self.program.classes[method.declaring_class.0 as usize];
+                Ok(CallableMetadata {
+                    name: method.name.clone(),
+                    module_name: declaring.module_name.clone(),
+                    parameters,
+                    return_type: substitute_type_arguments(
+                        &method.return_type,
+                        *class,
+                        type_arguments,
+                    ),
+                    internal: declaring.native,
+                    declaring_class: Some(method.declaring_class),
+                    method: Some(method),
+                })
+            }
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn bytes(&self, value: impl AsRef<str>, span: Span) -> Result<Value, VmError> {
+        Value::try_bytes(value.as_ref().as_bytes().to_vec()).map_err(|kind| runtime(kind, span))
+    }
+
+    #[allow(clippy::unused_self)]
+    fn vector(&self, class_name: &str, values: Vec<Value>, span: Span) -> Result<Value, VmError> {
+        Value::try_vector(Type::Object(class_name.to_owned()), values)
+            .map_err(|kind| runtime(kind, span))
+    }
+
+    fn allocate_object(
+        &self,
+        class: ClassId,
+        type_arguments: Vec<Type>,
+        property_count: usize,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        let class_name = self.program.classes[class.0 as usize].name.as_str();
+        if matches!(
+            class_name,
+            "ReflectionClass"
+                | "ReflectionFunction"
+                | "ReflectionMethod"
+                | "ReflectionProperty"
+                | "ReflectionParameter"
+        ) {
+            Value::try_uninitialized_reflection(class)
+        } else if is_instance_of_name(self.program, class, "Throwable") {
+            Value::try_throwable_object(class, property_count)
+        } else {
+            Value::try_typed_object(class, type_arguments, property_count)
+        }
+        .map_err(|kind| runtime(kind, span))
+    }
+
+    fn materialize_constant(
+        constant: &ConstantValue,
+        expected: &Type,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        match constant {
+            ConstantValue::Int(value) => Ok(Value::integer(*value)),
+            ConstantValue::Float(value) => Ok(Value::float(*value)),
+            ConstantValue::Bool(value) => Ok(Value::bool(*value)),
+            ConstantValue::Null => Ok(Value::NULL),
+            ConstantValue::String(value) => {
+                Value::try_bytes(value.clone()).map_err(|kind| runtime(kind, span))
+            }
+            ConstantValue::Vector(values) => {
+                let element = match expected {
+                    Type::Vector(element) => Some(element.as_ref()),
+                    Type::Union(members) => members.iter().find_map(|member| match member {
+                        Type::Vector(element) => Some(element.as_ref()),
+                        _ => None,
+                    }),
+                    _ => None,
+                }
+                .cloned()
+                .unwrap_or(Type::Mixed);
+                let values = values
+                    .iter()
+                    .map(|value| Self::materialize_constant(value, &element, span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Value::try_vector(element, values).map_err(|kind| runtime(kind, span))
+            }
+            ConstantValue::Map(entries) => {
+                let (key_type, value_type) = match expected {
+                    Type::Map(key, value) => Some((key.as_ref(), value.as_ref())),
+                    Type::Union(members) => members.iter().find_map(|member| match member {
+                        Type::Map(key, value) => Some((key.as_ref(), value.as_ref())),
+                        _ => None,
+                    }),
+                    _ => None,
+                }
+                .map_or((Type::Mixed, Type::Mixed), |(key, value)| {
+                    (key.clone(), value.clone())
+                });
+                let entries = entries
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            Self::materialize_constant(key, &key_type, span)?,
+                            Self::materialize_constant(value, &value_type, span)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, VmError>>()?;
+                Value::try_map(key_type, value_type, entries).map_err(|kind| runtime(kind, span))
+            }
+        }
+    }
+
+    fn reflection_invoke(
+        &mut self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let callable = self.reflected_callable(&arguments[0], span)?;
+        let metadata = self.callable_metadata(&callable, span)?;
+        let supplied = if operation == ReflectionBuiltin::FunctionInvokeArgs {
+            &arguments[1]
+        } else {
+            &arguments[2]
+        };
+        let mut bound = self.bind_reflection_arguments(supplied, &metadata.parameters, span)?;
+        let (callee, called_class) = match &callable {
+            ReflectionCallable::Function(function) => (Callee::Function(*function), None),
+            ReflectionCallable::Method {
+                class,
+                type_arguments,
+                ..
+            } => {
+                let method = metadata.method.as_ref().expect("method metadata");
+                let Some(callee) = method.callee else {
+                    return Err(self.reflection_error("abstract methods cannot be invoked", span));
+                };
+                if method.static_method {
+                    (callee, Some(method.declaring_class))
+                } else {
+                    let receiver = &arguments[1];
+                    let Some(actual) = receiver.class_id() else {
+                        return Err(self.reflection_error(
+                            "instance method invocation requires an object receiver",
+                            span,
+                        ));
+                    };
+                    let expected = descriptor_nominal_type(self.program, *class, type_arguments);
+                    if !value_matches(self.program, receiver, &expected) {
+                        return Err(
+                            self.reflection_error("method receiver has the wrong type", span)
+                        );
+                    }
+                    bound.insert(0, receiver.clone());
+                    (callee, Some(actual))
+                }
+            }
+        };
+        let result = self.invoke_callee(
+            callee,
+            bound,
+            depth,
+            called_class,
+            calling_function,
+            instruction,
+        )?;
+        if metadata.return_type != Type::Void
+            && !value_matches(self.program, &result, &metadata.return_type)
+        {
+            return Err(
+                self.reflection_error("invoked callable returned a value of the wrong type", span)
+            );
+        }
+        Ok(result)
+    }
+
+    fn reflection_new_instance(
+        &mut self,
+        arguments: &[Value],
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let (class_id, reflected_type) = self.reflected_class(&arguments[0], span)?;
+        let class = self.program.classes[class_id.0 as usize].clone();
+        let type_arguments = descriptor_type_arguments(reflected_type.as_ref());
+        if class.kind != thp_hir::NominalKind::Class || class.abstract_class {
+            return Err(self.error("reflected type is not a concrete class", span));
+        }
+        if class.native || type_arguments.len() != class.type_parameters.len() {
+            return Err(self.error("reflected type is not instantiable", span));
+        }
+        let Some(method) = class
+            .methods
+            .iter()
+            .find(|method| method.name == "__construct")
+            .cloned()
+        else {
+            return Err(self.reflection_error("class has no constructor", span));
+        };
+        if method.visibility != Visibility::Public {
+            return Err(self.reflection_error("constructor is not public", span));
+        }
+        let parameters = method
+            .parameters
+            .iter()
+            .cloned()
+            .map(|mut parameter| {
+                parameter.ty = substitute_type_arguments(&parameter.ty, class.id, &type_arguments);
+                parameter
+            })
+            .collect::<Vec<_>>();
+        let mut bound = self.bind_reflection_arguments(&arguments[1], &parameters, span)?;
+        let Some(callee) = method.callee else {
+            return Err(self.reflection_error("constructor is abstract", span));
+        };
+        let object = self.allocate_object(
+            class.id,
+            type_arguments.clone(),
+            class.properties.len(),
+            span,
+        )?;
+        for property in &class.properties {
+            if let Some(default) = &property.default {
+                let expected = substitute_type_arguments(&property.ty, class.id, &type_arguments);
+                let value = Self::materialize_constant(default, &expected, span)?;
+                object
+                    .set_property(property.id, value)
+                    .map_err(|kind| runtime(kind, span))?;
+            }
+        }
+        bound.insert(0, object.clone());
+        self.invoke_callee(
+            callee,
+            bound,
+            depth,
+            Some(class.id),
+            calling_function,
+            instruction,
+        )?;
+        Ok(object)
+    }
+
+    fn bind_reflection_arguments(
+        &self,
+        supplied: &Value,
+        parameters: &[ParameterMetadata],
+        span: Span,
+    ) -> Result<Vec<Value>, VmError> {
+        let variadic = parameters.iter().position(|parameter| parameter.variadic);
+        let mut bound = vec![None; parameters.len()];
+        if let Some(values) = supplied.vector_values() {
+            let fixed = variadic.unwrap_or(parameters.len());
+            if values.len() > fixed && variadic.is_none() {
+                return Err(self.argument_count_error("too many positional arguments", span));
+            }
+            for (index, value) in values.iter().take(fixed).enumerate() {
+                bound[index] = Some(value.clone());
+            }
+            if let Some(index) = variadic {
+                let values = values.iter().skip(index).cloned().collect::<Vec<_>>();
+                for value in &values {
+                    if !value_matches(self.program, value, &parameters[index].ty) {
+                        return Err(self.type_error("variadic argument has the wrong type", span));
+                    }
+                }
+                bound[index] = Some(
+                    Value::try_vector(parameters[index].ty.clone(), values)
+                        .map_err(|kind| runtime(kind, span))?,
+                );
+            }
+        } else if let Some(entries) = supplied.map_entries() {
+            for (key, value) in entries {
+                let Some(name) = key
+                    .as_bytes()
+                    .and_then(|name| std::str::from_utf8(name).ok())
+                else {
+                    return Err(self.type_error("named argument keys must be UTF-8 strings", span));
+                };
+                let Some(index) = parameters
+                    .iter()
+                    .position(|parameter| parameter.name == name)
+                else {
+                    return Err(self.error("unknown named argument", span));
+                };
+                if parameters[index].variadic {
+                    return Err(
+                        self.error("named arguments cannot target a variadic parameter", span)
+                    );
+                }
+                if bound[index].replace(value.clone()).is_some() {
+                    return Err(self.error("duplicate named argument", span));
+                }
+            }
+            if let Some(index) = variadic {
+                bound[index] = Some(
+                    Value::try_vector(parameters[index].ty.clone(), Vec::new())
+                        .map_err(|kind| runtime(kind, span))?,
+                );
+            }
+        } else {
+            return Err(self.type_error(
+                "arguments must be vector<mixed> or map<string, mixed>",
+                span,
+            ));
+        }
+        for (index, parameter) in parameters.iter().enumerate() {
+            if bound[index].is_none() {
+                let Some(default) = &parameter.default else {
+                    return Err(self.argument_count_error("missing required argument", span));
+                };
+                bound[index] = Some(Self::materialize_constant(default, &parameter.ty, span)?);
+            }
+            if !parameter.variadic
+                && !value_matches(
+                    self.program,
+                    bound[index].as_ref().expect("argument bound"),
+                    &parameter.ty,
+                )
+            {
+                return Err(self.type_error("argument has the wrong type", span));
+            }
+        }
+        Ok(bound.into_iter().flatten().collect())
+    }
+
+    fn reflection_error(&self, message: &str, span: Span) -> VmError {
+        self.native_exception(
+            "ReflectionException",
+            message.as_bytes().to_vec(),
+            None,
+            0,
+            span,
+        )
+    }
+
+    fn type_error(&self, message: &str, span: Span) -> VmError {
+        self.native_exception("TypeError", message.as_bytes().to_vec(), None, 0, span)
+    }
+
+    fn argument_count_error(&self, message: &str, span: Span) -> VmError {
+        self.native_exception(
+            "ArgumentCountError",
+            message.as_bytes().to_vec(),
+            None,
+            0,
+            span,
+        )
+    }
+
+    fn error(&self, message: &str, span: Span) -> VmError {
+        self.native_exception("Error", message.as_bytes().to_vec(), None, 0, span)
     }
 
     fn result_class(&self, instruction: &Instruction) -> Result<thp_hir::ClassId, VmError> {
@@ -1555,6 +2924,211 @@ impl ExecutionState<'_, '_> {
             })?;
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct CallableMetadata {
+    name: String,
+    module_name: String,
+    parameters: Vec<ParameterMetadata>,
+    return_type: Type,
+    internal: bool,
+    declaring_class: Option<ClassId>,
+    method: Option<Method>,
+}
+
+fn utf8_argument(arguments: &[Value], index: usize) -> Option<&str> {
+    arguments
+        .get(index)
+        .and_then(Value::as_bytes)
+        .and_then(|value| std::str::from_utf8(value).ok())
+}
+
+fn short_name(name: &str) -> &str {
+    name.rsplit_once('\\').map_or(name, |(_, short)| short)
+}
+
+fn namespace_name(name: &str) -> &str {
+    name.rsplit_once('\\')
+        .map_or("", |(namespace, _)| namespace)
+}
+
+fn named_type_name(ty: &Type) -> String {
+    match ty {
+        Type::Vector(_) => "vector".to_owned(),
+        Type::Map(_, _) => "map".to_owned(),
+        Type::Nominal { name, .. } | Type::Object(name) | Type::Parameter { name, .. } => {
+            name.clone()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn type_allows_null(ty: &Type) -> bool {
+    ty == &Type::Null
+        || matches!(ty, Type::Union(members) if members.iter().any(type_allows_null))
+        || ty == &Type::Mixed
+}
+
+fn descriptor_type_arguments(ty: Option<&Type>) -> Vec<Type> {
+    match ty {
+        Some(Type::Nominal { arguments, .. }) => arguments.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn descriptor_nominal_type(program: &Program, class: ClassId, arguments: &[Type]) -> Type {
+    let name = program.classes[class.0 as usize].name.clone();
+    if arguments.is_empty() {
+        Type::Object(name)
+    } else {
+        Type::Nominal {
+            name,
+            arguments: arguments.to_vec(),
+        }
+    }
+}
+
+fn callable_descriptor_type(
+    program: &Program,
+    callable: &ReflectionCallable,
+    declaring_class: Option<ClassId>,
+) -> Option<Type> {
+    let ReflectionCallable::Method {
+        class,
+        type_arguments,
+        ..
+    } = callable
+    else {
+        return None;
+    };
+    (*class == declaring_class?).then(|| descriptor_nominal_type(program, *class, type_arguments))
+}
+
+fn substitute_type_arguments(ty: &Type, owner: ClassId, arguments: &[Type]) -> Type {
+    match ty {
+        Type::Parameter { id, .. } if id.owner == owner => arguments
+            .get(id.index as usize)
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        Type::Vector(element) => Type::Vector(Box::new(substitute_type_arguments(
+            element, owner, arguments,
+        ))),
+        Type::Map(key, value) => Type::Map(
+            Box::new(substitute_type_arguments(key, owner, arguments)),
+            Box::new(substitute_type_arguments(value, owner, arguments)),
+        ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| substitute_type_arguments(member, owner, arguments))
+                .collect(),
+        ),
+        Type::Nominal {
+            name,
+            arguments: nested,
+        } => Type::Nominal {
+            name: name.clone(),
+            arguments: nested
+                .iter()
+                .map(|argument| substitute_type_arguments(argument, owner, arguments))
+                .collect(),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn effective_method_indexes(program: &Program, class_id: ClassId) -> Vec<usize> {
+    let class = &program.classes[class_id.0 as usize];
+    let mut names = Vec::<String>::new();
+    for method in &class.declared_methods {
+        if !names.contains(&method.name) {
+            names.push(method.name.clone());
+        }
+    }
+    let mut parent = class.parent;
+    while let Some(parent_id) = parent {
+        let ancestor = &program.classes[parent_id.0 as usize];
+        for method in &ancestor.declared_methods {
+            if method.visibility != Visibility::Private && !names.contains(&method.name) {
+                names.push(method.name.clone());
+            }
+        }
+        parent = ancestor.parent;
+    }
+    for method in &class.methods {
+        if !names.contains(&method.name) {
+            names.push(method.name.clone());
+        }
+    }
+    names
+        .iter()
+        .filter_map(|name| class.methods.iter().position(|method| method.name == *name))
+        .collect()
+}
+
+fn effective_property_slots(program: &Program, class_id: ClassId) -> Vec<thp_hir::PropertyId> {
+    let class = &program.classes[class_id.0 as usize];
+    let mut names = Vec::<String>::new();
+    let mut slots = Vec::new();
+    for property in &class.declared_properties {
+        names.push(property.name.clone());
+        slots.push(property.id);
+    }
+    let mut parent = class.parent;
+    while let Some(parent_id) = parent {
+        let ancestor = &program.classes[parent_id.0 as usize];
+        for property in &ancestor.declared_properties {
+            if property.visibility != Visibility::Private
+                && !names.contains(&property.name)
+                && let Some(effective) = class.properties.iter().find(|candidate| {
+                    candidate.name == property.name
+                        && candidate.declaring_class == property.declaring_class
+                })
+            {
+                names.push(property.name.clone());
+                slots.push(effective.id);
+            }
+        }
+        parent = ancestor.parent;
+    }
+    slots
+}
+
+fn value_type(program: &Program, value: &Value) -> Option<Type> {
+    if value.is_null() {
+        Some(Type::Null)
+    } else if value.as_int().is_some() {
+        Some(Type::Int)
+    } else if value.as_float().is_some() {
+        Some(Type::Float)
+    } else if value.as_bool().is_some() {
+        Some(Type::Bool)
+    } else if value.as_bytes().is_some() {
+        Some(Type::String)
+    } else if let Some((first, second)) = value.collection_types() {
+        Some(match second {
+            Some(value) => Type::Map(Box::new(first), Box::new(value)),
+            None => Type::Vector(Box::new(first)),
+        })
+    } else {
+        let class = value.class_id()?;
+        let metadata = &program.classes[class.0 as usize];
+        let arguments = value.type_arguments().unwrap_or_default();
+        Some(if arguments.is_empty() {
+            Type::Object(metadata.name.clone())
+        } else {
+            Type::Nominal {
+                name: metadata.name.clone(),
+                arguments: arguments.to_vec(),
+            }
+        })
+    }
+}
+
+fn value_matches(program: &Program, value: &Value, expected: &Type) -> bool {
+    value_type(program, value)
+        .is_some_and(|actual| thp_bytecode::type_accepts(program, expected, &actual))
 }
 
 fn catch_exception(
@@ -1840,89 +3414,6 @@ fn runtime_member_accessible(
         thp_syntax::Visibility::Private => owner == Some(declaring),
         thp_syntax::Visibility::Protected => owner
             .is_some_and(|owner| owner == declaring || is_instance_of(program, owner, declaring)),
-    }
-}
-
-fn materialize_constant(
-    value: &ConstantValue,
-    expected: &Type,
-    span: Span,
-) -> Result<Value, VmError> {
-    if !runtime_constant_matches(expected, value) {
-        return Err(runtime(
-            RuntimeErrorKind::TypeError(format!(
-                "constant default is incompatible with `{expected}`"
-            )),
-            span,
-        ));
-    }
-    match value {
-        ConstantValue::Integer(value) => Ok(Value::integer(*value)),
-        ConstantValue::Float(value) => Ok(Value::float(*value)),
-        ConstantValue::Bool(value) => Ok(Value::bool(*value)),
-        ConstantValue::Null => Ok(Value::NULL),
-        ConstantValue::String(value) => {
-            Value::try_bytes(value.clone()).map_err(|kind| runtime(kind, span))
-        }
-        ConstantValue::Vector(values) => {
-            let element = match expected {
-                Type::Vector(element) => element.as_ref().clone(),
-                _ => Type::Mixed,
-            };
-            let values = values
-                .iter()
-                .map(|value| materialize_constant(value, &element, span))
-                .collect::<Result<Vec<_>, _>>()?;
-            Value::try_vector(element, values).map_err(|kind| runtime(kind, span))
-        }
-        ConstantValue::Map(entries) => {
-            let (key, element) = match expected {
-                Type::Map(key, element) => (key.as_ref().clone(), element.as_ref().clone()),
-                _ => (Type::Mixed, Type::Mixed),
-            };
-            let entries = entries
-                .iter()
-                .map(|(actual_key, value)| {
-                    Ok((
-                        materialize_constant(actual_key, &key, span)?,
-                        materialize_constant(value, &element, span)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, VmError>>()?;
-            Value::try_map(key, element, entries).map_err(|kind| runtime(kind, span))
-        }
-    }
-}
-
-fn runtime_constant_matches(expected: &Type, value: &ConstantValue) -> bool {
-    match expected {
-        Type::Mixed => true,
-        Type::Union(members) => members
-            .iter()
-            .any(|member| runtime_constant_matches(member, value)),
-        Type::Int => matches!(value, ConstantValue::Integer(_)),
-        Type::Float => matches!(value, ConstantValue::Float(_)),
-        Type::Bool => matches!(value, ConstantValue::Bool(_)),
-        Type::String => matches!(value, ConstantValue::String(_)),
-        Type::Null => matches!(value, ConstantValue::Null),
-        Type::Vector(element) => matches!(
-            value,
-            ConstantValue::Vector(values)
-                if values.iter().all(|value| runtime_constant_matches(element, value))
-        ),
-        Type::Map(key, element) => matches!(
-            value,
-            ConstantValue::Map(entries)
-                if entries.iter().all(|(actual_key, value)| {
-                    runtime_constant_matches(key, actual_key)
-                        && runtime_constant_matches(element, value)
-                })
-        ),
-        Type::Void
-        | Type::Never
-        | Type::Object(_)
-        | Type::Nominal { .. }
-        | Type::Parameter { .. } => false,
     }
 }
 
@@ -2432,6 +3923,71 @@ var_dump($counter instanceof Counter);
 "#)
         .unwrap();
         assert_eq!(execution.output, b"41\n42\nbool(true)\n");
+    }
+
+    #[test]
+    fn reflection_materializes_nullable_collection_defaults_with_their_element_type() {
+        let execution = run(r#"<?thp
+function countValues(?vector<int> $values = [1, 2]): int {
+    return 2;
+}
+function countEntries(?map<string, int> $entries = {"one" => 1}): int {
+    return 1;
+}
+var_dump((new ReflectionFunction("countValues"))->invokeArgs());
+var_dump((new ReflectionFunction("countEntries"))->invokeArgs());
+"#)
+        .unwrap();
+
+        assert_eq!(execution.output, b"int(2)\nint(1)\n");
+    }
+
+    #[test]
+    fn reflection_constructs_throwable_subclasses_with_throwable_storage() {
+        let execution = run(r#"<?thp
+class Problem extends Exception {}
+$class = new ReflectionClass("Problem");
+$problem = $class->newInstanceArgs(["broken"]);
+var_dump($class->getMethod("getMessage")->invokeArgs($problem));
+"#)
+        .unwrap();
+
+        assert_eq!(execution.output, b"string(6) \"broken\"\n");
+    }
+
+    #[test]
+    fn generic_method_allocations_retain_concrete_type_arguments() {
+        let execution = run(r#"<?thp
+class Box<T> {
+    public T $value;
+
+    public function __construct(T $value) { $this->value = $value; }
+
+    public function copy(): Box<T> { return new Box<T>($this->value); }
+}
+$copy = (new Box<int>(1))->copy();
+var_dump((new ReflectionProperty($copy, "value"))->getValue($copy));
+"#)
+        .unwrap();
+
+        assert_eq!(execution.output, b"int(1)\n");
+    }
+
+    #[test]
+    fn reflected_trait_methods_retain_composition_order() {
+        let execution = run(r#"<?thp
+trait OrderedMethods {
+    public function second(): int { return 2; }
+    public function first(): int { return 1; }
+}
+class UsesOrderedMethods { use OrderedMethods; }
+foreach ((new ReflectionClass("UsesOrderedMethods"))->getDeclaredMethods() as $method) {
+    echo $method->getName() . "\n";
+}
+"#)
+        .unwrap();
+
+        assert_eq!(execution.output, b"second\nfirst\n");
     }
 
     #[test]

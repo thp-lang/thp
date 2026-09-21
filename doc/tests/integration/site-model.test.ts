@@ -162,11 +162,11 @@ describe("documentation site model", () => {
     const byKind = (kind: string) =>
       standardLibraryPages.filter((page) => page.source.data.kind === kind);
 
-    expect(standardLibraryPages).toHaveLength(457);
-    expect(byKind("module")).toHaveLength(9);
-    expect(byKind("class").length + byKind("interface").length).toBe(91);
+    expect(standardLibraryPages).toHaveLength(554);
+    expect(byKind("module")).toHaveLength(10);
+    expect(byKind("class").length + byKind("interface").length).toBe(103);
     expect(byKind("enum")).toHaveLength(3);
-    expect(byKind("method")).toHaveLength(330);
+    expect(byKind("method")).toHaveLength(414);
     expect(byKind("function")).toHaveLength(24);
     expect(
       byKind("module").map((page) => [page.source.data.id, page.route]),
@@ -179,6 +179,7 @@ describe("documentation site model", () => {
       ["std.filesystem", "/std/filesystem/"],
       ["std.index", "/std/"],
       ["std.iterators", "/std/iterators/"],
+      ["std.reflection", "/std/reflection/"],
       ["std.streams", "/std/streams/"],
     ]);
     expect(model.config.navigation).toContainEqual({
@@ -347,7 +348,7 @@ describe("documentation site model", () => {
       basePath: "/",
       siteUrl: "https://example.github.io",
     });
-    expect(rootModel.pages).toHaveLength(495);
+    expect(rootModel.pages).toHaveLength(593);
     const subpathModel = await build({
       root,
       basePath: "/typed-php/",
@@ -473,7 +474,7 @@ describe("documentation site model", () => {
         return a.source.data.nav.order - b.source.data.nav.order;
       });
 
-    expect(languagePages).toHaveLength(19);
+    expect(languagePages).toHaveLength(20);
     expect(languagePages.map((page) => page.source.data.title)).toEqual([
       "Overview",
       "Basic syntax",
@@ -486,6 +487,7 @@ describe("documentation site model", () => {
       "Functions",
       "Classes and objects",
       "Namespaces",
+      "Reflection",
       "Enumerations",
       "Errors",
       "Exceptions",

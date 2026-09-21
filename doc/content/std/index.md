@@ -46,6 +46,11 @@ observer contracts, and object utilities.
 cleanup, capability interfaces, file and memory factories, and a dynamic URI
 compatibility bridge.
 
+## Reflection
+
+[`Reflection`](thp:std.reflection) exposes immutable, VM-owned descriptors for
+types and declarations retained in the verified linked program.
+
 ## Bundled extensions
 
 [Bundled extensions](thp:std.extensions) reserves reference routes for the

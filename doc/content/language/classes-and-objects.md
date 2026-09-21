@@ -9,10 +9,10 @@ nav:
 status: experimental
 availability: partial
 notice: >-
-  The nominal object model and erased generic classes/interfaces are
+  The nominal object model and reified generic classes/interfaces are
   experimental. Generic functions, methods, and traits, interface state, trait
   constants, static properties, property hooks, magic methods, anonymous
-  classes, cloning, reflection, and serialization remain outside the executable
+  classes, cloning, and serialization remain outside the executable
   contract.
 ---
 
@@ -51,9 +51,11 @@ lexically:
 Trait members become members of the consuming class before these rules are
 applied. Both the type checker and bytecode verifier enforce access.
 
-Property names are unique across an inheritance hierarchy; a descendant cannot
-replace even a private parent property. Concrete classes are flattened with
-parent slots first, then composed-trait properties, then class properties.
+Public and protected property names remain unique across an inheritance
+hierarchy. A descendant may privately redeclare a parent-private property; the
+parent slot remains intact and the child receives a distinct slot. Concrete
+classes are flattened with parent slots first, then composed-trait properties,
+then class properties.
 Inherited slots keep their index. Constant defaults for all flattened
 properties run before the effective constructor, and reading a property that
 was never initialized is a runtime error. Property defaults may nest at most
@@ -128,8 +130,9 @@ cannot be replaced by a descendant or a trait.
 
 Overrides are deliberately strict. Staticness, parameter names and order,
 parameter types, defaults, variadic shape, and return type must match exactly.
-Visibility may stay equal or widen, never narrow. A descendant cannot redeclare
-a parent-private method name. Constructors follow the same compatibility
+Visibility may stay equal or widen, never narrow. A descendant may redeclare a
+parent-private method name as a distinct declaration; code already resolved in
+the parent remains bound to the parent method. Constructors follow the same compatibility
 rules, are inherited when omitted, and are not invoked implicitly when a child
 declares its own constructor.
 
@@ -213,8 +216,8 @@ check that cannot be proved fails safely.
 
 Named static access to a generic class is explicit, as in
 `Box<int>::make(1)`. Inside a generic class, `self`, `parent`, and `static`
-retain the lexical instantiation. Runtime objects remain erased: there is one
-class ID per declaration, no monomorphization, and
+retain the lexical instantiation. Runtime objects retain their concrete generic
+arguments while sharing one class ID per declaration; no monomorphization occurs, and
 `$value instanceof Box` tests that erased ID. `instanceof Box<int>` is rejected.
 Generic throwable declarations and generic catch targets are unsupported.
 Duplicate parameters are diagnosed at the repeated name. Arity, raw-type,

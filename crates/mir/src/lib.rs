@@ -38,7 +38,9 @@ impl Module {
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub module_name: String,
     pub parameters: Vec<LocalId>,
+    pub parameter_metadata: Vec<thp_hir::ParameterMetadata>,
     pub local_types: Vec<Type>,
     pub return_type: Type,
     pub owner: Option<ClassId>,
@@ -291,7 +293,9 @@ impl<'hir> FunctionBuilder<'hir> {
         Function {
             id: self.hir.id,
             name: self.hir.name.clone(),
+            module_name: self.hir.module_name.clone(),
             parameters: self.hir.parameters.clone(),
+            parameter_metadata: self.hir.parameter_metadata.clone(),
             local_types: self.local_types,
             return_type: self.hir.return_type.clone(),
             owner: self.hir.owner,
