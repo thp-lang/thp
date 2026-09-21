@@ -26,12 +26,34 @@ remain marked as prereleases while THP is experimental.
   invalidated by assignment.
 - config: Added installed-package source discovery and deterministic `thp.lock`
   generation and loading through the new `thp lock` command.
+- std: Implemented the invariant `Traversable<K, V>`, `Iterator<K, V>`, and
+  `IteratorAggregate<K, V>` interfaces; iterator-object `foreach` remains
+  proposed.
+- runtime: Implemented `TypeError` and its `ArgumentCountError` subclass for
+  dynamic argument binding failures.
+- tooling: Added the independently versioned `thp-lsp` 0.1.0 stdio server with
+  workspace diagnostics, navigation, rename, symbols, semantic tokens,
+  source-preserving formatting, detached docblocks, and local `@var` hints.
 
 ### Changed
 
 - bytecode: Bumped the bytecode schema from version 1 to 3 for reified generics,
   dynamic construction, checked narrowing, and reflection metadata; older
   cached or frozen bytecode must be regenerated.
+- config: Extended the experimental version-1 lock layout with package and
+  autoload records; locks generated with the previous layout must be
+  regenerated.
+- lang: Limited typed constant defaults to 128 nested collection levels.
+
+### Removed
+
+- doc: Removed the proposed `spl_autoload_*` callback APIs; THP uses configured
+  static project and installed-package discovery instead.
+
+### Fixed
+
+- lang: Invalidated guarded type refinements before loop reads when a `while`,
+  `for`, or `foreach` path can assign the refined local.
 
 ## [0.2.0] - 2026-09-02
 

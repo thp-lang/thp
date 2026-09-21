@@ -7,4 +7,12 @@ remain marked as prereleases while THP is experimental.
 
 ## [0.1.0]
 
-Initial release
+### Added
+
+- Published workspace diagnostics with full-document synchronization and
+  unsaved source overlays.
+- Added hover, completion, signature help, definition, references, safe rename,
+  document and workspace symbols, semantic tokens, and full-document
+  formatting.
+- Added detached docblock validation and tooling-only local `@var` hints.
+- Added independent signed release archives under `thp-lsp-v*` tags.
