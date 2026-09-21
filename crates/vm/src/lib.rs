@@ -486,7 +486,7 @@ impl ExecutionState<'_, '_> {
             object
                 .set_property(
                     property.id,
-                    self.materialize_constant(initializer, &ty, instruction.span)?,
+                    Self::materialize_constant(initializer, &ty, instruction.span)?,
                 )
                 .map_err(|kind| runtime(kind, instruction.span))?;
         }
@@ -605,7 +605,7 @@ impl ExecutionState<'_, '_> {
                         .default
                         .as_ref()
                         .map(|value| {
-                            self.materialize_constant(value, &parameter.ty, instruction.span)
+                            Self::materialize_constant(value, &parameter.ty, instruction.span)
                         })
                         .transpose()?
                         .ok_or_else(|| {
@@ -2135,7 +2135,7 @@ impl ExecutionState<'_, '_> {
             R::PropertyHasDefaultValue => Ok(Value::bool(property.default.is_some())),
             R::PropertyGetDefaultValue => {
                 property.default.as_ref().map_or(Ok(Value::NULL), |value| {
-                    self.materialize_constant(value, &property_type, span)
+                    Self::materialize_constant(value, &property_type, span)
                 })
             }
             R::PropertyIsPublic | R::PropertyIsProtected | R::PropertyIsPrivate => {
@@ -2222,7 +2222,7 @@ impl ExecutionState<'_, '_> {
             R::ParameterIsDefaultValueAvailable => Ok(Value::bool(parameter.default.is_some())),
             R::ParameterGetDefaultValue => parameter.default.as_ref().map_or_else(
                 || Err(self.reflection_error("parameter has no default value", span)),
-                |value| self.materialize_constant(value, &parameter.ty, span),
+                |value| Self::materialize_constant(value, &parameter.ty, span),
             ),
             R::ParameterIsOptional => Ok(Value::bool(
                 parameter.default.is_some() || parameter.variadic,
@@ -2494,9 +2494,7 @@ impl ExecutionState<'_, '_> {
         .map_err(|kind| runtime(kind, span))
     }
 
-    #[allow(clippy::self_only_used_in_recursion)]
     fn materialize_constant(
-        &self,
         constant: &ConstantValue,
         expected: &Type,
         span: Span,
@@ -2522,7 +2520,7 @@ impl ExecutionState<'_, '_> {
                 .unwrap_or(Type::Mixed);
                 let values = values
                     .iter()
-                    .map(|value| self.materialize_constant(value, &element, span))
+                    .map(|value| Self::materialize_constant(value, &element, span))
                     .collect::<Result<Vec<_>, _>>()?;
                 Value::try_vector(element, values).map_err(|kind| runtime(kind, span))
             }
@@ -2542,8 +2540,8 @@ impl ExecutionState<'_, '_> {
                     .iter()
                     .map(|(key, value)| {
                         Ok((
-                            self.materialize_constant(key, &key_type, span)?,
-                            self.materialize_constant(value, &value_type, span)?,
+                            Self::materialize_constant(key, &key_type, span)?,
+                            Self::materialize_constant(value, &value_type, span)?,
                         ))
                     })
                     .collect::<Result<Vec<_>, VmError>>()?;
@@ -2669,7 +2667,7 @@ impl ExecutionState<'_, '_> {
         for property in &class.properties {
             if let Some(default) = &property.default {
                 let expected = substitute_type_arguments(&property.ty, class.id, &type_arguments);
-                let value = self.materialize_constant(default, &expected, span)?;
+                let value = Self::materialize_constant(default, &expected, span)?;
                 object
                     .set_property(property.id, value)
                     .map_err(|kind| runtime(kind, span))?;
@@ -2755,7 +2753,7 @@ impl ExecutionState<'_, '_> {
                 let Some(default) = &parameter.default else {
                     return Err(self.argument_count_error("missing required argument", span));
                 };
-                bound[index] = Some(self.materialize_constant(default, &parameter.ty, span)?);
+                bound[index] = Some(Self::materialize_constant(default, &parameter.ty, span)?);
             }
             if !parameter.variadic
                 && !value_matches(
