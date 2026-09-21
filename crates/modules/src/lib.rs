@@ -11,8 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, Span};
 use thp_syntax::{
     Block, ClassDecl, Expr, ExprKind, ForClause, ForClauseKind, FunctionDecl, InterfaceDecl,
-    NameRef, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitDecl,
-    TraitUse, TypeSyntax, TypeSyntaxKind, UseKind,
+    NameRef, NewTarget, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation,
+    TraitDecl, TraitUse, TypeSyntax, TypeSyntaxKind, UseKind,
 };
 
 pub const INTERFACE_FORMAT_VERSION: u16 = 2;
@@ -209,6 +209,17 @@ impl FilesystemSourceProvider {
                 } else {
                     self.root.join(directory)
                 };
+                if fs::symlink_metadata(&directory)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(ModuleError::InvalidAutoload {
+                        prefix: mapping.prefix.clone(),
+                        message: format!(
+                            "{} is a directory symlink and will not be followed",
+                            directory.display()
+                        ),
+                    });
+                }
                 let canonical_directory =
                     fs::canonicalize(&directory).map_err(|source| ModuleError::Io {
                         path: directory.clone(),
@@ -965,11 +976,12 @@ fn collect_body_expr(expression: &Expr, output: &mut Vec<(bool, String)>) {
             }
         }
         ExprKind::New {
-            class_name,
-            arguments,
-            ..
+            target, arguments, ..
         } => {
-            output.push((false, class_name.clone()));
+            match target {
+                NewTarget::Static { class_name, .. } => output.push((false, class_name.clone())),
+                NewTarget::Dynamic(target) => collect_body_expr(target, output),
+            }
             for argument in arguments {
                 collect_body_expr(&argument.value, output);
             }
@@ -1473,12 +1485,19 @@ fn resolve_expr(
             }
         }
         ExprKind::New {
-            class_name,
+            target,
             type_arguments,
             arguments,
             ..
         } => {
-            *class_name = resolve_type_name(class_name, namespace, type_aliases);
+            match target {
+                NewTarget::Static { class_name, .. } => {
+                    *class_name = resolve_type_name(class_name, namespace, type_aliases);
+                }
+                NewTarget::Dynamic(target) => {
+                    resolve_expr(target, namespace, type_aliases, function_aliases, index);
+                }
+            }
             for argument in type_arguments {
                 resolve_type(argument, namespace, type_aliases);
             }
@@ -1632,7 +1651,12 @@ fn resolve_nominal_ref(
     }
 }
 
-fn resolve_type_name(name: &str, namespace: &str, aliases: &BTreeMap<String, String>) -> String {
+/// Resolves one type name with the same namespace/import rules as project compilation.
+pub fn resolve_type_name(
+    name: &str,
+    namespace: &str,
+    aliases: &BTreeMap<String, String>,
+) -> String {
     if name.starts_with('\\') {
         return name.trim_start_matches('\\').to_owned();
     }
@@ -1640,6 +1664,15 @@ fn resolve_type_name(name: &str, namespace: &str, aliases: &BTreeMap<String, Str
         return name.to_owned();
     }
     resolve_qualified(name, namespace, aliases)
+}
+
+/// Resolves every name in a parsed type without performing semantic validation.
+pub fn resolve_type_syntax_in_namespace(
+    ty: &mut TypeSyntax,
+    namespace: &str,
+    aliases: &BTreeMap<String, String>,
+) {
+    resolve_type(ty, namespace, aliases);
 }
 
 fn resolve_function_name(
@@ -2105,10 +2138,13 @@ fn collect_thp_files_inner(
             source,
         })?;
         let path = entry.path();
-        let metadata = fs::metadata(&path).map_err(|source| ModuleError::Io {
+        let metadata = fs::symlink_metadata(&path).map_err(|source| ModuleError::Io {
             path: path.clone(),
             source,
         })?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
         if metadata.is_dir() {
             collect_thp_files_inner(&path, output, visited)?;
         } else if metadata.is_file()
@@ -2257,6 +2293,30 @@ mod tests {
                 "App\\Service\\Zed"
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(
+            outside.path().join("Hidden.thp"),
+            "<?thp\nnamespace App\\linked;\nclass Hidden {}",
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("src/linked")).unwrap();
+        let entry = root.path().join("main.thp");
+        fs::write(&entry, "<?thp\n").unwrap();
+        let provider = FilesystemSourceProvider::new(
+            root.path(),
+            vec![AutoloadMapping::new("App\\", vec!["src".into()]).unwrap()],
+            &entry,
+        );
+        assert_eq!(provider.enumerate().unwrap().len(), 1);
     }
 
     #[test]

@@ -166,6 +166,8 @@ impl ResolvedProfile {
 /// Every profile resolved from a project.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedProject {
+    pub package_roots: Vec<PathBuf>,
+    pub autoload: AutoloadConfig,
     pub common: ResolvedProfile,
     pub targets: BTreeMap<TargetName, ResolvedProfile>,
 }
@@ -183,6 +185,7 @@ impl ResolvedProject {
 #[derive(Clone, Debug)]
 pub struct ProjectConfig {
     root: PathBuf,
+    package_roots: Vec<PathBuf>,
     autoload: AutoloadConfig,
     common: ProfileLayer,
     targets: BTreeMap<TargetName, ProfileLayer>,
@@ -203,6 +206,7 @@ impl ProjectConfig {
         let layer = parse_layer(path, source)?;
         Ok(Self {
             root: path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+            package_roots: layer.package_roots.unwrap_or_default(),
             autoload: layer.autoload,
             common: layer.common,
             targets: layer.targets,
@@ -222,8 +226,23 @@ impl ProjectConfig {
         let local_path = root.join(LOCAL_FILE_NAME);
         let local = load_layer(&local_path, false)?;
 
+        let mut package_roots = project.package_roots.unwrap_or_default();
+        for package_root in local.package_roots.unwrap_or_default() {
+            if !package_roots.contains(&package_root) {
+                package_roots.push(package_root);
+            }
+        }
+        let mut owners = project
+            .autoload
+            .keys()
+            .map(|prefix| (prefix.clone(), project_path.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut autoload = project.autoload;
-        autoload.extend(local.autoload);
+        for (prefix, directories) in local.autoload {
+            owners.insert(prefix.clone(), local_path.clone());
+            autoload.insert(prefix, directories);
+        }
+        discover_packages(root, &package_roots, &mut autoload, owners)?;
         let mut common = project.common;
         common.merge(local.common);
         let mut targets = project.targets;
@@ -233,6 +252,7 @@ impl ProjectConfig {
 
         Ok(Self {
             root: root.to_path_buf(),
+            package_roots,
             autoload,
             common,
             targets,
@@ -244,6 +264,16 @@ impl ProjectConfig {
     }
 
     pub fn autoload(&self) -> &AutoloadConfig {
+        &self.autoload
+    }
+
+    /// Ordered project-relative roots searched for installed packages.
+    pub fn package_roots(&self) -> &[PathBuf] {
+        &self.package_roots
+    }
+
+    /// The project mappings plus every mapping discovered from installed packages.
+    pub fn resolved_autoload(&self) -> &AutoloadConfig {
         &self.autoload
     }
 
@@ -282,7 +312,12 @@ impl ProjectConfig {
                     .map(|profile| (target.clone(), profile))
             })
             .collect::<Result<_, _>>()?;
-        Ok(ResolvedProject { common, targets })
+        Ok(ResolvedProject {
+            package_roots: self.package_roots.clone(),
+            autoload: self.autoload.clone(),
+            common,
+            targets,
+        })
     }
 }
 
@@ -450,6 +485,7 @@ struct RawTime {
 
 #[derive(Debug, Default)]
 struct DocumentLayer {
+    package_roots: Option<Vec<PathBuf>>,
     autoload: AutoloadConfig,
     common: ProfileLayer,
     targets: BTreeMap<TargetName, ProfileLayer>,
@@ -505,17 +541,37 @@ fn parse_layer(path: &Path, source: &str) -> Result<DocumentLayer, Diagnostic> {
         )
     })?;
 
-    let autoload = raw
-        .autoload
-        .into_iter()
-        .map(|(prefix, directories)| {
+    let mut package_roots = None;
+    let mut autoload = AutoloadConfig::new();
+    for (prefix, directories) in raw.autoload {
+        if prefix == "packages" {
+            let directories = convert_directories(directories);
+            if directories.is_empty() || directories.iter().any(String::is_empty) {
+                return Err(Diagnostic::at_field(
+                    path,
+                    source,
+                    "autoload.packages",
+                    "package discovery requires at least one non-empty directory",
+                ));
+            }
+            for directory in &directories {
+                validate_package_root(Path::new(directory)).map_err(|message| {
+                    Diagnostic::at_field(path, source, "autoload.packages", message)
+                })?;
+            }
+            let mut roots = Vec::new();
+            for directory in directories {
+                let directory = PathBuf::from(directory);
+                if !roots.contains(&directory) {
+                    roots.push(directory);
+                }
+            }
+            package_roots = Some(roots);
+        } else {
             validate_namespace_prefix(&prefix).map_err(|message| {
                 Diagnostic::at_field(path, source, format!("autoload.{prefix}"), message)
             })?;
-            let directories = match directories {
-                RawAutoloadDirectories::One(directory) => vec![directory],
-                RawAutoloadDirectories::Many(directories) => directories,
-            };
+            let directories = convert_directories(directories);
             if directories.is_empty() || directories.iter().any(String::is_empty) {
                 return Err(Diagnostic::at_field(
                     path,
@@ -524,9 +580,9 @@ fn parse_layer(path: &Path, source: &str) -> Result<DocumentLayer, Diagnostic> {
                     "an autoload mapping requires at least one non-empty directory",
                 ));
             }
-            Ok((prefix, directories.into_iter().map(PathBuf::from).collect()))
-        })
-        .collect::<Result<AutoloadConfig, Diagnostic>>()?;
+            autoload.insert(prefix, directories.into_iter().map(PathBuf::from).collect());
+        }
+    }
     let common = convert_profile(
         RawProfile {
             memory: raw.memory,
@@ -550,13 +606,38 @@ fn parse_layer(path: &Path, source: &str) -> Result<DocumentLayer, Diagnostic> {
         })
         .collect::<Result<_, Diagnostic>>()?;
     Ok(DocumentLayer {
+        package_roots,
         autoload,
         common,
         targets,
     })
 }
 
-fn validate_namespace_prefix(prefix: &str) -> Result<(), &'static str> {
+fn convert_directories(directories: RawAutoloadDirectories) -> Vec<String> {
+    match directories {
+        RawAutoloadDirectories::One(directory) => vec![directory],
+        RawAutoloadDirectories::Many(directories) => directories,
+    }
+}
+
+pub(crate) fn validate_package_root(path: &Path) -> Result<(), &'static str> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err("package roots must be non-empty project-relative paths");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err("package roots must not escape the project through `..`");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_namespace_prefix(prefix: &str) -> Result<(), &'static str> {
     if prefix.is_empty() {
         return Ok(());
     }
@@ -575,6 +656,125 @@ fn validate_namespace_prefix(prefix: &str) -> Result<(), &'static str> {
         return Err("autoload namespace prefixes must contain valid case-sensitive name segments");
     }
     Ok(())
+}
+
+fn discover_packages(
+    root: &Path,
+    package_roots: &[PathBuf],
+    autoload: &mut AutoloadConfig,
+    mut owners: BTreeMap<String, PathBuf>,
+) -> Result<(), Diagnostic> {
+    for package_root in package_roots {
+        let root_path = root.join(package_root);
+        for vendor in child_directories(&root_path)? {
+            for package in child_directories(&vendor)? {
+                let manifest = package.join(PROJECT_FILE_NAME);
+                let bytes = fs::read(&manifest).map_err(|error| {
+                    Diagnostic::new(
+                        &manifest,
+                        None,
+                        None,
+                        Some("autoload.packages".to_owned()),
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            "installed package is missing required `thp.toml`".to_owned()
+                        } else {
+                            format!("could not read package configuration: {error}")
+                        },
+                    )
+                })?;
+                let source = std::str::from_utf8(&bytes).map_err(|error| {
+                    let prefix =
+                        std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default();
+                    Diagnostic::new(
+                        &manifest,
+                        Some(prefix),
+                        Some(error.valid_up_to()..error.valid_up_to().saturating_add(1)),
+                        None,
+                        "configuration must be valid UTF-8",
+                    )
+                })?;
+                let layer = parse_layer(&manifest, source)?;
+                let package_relative = package.strip_prefix(root).unwrap_or(&package);
+                if package_relative.to_str().is_none() {
+                    return Err(Diagnostic::new(
+                        &manifest,
+                        None,
+                        None,
+                        Some("autoload.packages".to_owned()),
+                        "installed package paths must be valid UTF-8",
+                    ));
+                }
+                for (prefix, directories) in layer.autoload {
+                    if let Some(first) = owners.get(&prefix) {
+                        return Err(Diagnostic::at_field(
+                            &manifest,
+                            source,
+                            format!("autoload.{prefix}"),
+                            format!(
+                                "autoload namespace prefix `{prefix}` is already mapped by {}",
+                                first.display()
+                            ),
+                        ));
+                    }
+                    let directories = directories
+                        .into_iter()
+                        .map(|directory| {
+                            if directory.components().any(|component| {
+                                matches!(
+                                    component,
+                                    std::path::Component::ParentDir
+                                        | std::path::Component::RootDir
+                                        | std::path::Component::Prefix(_)
+                                )
+                            }) {
+                                Err(Diagnostic::at_field(
+                                    &manifest,
+                                    source,
+                                    format!("autoload.{prefix}"),
+                                    "package autoload paths must be relative to the package",
+                                ))
+                            } else {
+                                Ok(package_relative.join(directory))
+                            }
+                        })
+                        .collect::<Result<_, _>>()?;
+                    owners.insert(prefix.clone(), manifest.clone());
+                    autoload.insert(prefix, directories);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn child_directories(path: &Path) -> Result<Vec<PathBuf>, Diagnostic> {
+    let mut directories = fs::read_dir(path)
+        .map_err(|error| {
+            Diagnostic::new(
+                path,
+                None,
+                None,
+                Some("autoload.packages".to_owned()),
+                format!("could not scan package directory: {error}"),
+            )
+        })?
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|error| {
+                Diagnostic::new(
+                    path,
+                    None,
+                    None,
+                    Some("autoload.packages".to_owned()),
+                    format!("could not read package directory entry: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    directories.sort();
+    Ok(directories)
 }
 
 fn convert_profile(

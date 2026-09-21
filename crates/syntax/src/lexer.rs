@@ -1,4 +1,4 @@
-use thp_diagnostics::{Diagnostic, SourceFile, Span};
+use thp_diagnostics::{Diagnostic, SourceFile, SourceId, Span};
 
 use crate::{Token, TokenKind};
 
@@ -8,24 +8,55 @@ pub struct LexOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// A documentation comment retained by tooling without entering the token stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocblockSpan {
+    pub span: Span,
+}
+
+impl DocblockSpan {
+    pub fn text<'a>(&self, source: &'a str) -> &'a str {
+        &source[self.span.range()]
+    }
+}
+
 pub fn lex(source: &SourceFile) -> LexOutput {
     Lexer {
         source: source.text(),
+        source_id: source.source_id(),
         offset: 0,
         tokens: Vec::new(),
         diagnostics: Vec::new(),
+        docblocks: None,
     }
     .run()
 }
 
-struct Lexer<'source> {
+/// Lexes exactly like [`lex`] while retaining closed `/** ... */` trivia spans.
+pub fn lex_with_docblocks(source: &SourceFile) -> (LexOutput, Vec<DocblockSpan>) {
+    let mut docblocks = Vec::new();
+    let output = Lexer {
+        source: source.text(),
+        source_id: source.source_id(),
+        offset: 0,
+        tokens: Vec::new(),
+        diagnostics: Vec::new(),
+        docblocks: Some(&mut docblocks),
+    }
+    .run();
+    (output, docblocks)
+}
+
+struct Lexer<'source, 'docs> {
     source: &'source str,
+    source_id: Option<SourceId>,
     offset: usize,
     tokens: Vec<Token>,
     diagnostics: Vec<Diagnostic>,
+    docblocks: Option<&'docs mut Vec<DocblockSpan>>,
 }
 
-impl Lexer<'_> {
+impl Lexer<'_, '_> {
     fn run(mut self) -> LexOutput {
         while self.offset < self.source.len() {
             self.skip_trivia();
@@ -36,7 +67,7 @@ impl Lexer<'_> {
         }
         self.tokens.push(Token {
             kind: TokenKind::Eof,
-            span: Span::empty(self.source.len()),
+            span: self.span(self.source.len(), self.source.len()),
         });
         LexOutput {
             tokens: self.tokens,
@@ -46,6 +77,13 @@ impl Lexer<'_> {
 
     fn bytes(&self) -> &[u8] {
         self.source.as_bytes()
+    }
+
+    fn span(&self, start: usize, end: usize) -> Span {
+        self.source_id.map_or_else(
+            || Span::new(start, end),
+            |source| Span::in_source(source, start, end),
+        )
     }
 
     fn skip_trivia(&mut self) {
@@ -80,12 +118,18 @@ impl Lexer<'_> {
                     self.diagnostics.push(Diagnostic::error(
                         "lexing",
                         "L0002",
-                        Span::new(start, self.source.len()),
+                        self.span(start, self.source.len()),
                         "unterminated block comment",
                     ));
                     self.offset = self.source.len();
                 } else {
                     self.offset += 2;
+                    let span = self.span(start, self.offset);
+                    if self.bytes().get(start + 2) == Some(&b'*')
+                        && let Some(docblocks) = &mut self.docblocks
+                    {
+                        docblocks.push(DocblockSpan { span });
+                    }
                 }
                 continue;
             }
@@ -113,7 +157,7 @@ impl Lexer<'_> {
                 self.diagnostics.push(Diagnostic::error(
                     "lexing",
                     "L0003",
-                    Span::new(start, self.offset),
+                    self.span(start, self.offset),
                     "`$` must be followed by an ASCII variable name",
                 ));
                 return;
@@ -231,7 +275,7 @@ impl Lexer<'_> {
                     self.diagnostics.push(Diagnostic::error(
                         "lexing",
                         "L0001",
-                        Span::new(start, self.offset),
+                        self.span(start, self.offset),
                         "unrecognized source character",
                     ));
                     return;
@@ -298,7 +342,7 @@ impl Lexer<'_> {
             self.diagnostics.push(Diagnostic::error(
                 "lexing",
                 "L0004",
-                Span::new(start, self.source.len()),
+                self.span(start, self.source.len()),
                 "unterminated string literal",
             ));
         }
@@ -307,7 +351,7 @@ impl Lexer<'_> {
     fn push(&mut self, kind: TokenKind, start: usize) {
         self.tokens.push(Token {
             kind,
-            span: Span::new(start, self.offset),
+            span: self.span(start, self.offset),
         });
     }
 }
@@ -324,7 +368,7 @@ const fn is_identifier_continue(byte: u8) -> bool {
 mod tests {
     use thp_diagnostics::SourceFile;
 
-    use super::lex;
+    use super::{lex, lex_with_docblocks};
     use crate::TokenKind;
 
     #[test]
@@ -365,5 +409,19 @@ mod tests {
         let source = SourceFile::new("test.thp", "<?thp /*");
         let output = lex(&source);
         assert_eq!(output.diagnostics[0].code, "L0002");
+    }
+
+    #[test]
+    fn collects_only_closed_docblock_trivia_without_changing_tokens() {
+        let source = SourceFile::new(
+            "test.thp",
+            "<?thp /** docs */ /* plain */ $x = \"/** string */\"; /** open",
+        );
+        let plain = lex(&source);
+        let (documented, blocks) = lex_with_docblocks(&source);
+        assert_eq!(plain.tokens, documented.tokens);
+        assert_eq!(plain.diagnostics, documented.diagnostics);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text(source.text()), "/** docs */");
     }
 }

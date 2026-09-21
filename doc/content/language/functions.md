@@ -40,6 +40,7 @@ function first<T>(vector<T> $values): ?T {
 A parameter may declare a typed constant default. Supported defaults are
 scalar and `null` literals, unary constant expressions, and recursively
 constant vector and map literals.
+Typed constant defaults may nest at most 128 vector or map levels.
 
 ```thp
 function retry(

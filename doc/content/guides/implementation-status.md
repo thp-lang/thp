@@ -34,24 +34,27 @@ extraction, incremental/cache work, linking, and prepared execution.
 `proposed` means the symbol is documentation-only and must be rejected by the
 compiler if used as though it were available.
 
-| Symbol or syntax                                                                            | Availability | Executable boundary                                                                                              |
-| ------------------------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `<?thp`, comments, blocks, statements                                                       | implemented  | UTF-8 source and ASCII identifiers                                                                               |
-| `int`, `float`, `bool`, `string`, `null`, `void`, `mixed`, nullable types, unions           | implemented  | `string` values are arbitrary bytes at runtime                                                                   |
-| `vector<T>`, `map<K, V>`                                                                    | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                         |
-| Variables and functions                                                                     | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                  |
-| `if`, `match`, `while`, `for`, `return`, `echo`                                             | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                  |
-| `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Native collections only; the source is evaluated once and traversal uses its captured COW snapshot               |
-| `break`, `continue`                                                                         | partial      | Level one only; numeric levels are rejected                                                                      |
-| Scalar operators                                                                            | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing |
-| Classes and interfaces                                                                      | partial      | Reified generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported |
-| Traits                                                                                      | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                        |
-| Reflection descriptor constructors                                                          | implemented  | Linked-program discovery, deterministic metadata, checked access/invocation, and reflective construction         |
-| `Throwable`, `Exception`, `Error`, `TypeError`, `ArgumentCountError`, `UnhandledMatchError` | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures         |
-| `try`, `catch`, `finally`, `throw`, `using`                                                 | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                  |
-| Namespaces, imports, and project autoload discovery                                         | implemented  | Semicolon namespaces and deterministic configured source maps; no runtime include/autoload callbacks             |
-| OPcache, frozen projects, metrics, embedding, C ABI                                         | implemented  | Reified generic and reflection metadata is schema-versioned; the public C ABI remains version 1                  |
-| Cranelift JIT                                                                               | partial      | Safe scalar subset; automatic mode falls back to the VM                                                          |
+| Symbol or syntax                                                                            | Availability | Executable boundary                                                                                                                                                     |
+| ------------------------------------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<?thp`, comments, blocks, statements                                                       | implemented  | UTF-8 source and ASCII identifiers                                                                                                                                      |
+| `int`, `float`, `bool`, `string`, `null`, `void`, `mixed`, nullable types, unions           | implemented  | `string` values are arbitrary bytes at runtime                                                                                                                          |
+| `vector<T>`, `map<K, V>`                                                                    | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                                                                                |
+| Variables and functions                                                                     | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                                                                         |
+| `if`, `match`, `while`, `for`, `return`, `echo`                                             | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                                                                         |
+| `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Native collections only; the source is evaluated once and traversal uses its captured COW snapshot                                                                      |
+| `break`, `continue`                                                                         | partial      | Level one only; numeric levels are rejected                                                                                                                             |
+| Scalar operators                                                                            | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing                                                        |
+| Classes and interfaces                                                                      | partial      | Reified generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported                                                        |
+| Dynamic `new`                                                                               | implemented  | Exact compiled canonical class lookup; no runtime loading or autoloading                                                                                                |
+| `is_*` guards and direct-positive narrowing                                                 | implemented  | Direct local guards in `if`/`elseif`; no negation, composition, loop, or branch-join inference                                                                          |
+| Traits                                                                                      | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                                                                               |
+| Reflection descriptor constructors                                                          | implemented  | Linked-program discovery, deterministic metadata, checked access/invocation, and reflective construction                                                                |
+| `Throwable`, `Exception`, `Error`, `TypeError`, `ArgumentCountError`, `UnhandledMatchError` | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures                                                                |
+| `try`, `catch`, `finally`, `throw`, `using`                                                 | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                                                                         |
+| Namespaces, imports, and project/package autoload discovery                                 | implemented  | Semicolon namespaces and deterministic configured and installed-package source maps; no downloading, runtime source loading, or runtime include/autoload callbacks      |
+| OPcache, frozen projects, metrics, embedding, C ABI                                         | implemented  | Reified generic and reflection metadata is schema-versioned; the public C ABI remains version 1                                                                         |
+| Cranelift JIT                                                                               | partial      | Safe scalar subset; automatic mode falls back to the VM                                                                                                                 |
+| Language Server Protocol and detached docblocks                                             | implemented  | Independent 0.1.0 stdio server; workspace diagnostics, navigation, safe rename, symbols, semantic tokens, source-preserving formatting, and LSP-only local `@var` hints |
 
 ### Collection and iterator symbols
 
@@ -133,6 +136,9 @@ execute with identical semantics and falls back to the VM for heap operations,
 control-flow graphs, checked arithmetic, output, objects, method dispatch,
 exception regions, cleanup instructions, or instruction limits.
 
+Dynamic construction, guards over `mixed`, and checked narrowing remain outside
+the JIT subset, so automatic mode executes them in the VM.
+
 ## Deliberately rejected or pending
 
 The current executable subset rejects unsupported syntax instead of inheriting
@@ -144,8 +150,9 @@ PHP behavior. Pending work includes:
 - generic and multiple-parent interfaces, interface state, trait constants,
   static properties, property hooks, magic methods, anonymous classes, enums,
   reflection attributes/source inspection, and flow narrowing after `instanceof`;
-- global constants, dynamic names, runtime includes/autoload callbacks,
-  attributes, generators, closures, and cooperative async;
+- global constants, general dynamic calls and member names, runtime
+  includes/autoload callbacks, attributes, generators, closures, and cooperative
+  async;
 - the broader standard library, extension registration/dispatch, concrete
   FastCGI and web-server SAPI adapters, relocatable module code generation,
   dependency-minimal incremental invalidation, broader JIT coverage, hotness
@@ -161,6 +168,13 @@ arbitrary bytes.
 Bytecode is versioned, serialized, bounds checked, type checked, and verified
 before execution. Compile phases return diagnostics without printing or
 terminating. The CLI alone renders diagnostics and writes program output.
+
+`thp-lsp` collects `/** ... */` comments through lexer trivia and stores parsed
+documentation only in editor-owned indexes. Documentation never enters tokens,
+the AST, module interfaces, HIR, MIR, bytecode, runtime values, or reflection.
+A local `@var` hint can override hover, member completion, and receiver lookup
+after its matching assignment, but it never changes compiler diagnostics,
+typing, lowering, or generated code.
 
 `thp-embed` provides a safe in-process engine and request/response SAPI trait.
 `crates/abi/include/thp.h` exposes the version-one C embedding ABI with opaque

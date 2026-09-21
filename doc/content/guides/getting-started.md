@@ -18,7 +18,9 @@ through PHP, install into a PHP server, or provide a production web stack.
 
 Download the archive for your platform from the project's
 [GitHub Releases](https://github.com/thp-lang/thp/releases) page. Extract it and
-add the archive's `bin` directory to `PATH`.
+add the archive's `bin` directory to `PATH`. Main `v*` archives contain the
+`thp` compiler/runtime. The language server has independent `thp-lsp-v*`
+archives on the same releases page.
 
 Open a new terminal and confirm which binary will run:
 
@@ -37,8 +39,9 @@ To work from a source checkout, install Rust 1.88 or newer and build the CLI
 crate from the repository root:
 
 ```sh
-cargo build --release -p thp-cli
+cargo build --release -p thp-cli -p thp-lsp
 target/release/thp --version
+target/release/thp-lsp --version
 ```
 
 During compiler development, `cargo run` can build and invoke the same CLI in
@@ -191,10 +194,12 @@ thp run --opcache=.thp-cache --metrics=human hello.thp
 thp cache-prune --opcache=.thp-cache --max-bytes=268435456
 ```
 
-Project deployments can warm a complete linked artifact and then run it
-without scanning mapped source directories:
+Project deployments first lock resolved configuration and package mappings,
+then warm a complete linked artifact and run it without scanning mapped source
+directories:
 
 ```sh
+thp lock --project=examples/project
 thp cache-warm --project=examples/project --opcache=.thp-cache main.thp
 thp run --frozen --project=examples/project --opcache=.thp-cache main.thp
 ```

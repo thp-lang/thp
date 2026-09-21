@@ -8,8 +8,9 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId, MethodSlot,
-    NominalKind, ParameterMetadata, PropertyId, Type, TypeParameter,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId,
+    MAX_CONSTANT_NESTING, MethodSlot, NominalKind, ParameterMetadata, PropertyId, Type,
+    TypeParameter,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
@@ -196,6 +197,15 @@ pub enum InstructionKind {
         arguments: Vec<Register>,
     },
     NewObject(ClassId),
+    NewDynamic {
+        target: Register,
+        type_arguments: Vec<Type>,
+        arguments: Vec<DynamicArgument>,
+    },
+    CheckedNarrow {
+        value: Register,
+        narrowed: Type,
+    },
     GetProperty {
         object: Register,
         property: PropertyId,
@@ -225,6 +235,13 @@ pub enum InstructionKind {
     RaiseUnhandledMatch(Register),
     Phi(Vec<(BlockId, Register)>),
     Print(Register),
+}
+
+#[derive(Clone, Debug)]
+pub struct DynamicArgument {
+    pub name: Option<String>,
+    pub value: Register,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -475,6 +492,28 @@ fn lower_instruction(instruction: &thp_mir::InstructionKind) -> InstructionKind 
             arguments: arguments.clone(),
         },
         thp_mir::InstructionKind::NewObject(class) => InstructionKind::NewObject(*class),
+        thp_mir::InstructionKind::NewDynamic {
+            target,
+            type_arguments,
+            arguments,
+        } => InstructionKind::NewDynamic {
+            target: *target,
+            type_arguments: type_arguments.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| DynamicArgument {
+                    name: argument.name.clone(),
+                    value: argument.value,
+                    span: argument.span,
+                })
+                .collect(),
+        },
+        thp_mir::InstructionKind::CheckedNarrow { value, narrowed } => {
+            InstructionKind::CheckedNarrow {
+                value: *value,
+                narrowed: narrowed.clone(),
+            }
+        }
         thp_mir::InstructionKind::GetProperty { object, property } => {
             InstructionKind::GetProperty {
                 object: *object,
@@ -788,10 +827,10 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                         .get(origin.0 as usize)
                         .is_none_or(|origin| origin.kind != NominalKind::Trait)
                 })
-                || property
-                    .default
-                    .as_ref()
-                    .is_some_and(|value| !constant_matches_type(program, value, &property.ty))
+                || property.default.as_ref().is_some_and(|value| {
+                    !constant_value_within_nesting_limit(value, 0)
+                        || !constant_matches_type(program, value, &property.ty)
+                })
             {
                 return Err(global_error(format!(
                     "{} has invalid property metadata",
@@ -953,10 +992,10 @@ fn parameter_metadata_valid(program: &Program, parameters: &[ParameterMetadata])
             && (!parameter.variadic || index + 1 == parameters.len())
             && (!parameter.variadic || parameter.default.is_none())
             && verify_encoded_type(program, &parameter.ty).is_ok()
-            && parameter
-                .default
-                .as_ref()
-                .is_none_or(|value| constant_matches_type(program, value, &parameter.ty))
+            && parameter.default.as_ref().is_none_or(|value| {
+                constant_value_within_nesting_limit(value, 0)
+                    && constant_matches_type(program, value, &parameter.ty)
+            })
     })
 }
 
@@ -2217,6 +2256,41 @@ fn verify_instruction(
                 return Err(error("allocated object type does not match its class"));
             }
         }
+        InstructionKind::NewDynamic {
+            target,
+            type_arguments,
+            arguments,
+        } => {
+            check_register(function, *target, block, Some(index))?;
+            if function.register_types[target.0 as usize] != Type::String {
+                return Err(error("dynamic class target is not string"));
+            }
+            for ty in type_arguments {
+                verify_encoded_type(program, ty)?;
+                if contains_void(ty) {
+                    return Err(error("dynamic generic argument contains void"));
+                }
+            }
+            for argument in arguments {
+                check_register(function, argument.value, block, Some(index))?;
+                if argument.name.as_ref().is_some_and(String::is_empty) {
+                    return Err(error("dynamic argument name is empty"));
+                }
+            }
+            if instruction.ty.as_ref() != Some(&Type::Mixed) {
+                return Err(error("dynamic construction result is not mixed"));
+            }
+        }
+        InstructionKind::CheckedNarrow { value, narrowed } => {
+            check_register(function, *value, block, Some(index))?;
+            verify_encoded_type(program, narrowed)?;
+            let source = &function.register_types[value.0 as usize];
+            if !valid_checked_narrow(program, source, narrowed)
+                || instruction.ty.as_ref() != Some(narrowed)
+            {
+                return Err(error("invalid checked narrowing target"));
+            }
+        }
         InstructionKind::GetProperty { object, property } => {
             check_register(function, *object, block, Some(index))?;
             let receiver_type = &function.register_types[object.0 as usize];
@@ -2637,6 +2711,21 @@ fn verify_builtin_call(
             .ok_or_else(|| format!("builtin requires a {expected} receiver"))
     };
     match builtin {
+        Builtin::IsString
+        | Builtin::IsInt
+        | Builtin::IsFloat
+        | Builtin::IsNull
+        | Builtin::IsNumeric
+        | Builtin::IsVector
+        | Builtin::IsMap => {
+            if arguments.len() != 1
+                || argument_type(0) == &Type::Void
+                || result != Some(&Type::Bool)
+            {
+                return Err("invalid type-guard signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::Count => {
             if arguments.len() != 1 {
                 return Err("`count` requires one argument".to_owned());
@@ -3076,6 +3165,67 @@ fn constant_type(constant: &Constant) -> Type {
     }
 }
 
+fn constant_value_within_nesting_limit(value: &ConstantValue, depth: usize) -> bool {
+    match value {
+        ConstantValue::Vector(values) => {
+            depth < MAX_CONSTANT_NESTING
+                && values
+                    .iter()
+                    .all(|value| constant_value_within_nesting_limit(value, depth + 1))
+        }
+        ConstantValue::Map(entries) => {
+            depth < MAX_CONSTANT_NESTING
+                && entries.iter().all(|(key, value)| {
+                    constant_value_within_nesting_limit(key, depth + 1)
+                        && constant_value_within_nesting_limit(value, depth + 1)
+                })
+        }
+        _ => true,
+    }
+}
+
+fn valid_checked_narrow(program: &Program, source: &Type, narrowed: &Type) -> bool {
+    let canonical = matches!(
+        narrowed,
+        Type::String | Type::Int | Type::Float | Type::Null
+    ) || matches!(
+        narrowed,
+        Type::Vector(element) if element.as_ref() == &Type::Mixed
+    ) || matches!(
+        narrowed,
+        Type::Map(key, value)
+            if key.as_ref() == &Type::Mixed && value.as_ref() == &Type::Mixed
+    ) || matches!(
+        narrowed,
+        Type::Union(members) if members.as_slice() == [Type::Int, Type::Float, Type::String]
+    ) || matches!(
+        narrowed,
+        Type::Object(name)
+            if class_by_name(program, name).is_some_and(|class| {
+                class.type_parameters.is_empty()
+                    && matches!(class.kind, NominalKind::Class | NominalKind::Interface)
+            })
+    );
+    (source == &Type::Mixed || type_accepts(program, source, narrowed))
+        && (canonical
+            || (source != &Type::Mixed
+                && match narrowed {
+                    Type::String
+                    | Type::Int
+                    | Type::Float
+                    | Type::Null
+                    | Type::Vector(_)
+                    | Type::Map(_, _)
+                    | Type::Object(_)
+                    | Type::Nominal { .. }
+                    | Type::Parameter { .. } => true,
+                    Type::Union(members) => members
+                        .iter()
+                        .all(|member| valid_checked_narrow(program, source, member)),
+                    Type::Mixed | Type::Bool | Type::Void | Type::Never => false,
+                }))
+}
+
 fn global_error(message: impl Into<String>) -> VerificationError {
     VerificationError {
         function: None,
@@ -3247,6 +3397,146 @@ $descriptor = new ReflectionClass($box);
         let decoded = decode(&encode(&program)).unwrap();
         verify(&decoded).unwrap();
         assert!(decoded.classes.iter().any(|class| class.name == "Box"));
+    }
+
+    #[test]
+    fn dynamic_construction_metadata_and_instructions_round_trip() {
+        let program = compile(
+            r#"<?thp
+class Box {
+    public vector<int> $values = [1, 2];
+    public function __construct(string $name = "box", int ...$items) {}
+}
+$class: mixed = "Box";
+if (is_string($class)) { $box = new $class(name: "dynamic"); }
+"#,
+        );
+        let decoded = decode(&encode(&program)).unwrap();
+        verify(&decoded).unwrap();
+        let class = decoded
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        assert!(class.properties[0].default.is_some());
+        let constructor = class
+            .methods
+            .iter()
+            .find(|method| method.name == "__construct")
+            .unwrap();
+        assert_eq!(constructor.parameters[0].name, "name");
+        assert!(constructor.parameters[0].default.is_some());
+        assert!(constructor.parameters[1].variadic);
+        assert!(
+            decoded.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction.kind,
+                    super::InstructionKind::NewDynamic { .. }
+                ))
+        );
+
+        let mut forged = decoded.clone();
+        let destination = {
+            let instruction = forged.functions[0]
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.instructions)
+                .find(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        super::InstructionKind::CheckedNarrow { .. }
+                    )
+                })
+                .unwrap();
+            instruction.kind = super::InstructionKind::CheckedNarrow {
+                value: match &instruction.kind {
+                    super::InstructionKind::CheckedNarrow { value, .. } => *value,
+                    _ => unreachable!(),
+                },
+                narrowed: thp_hir::Type::Bool,
+            };
+            instruction.ty = Some(thp_hir::Type::Bool);
+            instruction.destination.unwrap()
+        };
+        forged.functions[0].register_types[destination.0 as usize] = thp_hir::Type::Bool;
+        assert!(verify(&forged).is_err());
+        assert!(
+            decoded.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction.kind,
+                    super::InstructionKind::CheckedNarrow { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn typed_constant_defaults_enforce_the_collection_nesting_limit() {
+        fn nested(levels: usize) -> thp_hir::ConstantValue {
+            let mut value = thp_hir::ConstantValue::Null;
+            for level in 0..levels {
+                value = if level % 2 == 0 {
+                    thp_hir::ConstantValue::Vector(vec![value])
+                } else {
+                    thp_hir::ConstantValue::Map(vec![(thp_hir::ConstantValue::Int(0), value)])
+                };
+            }
+            value
+        }
+
+        let mut program = compile(
+            "<?thp\nclass Box { public mixed $value = null; public function __construct(mixed $value = null) {} }",
+        );
+        let class = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        class.properties[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        for method in class
+            .methods
+            .iter_mut()
+            .chain(&mut class.declared_methods)
+            .filter(|method| method.name == "__construct")
+        {
+            method.parameters[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        }
+        verify(&program).unwrap();
+
+        let decoded = decode(&encode(&program)).expect("verified bytecode must round-trip");
+        verify(&decoded).unwrap();
+
+        program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap()
+            .properties[0]
+            .default = Some(nested(thp_hir::MAX_CONSTANT_NESTING + 1));
+        let error = verify(&program).unwrap_err();
+        assert!(error.message.contains("invalid property metadata"));
+
+        let class = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        class.properties[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        for method in class
+            .methods
+            .iter_mut()
+            .chain(&mut class.declared_methods)
+            .filter(|method| method.name == "__construct")
+        {
+            method.parameters[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING + 1));
+        }
+        let error = verify(&program).unwrap_err();
+        assert!(error.message.contains("invalid method metadata"));
     }
 
     #[test]

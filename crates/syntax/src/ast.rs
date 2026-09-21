@@ -316,6 +316,36 @@ pub enum TypeSyntaxKind {
     Union(Vec<TypeSyntax>),
 }
 
+impl std::fmt::Display for TypeSyntax {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            TypeSyntaxKind::Named { name, arguments } if arguments.is_empty() => {
+                formatter.write_str(name)
+            }
+            TypeSyntaxKind::Named { name, arguments } => {
+                write!(formatter, "{name}<")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{argument}")?;
+                }
+                formatter.write_str(">")
+            }
+            TypeSyntaxKind::Nullable(inner) => write!(formatter, "?{inner}"),
+            TypeSyntaxKind::Union(members) => {
+                for (index, member) in members.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str("|")?;
+                    }
+                    write!(formatter, "{member}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,
@@ -351,8 +381,7 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     New {
-        class_name: String,
-        class_span: Span,
+        target: NewTarget,
         type_arguments: Vec<TypeSyntax>,
         arguments: Vec<Argument>,
     },
@@ -389,6 +418,15 @@ pub enum ExprKind {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NewTarget {
+    Static {
+        class_name: String,
+        class_span: Span,
+    },
+    Dynamic(Box<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

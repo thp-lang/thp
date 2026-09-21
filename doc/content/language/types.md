@@ -128,6 +128,38 @@ raises `ValueError` unless the API documents a replacement policy. This keeps
 binary data lossless while making text assumptions visible at the operation
 that needs them.
 
+## Runtime type guards
+
+These reserved functions accept `mixed`, return `bool`, and narrow a local used
+directly in a positive `if` or `elseif` condition:
+
+| Guard                                                | Accepted runtime values             | Positive-branch type         |
+| ---------------------------------------------------- | ----------------------------------- | ---------------------------- |
+| [`is_string($value)`](thp:std.baseTypes.is_string)   | Any byte string                     | `string`                     |
+| [`is_int($value)`](thp:std.baseTypes.is_int)         | Integer                             | `int`                        |
+| [`is_float($value)`](thp:std.baseTypes.is_float)     | Floating-point number               | `float`                      |
+| [`is_null($value)`](thp:std.baseTypes.is_null)       | Null                                | `null`                       |
+| [`is_numeric($value)`](thp:std.baseTypes.is_numeric) | Integer, float, or numeric string   | `int` \| `float` \| `string` |
+| [`is_vector($value)`](thp:std.baseTypes.is_vector)   | Any vector                          | `vector<mixed>`              |
+| [`is_map($value)`](thp:std.baseTypes.is_map)         | Any map                             | `map<mixed, mixed>`          |
+| `$value instanceof Foo`                              | A `Foo` instance or nominal subtype | `Foo`                        |
+
+Narrowing intersects the guard type with the local's current type and ends with
+the guarded branch. Assigning the local invalidates that refinement for later
+statements, including after a nested conditional that may perform the
+assignment. Narrowing does not apply through negation, boolean composition,
+loops, early exits, or branch joins. `instanceof` narrows only to non-generic
+classes and interfaces because runtime objects erase generic arguments.
+
+A numeric string follows the documented
+[PHP numeric-string grammar](https://www.php.net/manual/en/language.types.numeric-strings.php):
+optional ASCII whitespace, an optional sign, decimal digits with an optional
+decimal point, and an optional decimal exponent with at least one exponent
+digit. At least one decimal digit is required overall.
+Hexadecimal and binary prefixes, underscores, `INF`, `NAN`, non-ASCII bytes,
+and trailing non-whitespace text are rejected. `is_numeric` never converts the
+string; after narrowing it remains a `string` member of the union.
+
 ## See also
 
 - [Variables](thp:guide.languageVariables)

@@ -2,16 +2,17 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId, MethodSlot,
-    NominalKind, ParameterMetadata, PropertyId, ReflectionBuiltin, Type, TypeParameter,
-    TypeParameterId,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId,
+    MAX_CONSTANT_NESTING, MethodSlot, NominalKind, ParameterMetadata, PropertyId,
+    ReflectionBuiltin, Type, TypeParameter, TypeParameterId,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 use crate::{
-    BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, ExceptionHandler, Function, Instruction,
-    InstructionKind, Method, NominalType, Program, Property, Terminator, verify,
+    BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, DynamicArgument, ExceptionHandler,
+    Function, Instruction, InstructionKind, Method, NominalType, Program, Property, Terminator,
+    verify,
 };
 
 const MAGIC: &[u8; 8] = b"THPBC\0\0\0";
@@ -604,6 +605,34 @@ impl Encoder {
                 self.u32(property.0);
                 self.u32(value.0);
             }
+            InstructionKind::NewDynamic {
+                target,
+                type_arguments,
+                arguments,
+            } => {
+                self.u8(27);
+                self.u32(target.0);
+                self.len(type_arguments.len());
+                for ty in type_arguments {
+                    self.ty(ty);
+                }
+                self.len(arguments.len());
+                for argument in arguments {
+                    if let Some(name) = &argument.name {
+                        self.u8(1);
+                        self.string(name);
+                    } else {
+                        self.u8(0);
+                    }
+                    self.u32(argument.value.0);
+                    self.span(argument.span);
+                }
+            }
+            InstructionKind::CheckedNarrow { value, narrowed } => {
+                self.u8(28);
+                self.u32(value.0);
+                self.ty(narrowed);
+            }
         }
     }
 
@@ -689,6 +718,13 @@ impl Encoder {
                 self.u8(23);
                 self.u8(operation as u8);
             }
+            Callee::Builtin(Builtin::IsString) => self.u8(24),
+            Callee::Builtin(Builtin::IsInt) => self.u8(25),
+            Callee::Builtin(Builtin::IsFloat) => self.u8(26),
+            Callee::Builtin(Builtin::IsNull) => self.u8(27),
+            Callee::Builtin(Builtin::IsNumeric) => self.u8(28),
+            Callee::Builtin(Builtin::IsVector) => self.u8(29),
+            Callee::Builtin(Builtin::IsMap) => self.u8(30),
         }
     }
 
@@ -807,7 +843,11 @@ impl Decoder<'_> {
         if end < start {
             return Err(self.error("source span ends before it starts"));
         }
-        Ok(Span { start, end })
+        Ok(Span {
+            start,
+            end,
+            source: None,
+        })
     }
 
     fn ty(&mut self, depth: usize) -> Result<Type, DecodeError> {
@@ -988,8 +1028,10 @@ impl Decoder<'_> {
     }
 
     fn constant_value(&mut self, depth: usize) -> Result<ConstantValue, DecodeError> {
-        if depth > 128 {
-            return Err(self.error("constant nesting exceeds 128 levels"));
+        if depth > MAX_CONSTANT_NESTING {
+            return Err(self.error(format!(
+                "constant nesting exceeds {MAX_CONSTANT_NESTING} levels"
+            )));
         }
         Ok(match self.u8()? {
             0 => ConstantValue::Int(i64::from_ne_bytes(self.u64()?.to_ne_bytes())),
@@ -1186,6 +1228,30 @@ impl Decoder<'_> {
                 property: PropertyId(self.u32()?),
                 value: Register(self.u32()?),
             },
+            27 => InstructionKind::NewDynamic {
+                target: Register(self.u32()?),
+                type_arguments: self.vector(|decoder| decoder.ty(0))?,
+                arguments: self.vector(|decoder| {
+                    let name = match decoder.u8()? {
+                        0 => None,
+                        1 => Some(decoder.string()?),
+                        tag => {
+                            return Err(
+                                decoder.error(format!("invalid optional argument-name tag {tag}"))
+                            );
+                        }
+                    };
+                    Ok(DynamicArgument {
+                        name,
+                        value: Register(decoder.u32()?),
+                        span: decoder.span()?,
+                    })
+                })?,
+            },
+            28 => InstructionKind::CheckedNarrow {
+                value: Register(self.u32()?),
+                narrowed: self.ty(0)?,
+            },
             tag => return Err(self.error(format!("unknown instruction tag {tag}"))),
         };
         Ok(Instruction {
@@ -1271,6 +1337,13 @@ impl Decoder<'_> {
                 .copied()
                 .map(|operation| Callee::Builtin(Builtin::Reflection(operation)))
                 .ok_or_else(|| self.error("unknown reflection builtin")),
+            24 => Ok(Callee::Builtin(Builtin::IsString)),
+            25 => Ok(Callee::Builtin(Builtin::IsInt)),
+            26 => Ok(Callee::Builtin(Builtin::IsFloat)),
+            27 => Ok(Callee::Builtin(Builtin::IsNull)),
+            28 => Ok(Callee::Builtin(Builtin::IsNumeric)),
+            29 => Ok(Callee::Builtin(Builtin::IsVector)),
+            30 => Ok(Callee::Builtin(Builtin::IsMap)),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }

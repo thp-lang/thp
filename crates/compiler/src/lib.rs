@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use thp_bytecode::{Program as BytecodeProgram, lower as lower_bytecode, verify};
-use thp_config::ProjectConfig;
+use thp_config::{AutoloadConfig, LOCK_FILE_NAME, LockFile, ProjectConfig};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, SourceMap, Span};
 use thp_hir::{Module as HirModule, lower_with_modules as lower_hir_with_modules};
 use thp_metrics::{Metrics, Stage};
@@ -219,13 +219,8 @@ pub fn compile_path(path: impl AsRef<Path>) -> Result<Compilation, LoadError> {
 /// Returns project configuration, discovery, or source loading failures.
 /// Language errors remain available in [`ProjectCompilation::diagnostics`].
 pub fn compile_project(request: &ProjectRequest) -> Result<ProjectCompilation, LoadError> {
-    let configuration = ProjectConfig::load(&request.project_root).map_err(|error| LoadError {
-        path: error.path.clone(),
-        message: error.to_string(),
-        metrics: Metrics::default(),
-    })?;
-    let mappings = configuration
-        .autoload()
+    let autoload = project_autoload(&request.project_root)?;
+    let mappings = autoload
         .iter()
         .map(|(prefix, directories)| AutoloadMapping::new(prefix, directories.clone()))
         .collect::<Result<Vec<_>, _>>()
@@ -236,6 +231,71 @@ pub fn compile_project(request: &ProjectRequest) -> Result<ProjectCompilation, L
         })?;
     let provider = FilesystemSourceProvider::new(&request.project_root, mappings, &request.entry);
     compile_project_with_provider(request, &provider)
+}
+
+fn project_autoload(root: &Path) -> Result<AutoloadConfig, LoadError> {
+    if root.join(LOCK_FILE_NAME).exists() {
+        LockFile::load(root)
+            .map(|lock| lock.project().autoload.clone())
+            .map_err(|error| {
+                let message = error.to_string();
+                LoadError {
+                    path: error.path,
+                    message,
+                    metrics: Metrics::default(),
+                }
+            })
+    } else {
+        ProjectConfig::load(root)
+            .map(|configuration| configuration.resolved_autoload().clone())
+            .map_err(|error| {
+                let message = error.to_string();
+                LoadError {
+                    path: error.path,
+                    message,
+                    metrics: Metrics::default(),
+                }
+            })
+    }
+}
+
+fn project_configuration_bytes(root: &Path) -> Result<Vec<u8>, LoadError> {
+    let lock_path = root.join(LOCK_FILE_NAME);
+    if lock_path.exists() {
+        LockFile::load(root).map_err(|error| {
+            let message = error.to_string();
+            LoadError {
+                path: error.path,
+                message,
+                metrics: Metrics::default(),
+            }
+        })?;
+        fs::read(&lock_path).map_err(|error| LoadError {
+            path: lock_path,
+            message: error.to_string(),
+            metrics: Metrics::default(),
+        })
+    } else {
+        let configuration = ProjectConfig::load(root).map_err(|error| {
+            let message = error.to_string();
+            LoadError {
+                path: error.path,
+                message,
+                metrics: Metrics::default(),
+            }
+        })?;
+        configuration
+            .source_fingerprint()
+            .map(String::into_bytes)
+            .map_err(|error| {
+                let message = error.to_string();
+                LoadError {
+                    path: error.path,
+                    message,
+                    metrics: Metrics::default(),
+                }
+            })
+    }
 }
 
 /// Compiles a project using a host-provided synchronous source provider.
@@ -268,6 +328,13 @@ pub fn compile_project_with_provider(
                 metrics: Metrics::default(),
             })?;
         let source_id = sources.add(source.clone());
+        let Some(source) = sources.get(source_id).cloned() else {
+            return Err(LoadError {
+                path: module.path,
+                message: "source map rejected an inserted source".to_owned(),
+                metrics,
+            });
+        };
         let lexed = metrics.measure(Stage::Lexing, || lex(&source));
         let parsed = metrics.measure(Stage::Parsing, || {
             parse_tokens(&source, lexed.tokens, lexed.diagnostics)
@@ -464,15 +531,16 @@ pub fn compile_project_with_provider(
     let lowered_hir = metrics.measure(Stage::Hir, || {
         lower_hir_with_modules(&linked_ast, &declaration_modules)
     });
-    diagnostics.extend(
-        lowered_hir
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| ProjectDiagnostic {
-                source: entry.source_id,
-                diagnostic,
-            }),
-    );
+    diagnostics.extend(lowered_hir.diagnostics.into_iter().map(|diagnostic| {
+        ProjectDiagnostic {
+            source: diagnostic
+                .labels
+                .first()
+                .and_then(|label| label.source)
+                .unwrap_or(entry.source_id),
+            diagnostic,
+        }
+    }));
     let hir = lowered_hir.module;
     if !diagnostics.is_empty() {
         return Ok(ProjectCompilation {
@@ -495,7 +563,7 @@ pub fn compile_project_with_provider(
             diagnostic: Diagnostic::error(
                 "bytecode_verification",
                 "B0001",
-                Span::empty(0),
+                Span::empty_in(entry.source_id, 0),
                 error.to_string(),
             ),
         });
@@ -527,12 +595,7 @@ pub fn cache_warm_project(
     if !compilation.is_success() {
         return Ok((compilation, None));
     }
-    let configuration =
-        fs::read(request.project_root.join("thp.toml")).map_err(|error| LoadError {
-            path: request.project_root.join("thp.toml"),
-            message: error.to_string(),
-            metrics: Metrics::default(),
-        })?;
+    let configuration = project_configuration_bytes(&request.project_root)?;
     let mut interface_hashes = compilation
         .interfaces
         .iter()
@@ -731,12 +794,7 @@ pub fn load_frozen_project(
     request: &ProjectRequest,
     store: &Store,
 ) -> Result<PreparedProject, LoadError> {
-    let configuration_path = request.project_root.join("thp.toml");
-    let configuration = fs::read(&configuration_path).map_err(|error| LoadError {
-        path: configuration_path.clone(),
-        message: error.to_string(),
-        metrics: Metrics::default(),
-    })?;
+    let configuration = project_configuration_bytes(&request.project_root)?;
     let expected_fingerprint = project_fingerprint(request, &configuration);
     let manifest = store
         .load_manifest(&manifest_key(&expected_fingerprint))
@@ -1049,6 +1107,7 @@ fn collect_declaration_modules(
 
 #[cfg(test)]
 mod tests {
+    use thp_config::build_lock;
     use thp_opcache::{CacheStatus, Store};
 
     use super::{
@@ -1168,6 +1227,120 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert!(kinds.contains(&thp_modules::DependencyKind::Import));
         assert!(kinds.contains(&thp_modules::DependencyKind::Body));
+    }
+
+    #[test]
+    fn compiles_discovered_packages_live_and_from_a_fresh_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("vendor/acme/math");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\npackages = \"vendor/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("thp.toml"),
+            "[autoload]\n\"Acme\\\\Math\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/functions.thp"),
+            "<?thp\nnamespace Acme\\Math;\nfunction answer(): int { return 42; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("main.thp"),
+            "<?thp\nuse function Acme\\Math\\answer;\necho answer();\n",
+        )
+        .unwrap();
+        let request = ProjectRequest::new(directory.path(), "main.thp");
+        assert!(compile_project(&request).unwrap().is_success());
+        build_lock(directory.path()).unwrap();
+        assert!(compile_project(&request).unwrap().is_success());
+
+        std::fs::write(
+            package.join("thp.toml"),
+            "# changed\n[autoload]\n\"Acme\\\\Math\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        assert!(
+            compile_project(&request)
+                .unwrap_err()
+                .message
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn compiler_preserves_project_and_lock_error_context() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\npackages = \"../vendor\"\n",
+        )
+        .unwrap();
+        let request = ProjectRequest::new(directory.path(), "main.thp");
+        let project_error = compile_project(&request).unwrap_err().to_string();
+
+        std::fs::write(directory.path().join("thp.toml"), "").unwrap();
+        std::fs::write(
+            directory.path().join("thp.lock"),
+            format!(
+                "THP-LOCK 1\nfingerprint {}\nprofile common\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        let lock_error = compile_project(&request).unwrap_err().to_string();
+        assert!(
+            project_error.contains(":2:1 (autoload.packages):")
+                && lock_error.contains(":3:1 (format):"),
+            "project error: {project_error}\nlock error: {lock_error}"
+        );
+    }
+
+    #[test]
+    fn frozen_project_rejects_changed_package_autoload_without_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("vendor/acme/message");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::create_dir_all(package.join("replacement")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\npackages = \"vendor/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("thp.toml"),
+            "[autoload]\n\"Acme\\\\Message\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        for (directory_name, value) in [("src", "old"), ("replacement", "new")] {
+            std::fs::write(
+                package.join(directory_name).join("Message.thp"),
+                format!(
+                    "<?thp\nnamespace Acme\\Message;\nfunction message(): string {{ return \"{value}\"; }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            directory.path().join("main.thp"),
+            "<?thp\nuse function Acme\\Message\\message;\necho message();\n",
+        )
+        .unwrap();
+        let request = ProjectRequest::new(directory.path(), "main.thp");
+        let store = Store::new(directory.path().join("cache"));
+        assert!(cache_warm_project(&request, &store).unwrap().0.is_success());
+
+        std::fs::write(
+            package.join("thp.toml"),
+            "[autoload]\n\"Acme\\\\Message\\\\\" = \"replacement/\"\n",
+        )
+        .unwrap();
+        assert!(compile_project(&request).unwrap().is_success());
+        assert!(load_frozen_project(&request, &store).is_err());
     }
 
     #[test]
@@ -1393,5 +1566,47 @@ class Box<T extends Right> {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn project_hir_and_diagnostics_retain_their_source_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\n\"App\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        let library = directory.path().join("src/Broken.thp");
+        std::fs::write(
+            &library,
+            "<?thp\nnamespace App;\nfunction broken(): int { return \"no\"; }\n",
+        )
+        .unwrap();
+        let entry = directory.path().join("main.thp");
+        std::fs::write(&entry, "<?thp\necho \"entry\";\n").unwrap();
+
+        let compilation = compile_project(&ProjectRequest::new(directory.path(), &entry)).unwrap();
+        let library_id = compilation
+            .units
+            .iter()
+            .find(|unit| unit.source.path() == library)
+            .unwrap()
+            .source_id;
+        assert!(
+            compilation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.source == library_id)
+        );
+        let function = compilation
+            .hir
+            .as_ref()
+            .unwrap()
+            .functions
+            .iter()
+            .find(|function| function.name == "App\\broken")
+            .unwrap();
+        assert_eq!(function.span.source, Some(library_id));
     }
 }

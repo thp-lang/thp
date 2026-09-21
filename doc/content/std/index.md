@@ -8,8 +8,8 @@ order: 0
 status: experimental
 availability: proposed
 notice:
-  This section defines THP's intended library contracts. Async, autoloading, Base,
-  SPL, and typed collections are not presented as available runtime APIs in this
+  This section defines THP's intended library contracts. Async, Base, SPL, and
+  typed collections are not presented as available runtime APIs in this
   documentation checkout.
 ---
 
@@ -31,20 +31,6 @@ custom scheduler implementations. [`delay()`](thp:std.async.delay) and
 [`suspend()`](thp:std.async.suspend) yield cooperatively; [`timeout()`](thp:std.async.timeout)
 limits an outstanding wait.
 
-## Autoloading
-
-[Autoloading](thp:std.dataStructures) defines a PHP-inspired, process-wide queue of
-callbacks that load type declarations on demand. Use
-[`spl_autoload_register()`](thp:std.spl.spl_autoload_register) and
-[`spl_autoload_unregister()`](thp:std.spl.spl_autoload_unregister) to
-manage loaders,
-[`spl_autoload_functions()`](thp:std.spl.spl_autoload_functions) to inspect
-them, and [`spl_autoload_call()`](thp:std.spl.spl_autoload_call) to start a
-lookup explicitly.
-
-The section also documents the configurable
-[`spl_autoload()`](thp:std.spl.spl_autoload) default loader.
-
 ## PHP-inspired library categories
 
 [`Exceptions`](thp:std.exceptions) documents the proposed exception
@@ -52,7 +38,7 @@ hierarchy. [`Iterators`](thp:std.iterators) covers adapters and recursive
 traversal. [`Filesystem`](thp:std.filesystem) documents filesystem metadata,
 files, temporary files, and locking results.
 [`Data structures`](thp:std.dataStructures) contains generic containers,
-observer contracts, autoloading, and object utilities.
+observer contracts, and object utilities.
 
 ## Streams
 

@@ -46,9 +46,11 @@ Project cache warming uses separate artifacts:
 
 The manifest is published last. Frozen execution validates project and format
 identity, configuration, entry selection, referenced artifacts, and the linked
-program without scanning mapped source directories.
+program without scanning mapped source directories. Deployment preparation
+generates the configuration lock before warming those artifacts.
 
 ```console
+thp lock --project=.
 thp cache-warm --project=. --opcache=.thp-cache main.thp
 thp run --project=. --frozen --opcache=.thp-cache main.thp
 ```

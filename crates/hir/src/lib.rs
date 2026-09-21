@@ -8,8 +8,9 @@ use std::fmt;
 use thp_diagnostics::{Diagnostic, Span};
 use thp_syntax::{
     Argument, BinaryOp, Block, Expr, ExprKind, ForClause, ForClauseKind, FunctionDecl, MatchArm,
-    MethodDecl, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitUse,
-    TypeParameterDecl as SyntaxTypeParameter, TypeSyntax, TypeSyntaxKind, UnaryOp, Visibility,
+    MethodDecl, NewTarget, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation,
+    TraitUse, TypeParameterDecl as SyntaxTypeParameter, TypeSyntax, TypeSyntaxKind, UnaryOp,
+    Visibility,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -214,6 +215,13 @@ pub enum Builtin {
     ExceptionGetSystemCode,
     ExceptionGetSuppressed,
     Reflection(ReflectionBuiltin),
+    IsString,
+    IsInt,
+    IsFloat,
+    IsNull,
+    IsNumeric,
+    IsVector,
+    IsMap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,6 +470,8 @@ pub struct Method {
     pub span: Span,
 }
 
+pub const MAX_CONSTANT_NESTING: usize = 128;
+
 impl Module {
     pub fn function(&self, id: FunctionId) -> &Function {
         &self.functions[id.0 as usize]
@@ -472,6 +482,31 @@ impl Module {
             .iter()
             .map(|function| count_expressions(&function.body))
             .sum()
+    }
+
+    /// Reports nominal inheritance using the resolved class graph retained in HIR.
+    pub fn is_nominal_subtype(&self, actual: &str, expected: &str) -> bool {
+        fn visit(
+            module: &Module,
+            actual: &str,
+            expected: &str,
+            seen: &mut BTreeSet<String>,
+        ) -> bool {
+            if actual == expected {
+                return true;
+            }
+            let Some(class) = module.classes.iter().find(|class| class.name == actual) else {
+                return false;
+            };
+            seen.insert(actual.to_owned())
+                && class
+                    .parent
+                    .iter()
+                    .chain(&class.interfaces)
+                    .any(|parent| visit(module, parent, expected, seen))
+        }
+
+        visit(self, actual, expected, &mut BTreeSet::new())
     }
 }
 
@@ -655,6 +690,15 @@ pub enum TypedExprKind {
         initializers: Vec<(PropertyId, TypedExpr)>,
         arguments: BoundArguments,
     },
+    DynamicNew {
+        target: Box<TypedExpr>,
+        type_arguments: Vec<Type>,
+        arguments: Vec<DynamicArgument>,
+    },
+    CheckedNarrow {
+        value: Box<TypedExpr>,
+        narrowed: Type,
+    },
     Property {
         object: Box<TypedExpr>,
         property: PropertyId,
@@ -667,6 +711,13 @@ pub enum TypedExprKind {
         subject: Box<TypedExpr>,
         arms: Vec<TypedMatchArm>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct DynamicArgument {
+    pub name: Option<String>,
+    pub value: TypedExpr,
+    pub span: Span,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -794,6 +845,15 @@ pub fn lower_with_modules(
     declaration_modules: &BTreeMap<String, String>,
 ) -> LowerOutput {
     TypeChecker::new(program, declaration_modules).lower(program)
+}
+
+/// Lowers a linked project whose syntax spans already carry their [`SourceId`]
+/// provenance. Declarations, callables, locals, expressions, and diagnostics
+/// retain those source-qualified spans in the resulting HIR.
+///
+/// [`SourceId`]: thp_diagnostics::SourceId
+pub fn lower_project(program: &Program) -> LowerOutput {
+    lower(program)
 }
 
 struct TypeChecker {
@@ -1419,6 +1479,18 @@ impl TypeChecker {
                     &mut self.diagnostics,
                 )
                 .unwrap_or(Type::Mixed);
+                if let Some(initializer) = &property.initializer
+                    && exceeds_constant_nesting_limit(initializer, 0)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0311",
+                        initializer.span,
+                        format!(
+                            "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                        ),
+                    ));
+                }
                 properties.push(Property {
                     id: PropertyId(
                         u32::try_from(properties.len())
@@ -2268,6 +2340,7 @@ struct FunctionChecker<'signatures, 'diagnostics> {
     owner: Option<ClassId>,
     static_method: bool,
     type_parameters: BTreeMap<String, Type>,
+    narrowed: HashMap<LocalId, Type>,
 }
 
 impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
@@ -2306,6 +2379,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             owner,
             static_method,
             type_parameters,
+            narrowed: HashMap::new(),
         }
     }
 
@@ -2417,6 +2491,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     let expected = self.locals[id.0 as usize].ty.clone();
                     let value = self.lower_expression(value, Some(&expected))?;
                     self.expect_type(&expected, &value.ty, value.span);
+                    self.narrowed.remove(&id);
                     StatementKind::Assign {
                         local: id,
                         value,
@@ -2476,19 +2551,49 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 branches,
                 otherwise,
             } => {
-                let branches = branches
-                    .iter()
-                    .filter_map(|(condition, body)| {
-                        let condition = self.lower_expression(condition, Some(&Type::Bool))?;
-                        self.expect_type(&Type::Bool, &condition.ty, condition.span);
-                        Some((condition, self.lower_block(body)))
-                    })
-                    .collect();
+                let entry_narrowed = self.narrowed.clone();
+                let mut exits = Vec::with_capacity(branches.len() + 1);
+                let mut lowered = Vec::new();
+                for (condition, body) in branches {
+                    self.narrowed.clone_from(&entry_narrowed);
+                    let Some(typed_condition) = self.lower_expression(condition, Some(&Type::Bool))
+                    else {
+                        continue;
+                    };
+                    self.expect_type(&Type::Bool, &typed_condition.ty, typed_condition.span);
+                    let refinement = self.positive_refinement(condition);
+                    let previous = refinement
+                        .as_ref()
+                        .and_then(|(local, _)| self.narrowed.get(local).cloned());
+                    if let Some((local, ty)) = refinement.clone() {
+                        self.narrowed.insert(local, ty);
+                    }
+                    let typed_body = self.lower_block(body);
+                    if let Some((local, narrowed)) = refinement
+                        && self.narrowed.get(&local) == Some(&narrowed)
+                    {
+                        match previous {
+                            Some(previous) => {
+                                self.narrowed.insert(local, previous);
+                            }
+                            None => {
+                                self.narrowed.remove(&local);
+                            }
+                        }
+                    }
+                    exits.push(self.narrowed.clone());
+                    lowered.push((typed_condition, typed_body));
+                }
+                self.narrowed.clone_from(&entry_narrowed);
                 let otherwise = otherwise
                     .as_ref()
                     .map_or_else(Vec::new, |body| self.lower_block(body));
+                exits.push(self.narrowed.clone());
+                self.narrowed = entry_narrowed;
+                self.narrowed
+                    .retain(|local, ty| exits.iter().all(|exit| exit.get(local) == Some(ty)));
                 StatementKind::If {
-                    branches,
+                    branches: lowered,
                     otherwise,
                 }
             }
@@ -2988,10 +3093,22 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
-                (
-                    TypedExprKind::Local(id),
-                    self.locals[id.0 as usize].ty.clone(),
-                )
+                let declared = self.locals[id.0 as usize].ty.clone();
+                if let Some(narrowed) = self.narrowed.get(&id).cloned() {
+                    (
+                        TypedExprKind::CheckedNarrow {
+                            value: Box::new(TypedExpr {
+                                kind: TypedExprKind::Local(id),
+                                ty: declared,
+                                span: expression.span,
+                            }),
+                            narrowed: narrowed.clone(),
+                        },
+                        narrowed,
+                    )
+                } else {
+                    (TypedExprKind::Local(id), declared)
+                }
             }
             ExprKind::Name(name) => {
                 self.diagnostics.push(Diagnostic::error(
@@ -3174,11 +3291,67 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 )
             }
             ExprKind::New {
-                class_name,
-                class_span,
+                target,
                 type_arguments,
                 arguments,
             } => {
+                let NewTarget::Static {
+                    class_name,
+                    class_span,
+                } = target
+                else {
+                    let NewTarget::Dynamic(target) = target else {
+                        unreachable!()
+                    };
+                    let target = self.lower_expression(target, Some(&Type::String))?;
+                    if target.ty != Type::String {
+                        let mut diagnostic = Diagnostic::error(
+                            "typing",
+                            "T0415",
+                            target.span,
+                            format!(
+                                "dynamic class target must be `string`, found `{}`",
+                                target.ty
+                            ),
+                        );
+                        if target.ty == Type::Mixed {
+                            diagnostic = diagnostic.with_note(
+                                "narrow the value with `is_string($value)` before dynamic construction",
+                            );
+                        }
+                        self.diagnostics.push(diagnostic);
+                    }
+                    let type_arguments = type_arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            resolve_type(
+                                argument,
+                                self.classes,
+                                &self.type_parameters,
+                                self.diagnostics,
+                            )
+                        })
+                        .collect();
+                    let arguments = arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            Some(DynamicArgument {
+                                name: argument.name.clone(),
+                                value: self.lower_expression(&argument.value, None)?,
+                                span: argument.span,
+                            })
+                        })
+                        .collect();
+                    return Some(TypedExpr {
+                        kind: TypedExprKind::DynamicNew {
+                            target: Box::new(target),
+                            type_arguments,
+                            arguments,
+                        },
+                        ty: Type::Mixed,
+                        span: expression.span,
+                    });
+                };
                 let Some(class) = self.classes.get(class_name).cloned() else {
                     self.diagnostics.push(Diagnostic::error(
                         "name_resolution",
@@ -3281,6 +3454,13 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         .expect("constructor id has a method signature")
                         .clone();
                     instantiate_method_signature(&mut method, &instance_type, self.classes);
+                    self.check_member_access(
+                        method.declaring_class,
+                        method.visibility,
+                        *class_span,
+                        "constructor",
+                        "__construct",
+                    );
                     self.bind_arguments(
                         "__construct",
                         arguments,
@@ -3788,7 +3968,73 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         })
     }
 
+    fn positive_refinement(&self, condition: &Expr) -> Option<(LocalId, Type)> {
+        let (name, guard) = match &condition.kind {
+            ExprKind::Call { callee, arguments } if arguments.len() == 1 => {
+                let ExprKind::Name(name) = &callee.kind else {
+                    return None;
+                };
+                let ExprKind::Variable(variable) = &arguments[0].value.kind else {
+                    return None;
+                };
+                let guard = match name.as_str() {
+                    "is_string" => Type::String,
+                    "is_int" => Type::Int,
+                    "is_float" => Type::Float,
+                    "is_null" => Type::Null,
+                    "is_numeric" => Type::Union(vec![Type::Int, Type::Float, Type::String]),
+                    "is_vector" => Type::Vector(Box::new(Type::Mixed)),
+                    "is_map" => Type::Map(Box::new(Type::Mixed), Box::new(Type::Mixed)),
+                    _ => return None,
+                };
+                (variable, guard)
+            }
+            ExprKind::InstanceOf {
+                value, class_name, ..
+            } => {
+                let ExprKind::Variable(variable) = &value.kind else {
+                    return None;
+                };
+                let class = self.classes.get(class_name)?;
+                if !class.type_parameters.is_empty()
+                    || !matches!(class.kind, NominalKind::Class | NominalKind::Interface)
+                {
+                    return None;
+                }
+                (variable, Type::Object(class_name.clone()))
+            }
+            _ => return None,
+        };
+        let local = *self.names.get(name)?;
+        let current = self
+            .narrowed
+            .get(&local)
+            .unwrap_or(&self.locals[local.0 as usize].ty);
+        intersect_narrow(current, &guard, self.classes).map(|ty| (local, ty))
+    }
+
     fn lower_call(&mut self, name: &str, arguments: &[Argument], span: Span) -> Option<TypedExpr> {
+        let guard = match name {
+            "is_string" => Some(Builtin::IsString),
+            "is_int" => Some(Builtin::IsInt),
+            "is_float" => Some(Builtin::IsFloat),
+            "is_null" => Some(Builtin::IsNull),
+            "is_numeric" => Some(Builtin::IsNumeric),
+            "is_vector" => Some(Builtin::IsVector),
+            "is_map" => Some(Builtin::IsMap),
+            _ => None,
+        };
+        if let Some(callee) = guard {
+            let parameters = vec![native_parameter("value", Type::Mixed, None, span)];
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(callee),
+                    arguments: self.bind_arguments(name, arguments, &parameters, span),
+                },
+                ty: Type::Bool,
+                span,
+            });
+        }
         if name == "var_dump" {
             let mut explicit = Vec::new();
             for (index, argument) in arguments.iter().enumerate() {
@@ -4556,6 +4802,18 @@ fn resolve_parameters(
                     "a required parameter cannot follow a parameter with a default",
                 ));
             }
+            if let Some(default) = &parameter.default
+                && exceeds_constant_nesting_limit(default, 0)
+            {
+                diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0311",
+                    default.span,
+                    format!(
+                        "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                    ),
+                ));
+            }
             ParameterSignature {
                 name: parameter.name.clone(),
                 ty: if parameter.variadic {
@@ -4602,11 +4860,100 @@ fn is_default_constant(expression: &Expr) -> bool {
     }
 }
 
+fn exceeds_constant_nesting_limit(expression: &Expr, depth: usize) -> bool {
+    match &expression.kind {
+        ExprKind::Vector(values) => {
+            depth >= MAX_CONSTANT_NESTING
+                || values
+                    .iter()
+                    .any(|value| exceeds_constant_nesting_limit(value, depth + 1))
+        }
+        ExprKind::Map(entries) => {
+            depth >= MAX_CONSTANT_NESTING
+                || entries.iter().any(|entry| {
+                    exceeds_constant_nesting_limit(&entry.key, depth + 1)
+                        || exceeds_constant_nesting_limit(&entry.value, depth + 1)
+                })
+        }
+        ExprKind::Unary { operand, .. } => exceeds_constant_nesting_limit(operand, depth),
+        _ => false,
+    }
+}
+
+fn constant_value(expression: &Expr) -> Option<ConstantValue> {
+    match &expression.kind {
+        ExprKind::Integer(value) => Some(ConstantValue::Int(*value)),
+        ExprKind::Float(value) => Some(ConstantValue::Float(*value)),
+        ExprKind::Bool(value) => Some(ConstantValue::Bool(*value)),
+        ExprKind::Null => Some(ConstantValue::Null),
+        ExprKind::String(value) => Some(ConstantValue::String(value.clone())),
+        ExprKind::Vector(values) => Some(ConstantValue::Vector(
+            values.iter().map(constant_value).collect::<Option<_>>()?,
+        )),
+        ExprKind::Map(entries) => Some(ConstantValue::Map(
+            entries
+                .iter()
+                .map(|entry| Some((constant_value(&entry.key)?, constant_value(&entry.value)?)))
+                .collect::<Option<_>>()?,
+        )),
+        ExprKind::Unary { op, operand } => match (op, constant_value(operand)?) {
+            (UnaryOp::Negate, ConstantValue::Int(value)) => {
+                Some(ConstantValue::Int(value.checked_neg()?))
+            }
+            (UnaryOp::Negate, ConstantValue::Float(value)) => Some(ConstantValue::Float(-value)),
+            (UnaryOp::Not, ConstantValue::Bool(value)) => Some(ConstantValue::Bool(!value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn types_overlap(left: &Type, right: &Type, classes: &BTreeMap<String, ClassSignature>) -> bool {
     left == &Type::Mixed
         || right == &Type::Mixed
         || type_accepts(left, right, classes)
         || type_accepts(right, left, classes)
+}
+
+fn intersect_narrow(
+    current: &Type,
+    guard: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Option<Type> {
+    if current == &Type::Mixed {
+        return Some(guard.clone());
+    }
+    if let Type::Union(members) = current {
+        let narrowed = members
+            .iter()
+            .filter_map(|member| intersect_narrow(member, guard, classes))
+            .collect::<Vec<_>>();
+        return match narrowed.as_slice() {
+            [] => None,
+            [member] => Some(member.clone()),
+            _ => Some(Type::Union(narrowed)),
+        };
+    }
+    if let Type::Union(members) = guard {
+        return members
+            .iter()
+            .find_map(|member| intersect_narrow(current, member, classes));
+    }
+    if matches!((current, guard),
+        (Type::Vector(_), Type::Vector(element)) if element.as_ref() == &Type::Mixed
+    ) || matches!((current, guard),
+        (Type::Map(_, _), Type::Map(key, value))
+            if key.as_ref() == &Type::Mixed && value.as_ref() == &Type::Mixed
+    ) {
+        return Some(current.clone());
+    }
+    if type_accepts(guard, current, classes) {
+        Some(current.clone())
+    } else if type_accepts(current, guard, classes) {
+        Some(guard.clone())
+    } else {
+        None
+    }
 }
 
 fn type_accepts(
@@ -6551,35 +6898,6 @@ fn method_metadata(
     }
 }
 
-fn constant_value(expression: &Expr) -> Option<ConstantValue> {
-    match &expression.kind {
-        ExprKind::Integer(value) => Some(ConstantValue::Int(*value)),
-        ExprKind::Float(value) => Some(ConstantValue::Float(*value)),
-        ExprKind::Bool(value) => Some(ConstantValue::Bool(*value)),
-        ExprKind::Null => Some(ConstantValue::Null),
-        ExprKind::String(value) => Some(ConstantValue::String(value.clone())),
-        ExprKind::Vector(values) => values
-            .iter()
-            .map(constant_value)
-            .collect::<Option<Vec<_>>>()
-            .map(ConstantValue::Vector),
-        ExprKind::Map(entries) => entries
-            .iter()
-            .map(|entry| Some((constant_value(&entry.key)?, constant_value(&entry.value)?)))
-            .collect::<Option<Vec<_>>>()
-            .map(ConstantValue::Map),
-        ExprKind::Unary {
-            op: UnaryOp::Negate,
-            operand,
-        } => match constant_value(operand)? {
-            ConstantValue::Int(value) => value.checked_neg().map(ConstantValue::Int),
-            ConstantValue::Float(value) => Some(ConstantValue::Float(-value)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 const fn nominal_kind_name(kind: NominalKind) -> &'static str {
     match kind {
         NominalKind::Class => "class",
@@ -6796,8 +7114,19 @@ fn count_expression(expression: &TypedExpr) -> usize {
                 .sum::<usize>()
                 + count_bound_arguments(arguments)
         }
+        TypedExprKind::DynamicNew {
+            target, arguments, ..
+        } => {
+            count_expression(target)
+                + arguments
+                    .iter()
+                    .map(|argument| count_expression(&argument.value))
+                    .sum::<usize>()
+        }
+        TypedExprKind::CheckedNarrow { value, .. } | TypedExprKind::InstanceOf { value, .. } => {
+            count_expression(value)
+        }
         TypedExprKind::Property { object, .. } => count_expression(object),
-        TypedExprKind::InstanceOf { value, .. } => count_expression(value),
         TypedExprKind::Match { subject, arms } => {
             count_expression(subject)
                 + arms
@@ -6842,10 +7171,10 @@ fn count_loop_clause(clause: &LoopClause) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use thp_diagnostics::SourceFile;
-    use thp_syntax::parse;
+    use thp_diagnostics::{SourceFile, Span};
+    use thp_syntax::{Expr, ExprKind, StmtKind, parse};
 
-    use super::{Type, lower};
+    use super::{MAX_CONSTANT_NESTING, Type, lower};
 
     fn typecheck(source: &str) -> super::LowerOutput {
         let source = SourceFile::new("test.thp", source);
@@ -6860,6 +7189,78 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect()
+    }
+
+    fn check_default_nesting(levels: usize) -> (Vec<thp_diagnostics::Diagnostic>, Span, Span) {
+        let source = SourceFile::new(
+            "test.thp",
+            "<?thp\nclass Box { public mixed $value = null; }\nfunction example(mixed $value = true): void {}",
+        );
+        let mut parsed = parse(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut property_span = None;
+        let mut parameter_span = None;
+        for statement in &mut parsed.program.statements {
+            let default = match &mut statement.kind {
+                StmtKind::Class(class) => {
+                    let default = class.properties[0].initializer.as_mut().unwrap();
+                    property_span = Some(default.span);
+                    default
+                }
+                StmtKind::Function(function) => {
+                    let default = function.parameters[0].default.as_mut().unwrap();
+                    parameter_span = Some(default.span);
+                    default
+                }
+                _ => continue,
+            };
+            for _ in 0..levels {
+                let span = default.span;
+                let value = std::mem::replace(
+                    default,
+                    Expr {
+                        kind: ExprKind::Null,
+                        span,
+                    },
+                );
+                *default = Expr {
+                    kind: ExprKind::Vector(vec![value]),
+                    span,
+                };
+            }
+        }
+        let mut checker =
+            super::TypeChecker::new(&parsed.program, &std::collections::BTreeMap::new());
+        checker.collect_nominal_names(&parsed.program);
+        checker.collect_signatures(&parsed.program);
+        (
+            checker.diagnostics,
+            property_span.unwrap(),
+            parameter_span.unwrap(),
+        )
+    }
+
+    #[test]
+    fn typed_constant_defaults_enforce_the_collection_nesting_limit() {
+        let (accepted, _, _) = check_default_nesting(MAX_CONSTANT_NESTING);
+        assert!(accepted.is_empty(), "{accepted:?}");
+
+        let (rejected, property_span, parameter_span) =
+            check_default_nesting(MAX_CONSTANT_NESTING + 1);
+        let diagnostics = rejected
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "T0311")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.message == "typed constant defaults may nest at most 128 collection levels"
+        }));
+        let locations = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.labels[0].span)
+            .collect::<Vec<_>>();
+        assert!(locations.contains(&property_span));
+        assert!(locations.contains(&parameter_span));
     }
 
     #[test]
@@ -7272,5 +7673,23 @@ using ($plain = new Plain()) {}
         assert!(codes.contains(&"T0008"));
         assert!(codes.contains(&"T0451"));
         assert!(codes.contains(&"T0601"));
+    }
+
+    #[test]
+    fn dynamic_new_requires_direct_string_narrowing_and_restores_types() {
+        let codes = diagnostic_codes(
+            r#"<?thp
+class Item { private function __construct() {} public final function value(): string { return "ok"; } }
+$class: mixed = "Item";
+if (is_string($class)) { $item = new $class(); }
+$outside = new $class();
+if (is_string($class) && true) { $composed = new $class(); }
+$number: int = 1;
+$invalid = new $number();
+$static = new Item();
+"#,
+        );
+        assert_eq!(codes.iter().filter(|code| **code == "T0415").count(), 3);
+        assert!(codes.contains(&"T0414"));
     }
 }

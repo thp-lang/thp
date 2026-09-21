@@ -58,7 +58,8 @@ classes are flattened with parent slots first, then composed-trait properties,
 then class properties.
 Inherited slots keep their index. Constant defaults for all flattened
 properties run before the effective constructor, and reading a property that
-was never initialized is a runtime error.
+was never initialized is a runtime error. Property defaults may nest at most
+128 vector or map levels.
 
 ## Interfaces and inheritance
 
@@ -181,6 +182,38 @@ same exact type. Defaults, omitted arguments, unions, subtype conversion,
 assignment context, and return context do not infer arguments; an
 underdetermined or conflicting call must provide explicit arguments.
 
+## Dynamic construction
+
+`new $class(...)` and `new (expression)<T, U>(...)` resolve a class at runtime.
+The target expression must have the narrowed static type `string`; it is
+evaluated once, followed by each explicit argument once in source order. The
+result type is always `mixed`.
+
+```thp
+$class: mixed = "App\\Service\\Worker";
+if (is_string($class)) {
+    $worker = new $class<string>(name: "queue");
+    if ($worker instanceof Worker) {
+        $worker->run();
+    }
+}
+```
+
+Lookup is exact, case-sensitive, and uses the compiled program's canonical
+class names. It does not apply the caller's namespace, normalize a leading
+backslash, load source files, autoload, invoke callbacks, or use reflection.
+Interfaces, traits, abstract classes, native classes, unknown names, and
+inaccessible constructors fail with `Error`; invalid UTF-8 names fail with
+`ValueError`. Runtime argument mismatches are type errors.
+
+Explicit generic arguments are checked after lookup. Missing trailing
+arguments become `mixed`, excess arguments fail, and every declared bound must
+still be satisfied. Constructor defaults, names, variadics, visibility,
+inheritance, and property defaults use the same rules as static construction.
+Collections used as defaults are freshly materialized for each object. Because
+object generic arguments are erased, a parameterized runtime compatibility
+check that cannot be proved fails safely.
+
 Named static access to a generic class is explicit, as in
 `Box<int>::make(1)`. Inside a generic class, `self`, `parent`, and `static`
 retain the lexical instantiation. Runtime objects retain their concrete generic
@@ -210,7 +243,8 @@ method without an object. Constructors are selected from the effective class
 hierarchy and invoked directly.
 
 `instanceof` accepts a class or interface name and follows the complete nominal
-graph. It does not currently narrow the static type of the tested expression.
+graph. A direct positive `if ($value instanceof Foo)` condition narrows that
+local to `Foo` within the branch when `Foo` is non-generic.
 
 ## Traits
 

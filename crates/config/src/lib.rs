@@ -11,8 +11,8 @@ mod value;
 
 pub use diagnostic::{Diagnostic, SourceLocation};
 pub use lock::{
-    LOCK_FILE_NAME, LOCK_VERSION, LockBuild, LockError, LockErrorKind, LockFile, ParsedExtension,
-    ParsedLock, ParsedProfile, build_lock, parse_lock,
+    LOCK_FILE_NAME, LOCK_VERSION, LockBuild, LockError, LockErrorKind, LockFile,
+    ParsedAutoloadMapping, ParsedExtension, ParsedLock, ParsedProfile, build_lock, parse_lock,
 };
 pub use model::{
     AutoloadConfig, ExtensionConfig, ExtensionName, ProjectConfig, ResolvedProfile,
