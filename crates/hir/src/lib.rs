@@ -2598,6 +2598,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 }
             }
             StmtKind::While { condition, body } => {
+                self.invalidate_loop_refinements(body, &[]);
                 let condition = self.lower_expression(condition, Some(&Type::Bool))?;
                 self.expect_type(&Type::Bool, &condition.ty, condition.span);
                 self.loop_depth += 1;
@@ -2615,6 +2616,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     .iter()
                     .filter_map(|clause| self.lower_loop_clause(clause))
                     .collect::<Vec<_>>();
+                self.invalidate_loop_refinements(body, conditions);
+                self.invalidate_loop_refinements(&[], updates);
                 let conditions = conditions
                     .iter()
                     .filter_map(|clause| self.lower_loop_clause(clause))
@@ -2671,6 +2674,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     .as_ref()
                     .map(|binding| self.bind_foreach_local(&binding.name, &key_type, binding.span));
                 let value_binding = self.bind_foreach_local(&value.name, &value_type, value.span);
+                self.invalidate_loop_refinements(body, &[]);
                 self.loop_depth += 1;
                 let lowered_body = self.lower_block(body);
                 self.loop_depth -= 1;
@@ -2918,6 +2922,17 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         })
     }
 
+    fn invalidate_loop_refinements(&mut self, body: &[Stmt], clauses: &[ForClause]) {
+        // A write on any iteration invalidates the incoming guard before the loop head.
+        self.narrowed.retain(|local, _| {
+            let name = &self.locals[local.0 as usize].name;
+            !block_assigns_local(body, name)
+                && !clauses
+                    .iter()
+                    .any(|clause| clause_assigns_local(clause, name))
+        });
+    }
+
     fn lower_loop_clause(&mut self, clause: &ForClause) -> Option<LoopClause> {
         let kind = match &clause.kind {
             ForClauseKind::Assign {
@@ -2956,6 +2971,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 } else {
                     self.expect_type(&expected, &value.ty, value.span);
                 }
+                self.narrowed.remove(&local);
                 LoopClauseKind::Assign { local, value }
             }
             ForClauseKind::SetProperty {
@@ -3009,6 +3025,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         if let Some(local) = self.names.get(name).copied() {
             let existing = self.locals[local.0 as usize].ty.clone();
             self.expect_type(&existing, ty, span);
+            self.narrowed.remove(&local);
             return (local, Some(local), name.to_owned());
         }
         (
@@ -4906,6 +4923,65 @@ fn constant_value(expression: &Expr) -> Option<ConstantValue> {
         },
         _ => None,
     }
+}
+
+fn clause_assigns_local(clause: &ForClause, name: &str) -> bool {
+    matches!(&clause.kind, ForClauseKind::Assign { name: assigned, .. } if assigned == name)
+}
+
+fn block_assigns_local(body: &[Stmt], name: &str) -> bool {
+    body.iter().any(|statement| match &statement.kind {
+        StmtKind::Assign { name: assigned, .. } => assigned == name,
+        StmtKind::Block(body) | StmtKind::While { body, .. } => block_assigns_local(body, name),
+        StmtKind::If {
+            branches,
+            otherwise,
+        } => {
+            branches
+                .iter()
+                .any(|(_, body)| block_assigns_local(body, name))
+                || otherwise
+                    .as_ref()
+                    .is_some_and(|body| block_assigns_local(body, name))
+        }
+        StmtKind::For {
+            initializers,
+            conditions,
+            updates,
+            body,
+        } => {
+            initializers
+                .iter()
+                .chain(conditions)
+                .chain(updates)
+                .any(|clause| clause_assigns_local(clause, name))
+                || block_assigns_local(body, name)
+        }
+        StmtKind::Foreach {
+            key, value, body, ..
+        } => {
+            key.as_ref().is_some_and(|key| key.name == name)
+                || value.name == name
+                || block_assigns_local(body, name)
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            block_assigns_local(body, name)
+                || catches.iter().any(|clause| {
+                    clause.variable != name && block_assigns_local(&clause.body, name)
+                })
+                || finally
+                    .as_ref()
+                    .is_some_and(|body| block_assigns_local(body, name))
+        }
+        StmtKind::Using { variable, body, .. } => {
+            variable != name && block_assigns_local(body, name)
+        }
+        _ => false,
+    })
 }
 
 fn types_overlap(left: &Type, right: &Type, classes: &BTreeMap<String, ClassSignature>) -> bool {
@@ -7691,5 +7767,23 @@ $static = new Item();
         );
         assert_eq!(codes.iter().filter(|code| **code == "T0415").count(), 3);
         assert!(codes.contains(&"T0414"));
+    }
+
+    #[test]
+    fn loop_writes_invalidate_outer_guards_before_repeated_reads() {
+        for statement in [
+            "while (true) { text($value); $value = 1; }",
+            "for (; true;) { text($value); if (true) { $value = 1; } }",
+            "for (; true; $value = 1) { text($value); }",
+            "foreach ([1] as $value) { text($value); }",
+            "foreach ([1] as $value => $item) { text($value); }",
+        ] {
+            let source = format!(
+                "<?thp\nfunction text(string $value): void {{}}\n\
+                 $value: int|string = \"text\";\n\
+                 if (is_string($value)) {{ {statement} }}"
+            );
+            assert!(diagnostic_codes(&source).contains(&"T0005"), "{statement}");
+        }
     }
 }
