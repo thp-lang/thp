@@ -7,21 +7,31 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-21
+
 ### Added
 
+- lang: Implemented reified generic classes and single-parent generic
+  interfaces with invariant type arguments, bounds, inference, and checked
+  substitutions.
 - lang: Implemented exact compiled-class dynamic construction with constructor
   defaults, named and variadic arguments, inheritance, visibility checks, and
   runtime generic-bound validation.
+- lang: Added deterministic reflection over linked classes, functions, methods,
+  parameters, properties, and types, including checked access, invocation, and
+  construction.
 - std: Implemented `is_string`, `is_int`, `is_float`, `is_null`, `is_numeric`,
   `is_vector`, and `is_map`, with direct positive-branch narrowing for guards
   and `instanceof`. Narrowing preserves compatible union members and is
   invalidated by assignment.
+- config: Added installed-package source discovery and deterministic `thp.lock`
+  generation and loading through the new `thp lock` command.
 
 ### Changed
 
-- bytecode: Bumped the bytecode schema from version 2 to 3 for dynamic
-  construction metadata and checked narrowing; older cached or frozen bytecode
-  must be regenerated.
+- bytecode: Bumped the bytecode schema from version 1 to 3 for reified generics,
+  dynamic construction, checked narrowing, and reflection metadata; older
+  cached or frozen bytecode must be regenerated.
 
 ## [0.2.0] - 2026-09-02
 

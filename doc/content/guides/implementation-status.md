@@ -147,9 +147,10 @@ PHP behavior. Pending work includes:
 - closures, call-site argument unpacking, by-reference parameters, general
   assignment expressions, property-rooted collection mutation, iterator-object
   `foreach`, and numeric `break`/`continue` levels;
-- generic and multiple-parent interfaces, interface state, trait constants,
-  static properties, property hooks, magic methods, anonymous classes, enums,
-  reflection attributes/source inspection, and flow narrowing after `instanceof`;
+- generic functions, methods, and traits, multiple-parent interfaces, interface
+  state, trait constants, static properties, property hooks, magic methods,
+  anonymous classes, enums, reflection attributes/source inspection, and flow
+  narrowing after `instanceof`;
 - global constants, general dynamic calls and member names, runtime
   includes/autoload callbacks, attributes, generators, closures, and cooperative
   async;
