@@ -18,20 +18,19 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: This experimental contract is implemented in the standalone compiler and VM.
+version: "0.5"
 ---
 
 `IteratorIterator` adapts a cursor iterator to the outer-iterator contract.
 
 ## Construction
 
-| Method                                                       | Description                                                                                 |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| [`__construct()`](thp:std.spl.IteratorIterator::__construct) | Wraps the supplied cursor iterator without changing its key, value, or exhaustion behavior. |
+| Method                                                                 | Description                                                                                 |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| [`__construct()`](thp:std.spl.IteratorIterator::__construct)           | Wraps the supplied cursor iterator without changing its key, value, or exhaustion behavior. |
+| [`getInnerIterator()`](thp:std.spl.IteratorIterator::getInnerIterator) | Returns the same wrapped iterator object.                                                   |
 
 ## Behavior
 
@@ -41,12 +40,12 @@ constructing this adapter.
 
 ## Errors
 
-Construction validates the parameters shown above. Cursor operations propagate failures from the wrapped iterator, callback, pattern engine, or filesystem when that dependency is present; each member page identifies the applicable source. Concrete THP error classes remain unsettled.
+Construction validates the parameters shown above. Cursor operations call the same method on the wrapped iterator and propagate its failures unchanged.
 
 ## Example
 
 ```thp
-$adapter = new IteratorIterator<int, int>($values);
+$adapter = new IteratorIterator(new VectorIterator([1, 2]));
 $inner = $adapter->getInnerIterator();
 ```
 

@@ -1,7 +1,7 @@
 # Install thp-lsp
 
-`thp-lsp` 0.1.0 is an experimental standalone language server. It is released
-separately from the THP compiler and is not published to crates.io.
+`thp-lsp` 0.5.0 is an experimental standalone language server. Its release
+artifacts are separate from the THP compiler; it is not published to crates.io.
 
 Extract the archive for your platform and add its `bin` directory to `PATH`.
 Then configure an LSP client to start either `thp-lsp` or `thp-lsp --stdio` for

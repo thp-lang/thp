@@ -73,6 +73,11 @@ A vector iterator implements `Iterator<int, T>` and uses zero-based offsets as
 keys. A map iterator implements `Iterator<K, V>` and preserves the map's keys
 and insertion order. There is no separate keyed-iterator interface.
 
+Native [`VectorIterator<T>`](thp:std.spl.VectorIterator) and
+[`MapIterator<K, V>`](thp:std.spl.MapIterator) capture copy-on-write snapshots.
+Typed iterator boundaries create fresh collection cursors; passing an iterator
+object keeps its identity and current position.
+
 ## Example
 
 ```thp

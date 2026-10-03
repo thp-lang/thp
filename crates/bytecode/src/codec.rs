@@ -725,6 +725,17 @@ impl Encoder {
             Callee::Builtin(Builtin::IsNumeric) => self.u8(28),
             Callee::Builtin(Builtin::IsVector) => self.u8(29),
             Callee::Builtin(Builtin::IsMap) => self.u8(30),
+            Callee::Builtin(Builtin::IteratorFromCollection) => self.u8(31),
+            Callee::Builtin(Builtin::IteratorConstruct) => self.u8(32),
+            Callee::Builtin(Builtin::IteratorRewind) => self.u8(33),
+            Callee::Builtin(Builtin::IteratorValid) => self.u8(34),
+            Callee::Builtin(Builtin::IteratorKey) => self.u8(35),
+            Callee::Builtin(Builtin::IteratorValue) => self.u8(36),
+            Callee::Builtin(Builtin::IteratorAdvance) => self.u8(37),
+            Callee::Builtin(Builtin::IteratorGetInner) => self.u8(38),
+            Callee::Builtin(Builtin::IteratorCount) => self.u8(39),
+            Callee::Builtin(Builtin::IteratorToVector) => self.u8(40),
+            Callee::Builtin(Builtin::IteratorToMap) => self.u8(41),
         }
     }
 
@@ -1344,6 +1355,17 @@ impl Decoder<'_> {
             28 => Ok(Callee::Builtin(Builtin::IsNumeric)),
             29 => Ok(Callee::Builtin(Builtin::IsVector)),
             30 => Ok(Callee::Builtin(Builtin::IsMap)),
+            31 => Ok(Callee::Builtin(Builtin::IteratorFromCollection)),
+            32 => Ok(Callee::Builtin(Builtin::IteratorConstruct)),
+            33 => Ok(Callee::Builtin(Builtin::IteratorRewind)),
+            34 => Ok(Callee::Builtin(Builtin::IteratorValid)),
+            35 => Ok(Callee::Builtin(Builtin::IteratorKey)),
+            36 => Ok(Callee::Builtin(Builtin::IteratorValue)),
+            37 => Ok(Callee::Builtin(Builtin::IteratorAdvance)),
+            38 => Ok(Callee::Builtin(Builtin::IteratorGetInner)),
+            39 => Ok(Callee::Builtin(Builtin::IteratorCount)),
+            40 => Ok(Callee::Builtin(Builtin::IteratorToVector)),
+            41 => Ok(Callee::Builtin(Builtin::IteratorToMap)),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }

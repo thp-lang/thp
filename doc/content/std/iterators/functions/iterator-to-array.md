@@ -32,8 +32,9 @@ module: iterators
 ---
 
 `iterator_to_array()` records PHP migration behavior but is not a THP-native
-name. The native vector-producing contract is planned as
-`iterator_to_vector()`; a keyed conversion will use `iterator_to_map()`.
+name. The implemented vector-producing function is
+[`iterator_to_vector()`](thp:std.spl.iterator_to_vector); keyed conversion uses
+[`iterator_to_map()`](thp:std.spl.iterator_to_map).
 
 ## Behavior
 
