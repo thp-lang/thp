@@ -80,6 +80,13 @@ object traversal accepts `Traversable<K, V>` and binds its invariant `K` and
 `V`. Iterator implementations use `int` keys for vector shapes and preserve
 the declared key type for map shapes.
 
+At a typed assignment, property, argument, or return boundary requiring a
+compatible `Iterator<K, V>` or `Traversable<K, V>`, a vector or map creates a
+fresh rewindable iterator over its copy-on-write snapshot. Nullable targets
+and unions with one compatible iterator branch work the same way. An existing
+iterator keeps its identity and position. Raw collections have no cursor
+methods, and direct collection `foreach` keeps its native traversal.
+
 Vectors and maps are native values rather than ordinary class instances. This
 allows the compiler and VM to lower common collection operations directly
 without requiring an object wrapper or dynamic method dispatch. Their internal

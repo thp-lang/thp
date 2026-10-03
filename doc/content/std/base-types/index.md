@@ -54,10 +54,9 @@ generic element and key constraints. `[]` creates a vector,
 Collection operations use global functions prefixed by their native input
 shape rather than methods or PHP's `array_*` names. Proposed functions include
 `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()`,
-`map_transform()`, `map_filter()`, and `map_merge()`. Every transformation is
-proposed. `count(string|vector<T>|map<K, V>): int` is the only executable
-general collection function in this checkout. It reads the collection length
-without consuming, moving, or creating traversal state. Proposed
+`map_transform()`, `map_filter()`, and `map_merge()`. These transformations are
+proposed. `count(string|vector<T>|map<K, V>): int` reads the collection length
+without consuming, moving, or creating traversal state. Implemented
 [`iterator_count()`](thp:std.spl.iterator_count) instead accepts an
 `Iterator<K, V>`, counts from its current cursor through exhaustion, advances
 it, and does not rewind; the two names are neither aliases nor overloads.

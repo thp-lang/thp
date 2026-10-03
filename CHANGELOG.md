@@ -7,6 +7,20 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-03
+
+### Added
+
+- lang: Added rewindable native `VectorIterator<T>`, `MapIterator<K, V>`,
+  `EmptyIterator<K, V>`, and `IteratorIterator<K, V>` cursors, with typed
+  collection conversion at iterator boundaries.
+- std: Added consuming `iterator_count()`, `iterator_to_vector()`, and
+  `iterator_to_map()` functions.
+- runtime: Advanced the bytecode schema to version 4 for native iterator
+  builtins and verification.
+- tooling: Updated `thp-lsp` to 0.5.0 with native iterator type arities and
+  compiler diagnostic parity.
+
 ## [0.4.0] - 2026-10-03
 
 ### Added

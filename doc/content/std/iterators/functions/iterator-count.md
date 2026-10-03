@@ -21,15 +21,13 @@ errors:
   - description: Failures from cursor inspection or advancement propagate.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired function contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: This experimental contract is implemented in the standalone compiler and VM.
+version: "0.5"
 module: iterators
 ---
 
-`iterator_count<K, V>(Iterator<K, V>): int` is a proposed consuming operation
+`iterator_count<K, V>(Iterator<K, V>): int` is a consuming operation
 on an explicit iterator. It is not an alias for, or overload of, executable
 [`count()`](thp:std.baseTypes).
 

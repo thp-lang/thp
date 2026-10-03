@@ -17,7 +17,7 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 3;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -2242,6 +2242,10 @@ fn verify_instruction(
                             | "ReflectionMethod"
                             | "ReflectionProperty"
                             | "ReflectionParameter"
+                            | "VectorIterator"
+                            | "MapIterator"
+                            | "EmptyIterator"
+                            | "IteratorIterator"
                     ))
             {
                 return Err(error("only a concrete class can be allocated"));
@@ -2711,6 +2715,124 @@ fn verify_builtin_call(
             .ok_or_else(|| format!("builtin requires a {expected} receiver"))
     };
     match builtin {
+        Builtin::IteratorFromCollection => {
+            if arguments.len() != 1 {
+                return Err("invalid collection iterator conversion".to_owned());
+            }
+            let expected = match argument_type(0) {
+                Type::Vector(value) => Type::Nominal {
+                    name: "VectorIterator".to_owned(),
+                    arguments: vec![value.as_ref().clone()],
+                },
+                Type::Map(key, value) => Type::Nominal {
+                    name: "MapIterator".to_owned(),
+                    arguments: vec![key.as_ref().clone(), value.as_ref().clone()],
+                },
+                _ => return Err("collection iterator requires a vector or map".to_owned()),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "collection iterator result type is wrong".to_owned())
+        }
+        Builtin::IteratorConstruct => {
+            let Some((name, type_arguments)) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid iterator constructor receiver".to_owned());
+            };
+            let expected_argument = match (name, type_arguments) {
+                ("VectorIterator", [value]) => Some(Type::Vector(Box::new(value.clone()))),
+                ("MapIterator", [key, value]) => {
+                    Some(Type::Map(Box::new(key.clone()), Box::new(value.clone())))
+                }
+                ("IteratorIterator", [key, value]) => Some(Type::Nominal {
+                    name: "Iterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                }),
+                ("EmptyIterator", [_, _]) => None,
+                _ => return Err("invalid iterator constructor receiver".to_owned()),
+            };
+            if arguments.len() != 1 + usize::from(expected_argument.is_some())
+                || result != Some(&Type::Void)
+                || expected_argument
+                    .as_ref()
+                    .is_some_and(|expected| !type_accepts(program, expected, argument_type(1)))
+            {
+                return Err("invalid iterator constructor".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::IteratorRewind
+        | Builtin::IteratorAdvance
+        | Builtin::IteratorValid
+        | Builtin::IteratorKey
+        | Builtin::IteratorValue
+        | Builtin::IteratorGetInner => {
+            let Some((name, type_arguments)) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid iterator cursor receiver".to_owned());
+            };
+            if arguments.len() != 1
+                || !matches!(
+                    name,
+                    "VectorIterator" | "MapIterator" | "EmptyIterator" | "IteratorIterator"
+                )
+            {
+                return Err("invalid iterator cursor call".to_owned());
+            }
+            let Some(iterator_class) = class_by_name(program, "Iterator") else {
+                return Err("Iterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) =
+                instantiation_for_class(program, argument_type(0), iterator_class.id)
+            else {
+                return Err("invalid iterator cursor receiver".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("invalid iterator type arguments".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::IteratorRewind | Builtin::IteratorAdvance => Type::Void,
+                Builtin::IteratorValid => Type::Bool,
+                Builtin::IteratorKey => key.clone(),
+                Builtin::IteratorValue => value.clone(),
+                Builtin::IteratorGetInner if name == "IteratorIterator" => Type::Nominal {
+                    name: "Iterator".to_owned(),
+                    arguments: type_arguments.to_vec(),
+                },
+                _ => return Err("invalid iterator cursor call".to_owned()),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid iterator cursor result".to_owned())
+        }
+        Builtin::IteratorCount | Builtin::IteratorToVector | Builtin::IteratorToMap => {
+            if arguments.len() != 1 {
+                return Err("iterator function requires one argument".to_owned());
+            }
+            let Some(iterator_class) = class_by_name(program, "Iterator") else {
+                return Err("Iterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) = arguments.first().and_then(|_| {
+                instantiation_for_class(program, argument_type(0), iterator_class.id)
+            }) else {
+                return Err("iterator function requires an iterator".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("invalid iterator type arguments".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::IteratorCount => Type::Int,
+                Builtin::IteratorToVector => Type::Vector(Box::new(value.clone())),
+                _ => Type::Map(Box::new(key.clone()), Box::new(value.clone())),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid iterator function result".to_owned())
+        }
         Builtin::IsString
         | Builtin::IsInt
         | Builtin::IsFloat
@@ -3327,6 +3449,65 @@ mod tests {
         let program = compile("<?thp\n$value: int = 2 + 3; echo $value;");
         assert_eq!(program.schema_version, BYTECODE_SCHEMA_VERSION);
         verify(&program).unwrap();
+    }
+
+    #[test]
+    fn iterator_builtins_round_trip_and_reject_forged_result_types() {
+        let source = "<?thp\n$iterator: Iterator<int, int> = [1, 2];\n$values = iterator_to_vector($iterator);";
+        let mut program = compile(source);
+        verify(&program).unwrap();
+        verify(&decode(&encode(&program)).unwrap()).unwrap();
+        let function = &mut program.functions[program.entry.0 as usize];
+        let instruction = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction.kind,
+                    super::InstructionKind::Call {
+                        callee: thp_hir::Callee::Builtin(thp_hir::Builtin::IteratorToVector),
+                        ..
+                    }
+                )
+            })
+            .expect("iterator conversion call");
+        let destination = instruction.destination.expect("conversion has result");
+        let forged = thp_hir::Type::Vector(Box::new(thp_hir::Type::String));
+        instruction.ty = Some(forged.clone());
+        function.register_types[destination.0 as usize] = forged;
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid iterator function result")
+        );
+    }
+
+    #[test]
+    fn rejects_extra_iterator_conversion_argument() {
+        let mut program = compile(
+            "<?thp\n$iterator: Iterator<int, int> = [1, 2];\n$values = iterator_to_vector($iterator);",
+        );
+        let instruction = program.functions[program.entry.0 as usize]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction.kind,
+                    super::InstructionKind::Call {
+                        callee: thp_hir::Callee::Builtin(thp_hir::Builtin::IteratorToVector),
+                        ..
+                    }
+                )
+            })
+            .expect("iterator conversion call");
+        let super::InstructionKind::Call { arguments, .. } = &mut instruction.kind else {
+            unreachable!()
+        };
+        arguments.push(arguments[0]);
+        assert!(verify(&program).is_err());
     }
 
     #[test]

@@ -41,7 +41,7 @@ compiler if used as though it were available.
 | `vector<T>`, `map<K, V>`                                                                    | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                                                                                |
 | Variables and functions                                                                     | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                                                                         |
 | `if`, `match`, `while`, `for`, `return`, `echo`                                             | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                                                                         |
-| `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Native collections only; the source is evaluated once and traversal uses its captured COW snapshot                                                                      |
+| `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Direct collection lowering; the source is evaluated once and traversal uses its captured COW snapshot                                                                   |
 | `break`, `continue`                                                                         | partial      | Level one only; numeric levels are rejected                                                                                                                             |
 | Scalar operators                                                                            | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing                                                        |
 | Classes and interfaces                                                                      | partial      | Reified generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported                                                        |
@@ -54,7 +54,7 @@ compiler if used as though it were available.
 | Namespaces, imports, and project/package autoload discovery                                 | implemented  | Semicolon namespaces and deterministic configured and installed-package source maps; no downloading, runtime source loading, or runtime include/autoload callbacks      |
 | OPcache, frozen projects, metrics, embedding, C ABI                                         | implemented  | Reified generic and reflection metadata is schema-versioned; the public C ABI remains version 1                                                                         |
 | Cranelift JIT                                                                               | partial      | Safe scalar subset; automatic mode falls back to the VM                                                                                                                 |
-| Language Server Protocol and detached docblocks                                             | implemented  | Independent 0.1.0 stdio server; workspace diagnostics, navigation, safe rename, symbols, semantic tokens, source-preserving formatting, and LSP-only local `@var` hints |
+| Language Server Protocol and detached docblocks                                             | implemented  | Independent 0.5.0 stdio server; workspace diagnostics, navigation, safe rename, symbols, semantic tokens, source-preserving formatting, and LSP-only local `@var` hints |
 
 ### Collection and iterator symbols
 
@@ -65,17 +65,19 @@ compiler if used as though it were available.
 | `Iterator<K, V>`                                                       | implemented  | Executable cursor interface extending `Traversable<K, V>`                                                                        |
 | `IteratorAggregate<K, V>`                                              | implemented  | Executable aggregate interface; `getIterator()` returns `Traversable<K, V>`                                                      |
 | `foreach (Traversable<K, V>)`                                          | implemented  | Resolves aggregate layers, rewinds the direct iterator, and dispatches `valid`, `value`, optional `key`, and `advance` virtually |
-| `iterator_count<K, V>(Iterator<K, V>): int`                            | proposed     | Counts from the current cursor through exhaustion, advances it, and never rewinds                                                |
+| `VectorIterator<T>`, `MapIterator<K, V>`                               | implemented  | Rewindable cursors over COW collection snapshots; typed iterator targets create fresh cursors                                    |
+| `EmptyIterator<K, V>`, `IteratorIterator<K, V>`, `OuterIterator<K, V>` | implemented  | Empty cursor and shared wrapper delegation through the outer iterator interface                                                  |
+| `iterator_count<K, V>(Iterator<K, V>): int`                            | implemented  | Counts from the current cursor through exhaustion, advances it, and never rewinds                                                |
 | `iterator_apply()`                                                     | proposed     | Callback-driven consuming traversal is not implemented                                                                           |
-| `iterator_to_vector()`, `iterator_to_map()`                            | proposed     | Consuming iterator conversions are not implemented                                                                               |
+| `iterator_to_vector()`, `iterator_to_map()`                            | implemented  | Consume remaining values; vector discards keys, map preserves first key position when keys repeat                                |
 | `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()` | proposed     | Native-vector transformations are not implemented                                                                                |
 | `map_transform()`, `map_filter()`, `map_merge()`                       | proposed     | Native-map transformations are not implemented                                                                                   |
-| Iterator adapters and recursive iterators                              | proposed     | All classes and members in the iterator module are documentation-only                                                            |
+| Other iterator adapters and recursive iterators                        | proposed     | Remaining iterator module classes are documentation-only                                                                         |
 
 [`count()`](thp:std.baseTypes) and
 [`iterator_count()`](thp:std.spl.iterator_count) are separate functions, not
 aliases or overloads. The first inspects an existing native value without a
-cursor; the second is a future consuming operation on an explicit iterator.
+cursor; the second consumes an explicit iterator from its current cursor.
 
 ### Stream symbols
 

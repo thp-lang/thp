@@ -36,13 +36,13 @@ status: experimental
 availability: proposed
 notice:
   This PHP migration-analysis placeholder is not an accepted THP-native API and
-  is not implemented. The native map-backed iterator is planned as MapIterator.
+  is not implemented. Use the native `MapIterator<K, V>` instead.
 version: "0.1"
 ---
 
 `ArrayIterator` records the PHP migration shape of an iterator over map-like
-storage. THP does not have an `array` type; the native contract is planned as
-`MapIterator<K, V>`.
+storage. THP does not have an `array` type; the native contract is
+[`MapIterator<K, V>`](thp:std.spl.MapIterator).
 
 ## Construction
 

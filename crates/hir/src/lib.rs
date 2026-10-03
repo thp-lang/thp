@@ -193,6 +193,17 @@ pub enum NominalKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Builtin {
     Count,
+    IteratorFromCollection,
+    IteratorConstruct,
+    IteratorRewind,
+    IteratorValid,
+    IteratorKey,
+    IteratorValue,
+    IteratorAdvance,
+    IteratorGetInner,
+    IteratorCount,
+    IteratorToVector,
+    IteratorToMap,
     VarDump,
     MemoryStreamOpen,
     TempStreamOpen,
@@ -3184,15 +3195,21 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 return None;
             }
             ExprKind::Vector(values) => {
+                let target_element = expected
+                    .and_then(iterator_target_args)
+                    .and_then(|(key, value)| (key == &Type::Int).then_some(value));
                 let expected_element = match expected {
                     Some(Type::Vector(element)) => Some(element.as_ref()),
-                    Some(Type::Union(members)) => members.iter().find_map(|member| {
-                        let Type::Vector(element) = member else {
-                            return None;
-                        };
-                        Some(element.as_ref())
-                    }),
-                    _ => None,
+                    Some(Type::Union(members)) => members
+                        .iter()
+                        .find_map(|member| {
+                            let Type::Vector(element) = member else {
+                                return None;
+                            };
+                            Some(element.as_ref())
+                        })
+                        .or(target_element),
+                    _ => target_element,
                 };
                 let values = values
                     .iter()
@@ -3224,6 +3241,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 )
             }
             ExprKind::Map(entries) => {
+                let target_types = expected.and_then(iterator_target_args);
                 let (expected_key, expected_value) = match expected {
                     Some(Type::Map(key, value)) => (Some(key.as_ref()), Some(value.as_ref())),
                     Some(Type::Union(members)) => members
@@ -3234,8 +3252,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             };
                             Some((Some(key.as_ref()), Some(value.as_ref())))
                         })
-                        .unwrap_or((None, None)),
-                    _ => (None, None),
+                        .unwrap_or_else(|| {
+                            target_types
+                                .map_or((None, None), |(key, value)| (Some(key), Some(value)))
+                        }),
+                    _ => target_types.map_or((None, None), |(key, value)| (Some(key), Some(value))),
                 };
                 let entries = entries
                     .iter()
@@ -3327,7 +3348,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
-                return self.lower_call(name, arguments, expression.span);
+                let value = self.lower_call(name, arguments, expression.span)?;
+                return Some(match expected {
+                    Some(expected) => coerce_collection_iterator(value, expected, self.classes),
+                    None => value,
+                });
             }
             ExprKind::Index { collection, index } => {
                 let collection = self.lower_expression(collection, None)?;
@@ -3454,6 +3479,10 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             | "ReflectionMethod"
                             | "ReflectionProperty"
                             | "ReflectionParameter"
+                            | "VectorIterator"
+                            | "MapIterator"
+                            | "EmptyIterator"
+                            | "IteratorIterator"
                     )
                 {
                     self.diagnostics.push(Diagnostic::error(
@@ -3936,10 +3965,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 return self.lower_match_expression(subject, arms, expected, expression.span);
             }
         };
-        Some(TypedExpr {
+        let value = TypedExpr {
             kind,
             ty,
             span: expression.span,
+        };
+        Some(match expected {
+            Some(expected) => coerce_collection_iterator(value, expected, self.classes),
+            None => value,
         })
     }
 
@@ -4157,6 +4190,55 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     arguments,
                 },
                 ty: Type::Int,
+                span,
+            });
+        }
+        if matches!(
+            name,
+            "iterator_count" | "iterator_to_vector" | "iterator_to_map"
+        ) {
+            let parameters = vec![native_parameter("iterator", Type::Mixed, None, span)];
+            let mut arguments = self.bind_arguments(name, arguments, &parameters, span);
+            let first = arguments.explicit.first_mut();
+            let iterator = first
+                .as_ref()
+                .and_then(|argument| iterator_types(&argument.value.ty, self.classes));
+            let Some((key, value)) = iterator else {
+                if let Some(argument) = first {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        argument.value.span,
+                        format!(
+                            "`{name}` requires `Iterator<K, V>`, found `{}`",
+                            argument.value.ty
+                        ),
+                    ));
+                }
+                return None;
+            };
+            let parameter_type = Type::Nominal {
+                name: "Iterator".to_owned(),
+                arguments: vec![key.clone(), value.clone()],
+            };
+            let first = first.expect("iterator type came from argument");
+            first.value =
+                coerce_collection_iterator(first.value.clone(), &parameter_type, self.classes);
+            self.expect_type(&parameter_type, &first.value.ty, first.value.span);
+            let (builtin, ty) = match name {
+                "iterator_count" => (Builtin::IteratorCount, Type::Int),
+                "iterator_to_vector" => (Builtin::IteratorToVector, Type::Vector(Box::new(value))),
+                _ => (
+                    Builtin::IteratorToMap,
+                    Type::Map(Box::new(key), Box::new(value)),
+                ),
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    arguments,
+                },
+                ty,
                 span,
             });
         }
@@ -4492,7 +4574,17 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             let Some(value) = self.lower_expression(&argument.value, None) else {
                 continue;
             };
-            if !unify_inference(pattern, &value.ty, &class_parameters, &mut inferred) {
+            let actual = if class.name == "IteratorIterator" {
+                iterator_types(&value.ty, self.classes)
+                    .map(|(key, value)| Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: vec![key, value],
+                    })
+                    .unwrap_or(value.ty)
+            } else {
+                value.ty
+            };
+            if !unify_inference(pattern, &actual, &class_parameters, &mut inferred) {
                 conflict = true;
             }
         }
@@ -5137,6 +5229,102 @@ fn nominal_parts(ty: &Type) -> Option<(&str, &[Type])> {
     match ty {
         Type::Object(name) => Some((name, &[])),
         Type::Nominal { name, arguments } => Some((name, arguments)),
+        _ => None,
+    }
+}
+
+fn iterator_types(ty: &Type, classes: &BTreeMap<String, ClassSignature>) -> Option<(Type, Type)> {
+    let args = match ty {
+        Type::Vector(value) => return Some((Type::Int, value.as_ref().clone())),
+        Type::Map(key, value) => return Some((key.as_ref().clone(), value.as_ref().clone())),
+        _ => instantiated_ancestor(ty, "Iterator", classes)?,
+    };
+    let Type::Nominal { arguments, .. } = args else {
+        return None;
+    };
+    Some((arguments.first()?.clone(), arguments.get(1)?.clone()))
+}
+
+fn coerce_collection_iterator(
+    value: TypedExpr,
+    expected: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> TypedExpr {
+    let collection = match &value.ty {
+        Type::Vector(element) => Some((
+            "VectorIterator",
+            vec![element.as_ref().clone()],
+            vec![Type::Int, element.as_ref().clone()],
+        )),
+        Type::Map(key, element) => Some((
+            "MapIterator",
+            vec![key.as_ref().clone(), element.as_ref().clone()],
+            vec![key.as_ref().clone(), element.as_ref().clone()],
+        )),
+        _ => None,
+    };
+    let Some((name, arguments, iterator_args)) = collection else {
+        return value;
+    };
+    let iterator = Type::Nominal {
+        name: name.to_owned(),
+        arguments,
+    };
+    let target = Type::Nominal {
+        name: "Iterator".to_owned(),
+        arguments: iterator_args.clone(),
+    };
+    let traversable = Type::Nominal {
+        name: "Traversable".to_owned(),
+        arguments: iterator_args,
+    };
+    let branches = match expected {
+        Type::Union(members) => members.as_slice(),
+        _ => std::slice::from_ref(expected),
+    };
+    if branches
+        .iter()
+        .filter(|branch| {
+            type_accepts(branch, &target, classes) || type_accepts(branch, &traversable, classes)
+        })
+        .count()
+        != 1
+        || type_accepts(expected, &value.ty, classes)
+    {
+        return value;
+    }
+    let span = value.span;
+    TypedExpr {
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(Builtin::IteratorFromCollection),
+            arguments: BoundArguments {
+                explicit: vec![BoundArgument {
+                    target: ArgumentTarget::Parameter(0),
+                    value,
+                }],
+                defaults: vec![],
+                parameter_count: 1,
+                variadic_parameter: None,
+                variadic_type: None,
+            },
+        },
+        ty: iterator,
+        span,
+    }
+}
+
+fn iterator_target_args(ty: &Type) -> Option<(&Type, &Type)> {
+    match ty {
+        Type::Nominal { name, arguments }
+            if matches!(name.as_str(), "Iterator" | "Traversable") =>
+        {
+            Some((arguments.first()?, arguments.get(1)?))
+        }
+        Type::Union(members) => {
+            let mut targets = members.iter().filter_map(iterator_target_args);
+            let target = targets.next()?;
+            targets.next().is_none().then_some(target)
+        }
         _ => None,
     }
 }
@@ -5829,6 +6017,46 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Some("Traversable"),
             &[],
         ),
+        (
+            "OuterIterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Iterator"),
+            &[],
+        ),
+        (
+            "VectorIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "MapIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "EmptyIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "IteratorIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["OuterIterator"],
+        ),
         ("Closeable", NominalKind::Interface, true, false, None, &[]),
         (
             "ReadableStream",
@@ -6094,12 +6322,27 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         )
         .collect::<BTreeMap<_, _>>();
 
-    for name in ["Traversable", "Iterator", "IteratorAggregate"] {
+    for name in [
+        "Traversable",
+        "Iterator",
+        "IteratorAggregate",
+        "OuterIterator",
+        "VectorIterator",
+        "MapIterator",
+        "EmptyIterator",
+        "IteratorIterator",
+    ] {
         let class = classes
             .get_mut(name)
             .expect("iterator prelude nominal exists");
-        class.type_parameters = ["K", "V"]
-            .into_iter()
+        let parameters: &[&str] = if name == "VectorIterator" {
+            &["T"]
+        } else {
+            &["K", "V"]
+        };
+        class.type_parameters = parameters
+            .iter()
+            .copied()
             .enumerate()
             .map(|(index, parameter_name)| TypeParameter {
                 id: TypeParameterId {
@@ -6112,12 +6355,17 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             })
             .collect();
     }
-    for name in ["Iterator", "IteratorAggregate"] {
+    for name in ["Iterator", "IteratorAggregate", "OuterIterator"] {
         let class = classes
             .get_mut(name)
             .expect("iterator prelude nominal exists");
         class.parent_type = Some(Type::Nominal {
-            name: "Traversable".to_owned(),
+            name: if name == "OuterIterator" {
+                "Iterator"
+            } else {
+                "Traversable"
+            }
+            .to_owned(),
             arguments: class
                 .type_parameters
                 .iter()
@@ -6127,6 +6375,37 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                 })
                 .collect(),
         });
+    }
+
+    for name in [
+        "VectorIterator",
+        "MapIterator",
+        "EmptyIterator",
+        "IteratorIterator",
+    ] {
+        let class = classes.get_mut(name).expect("native iterator exists");
+        let parameters = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let arguments = if name == "VectorIterator" {
+            vec![Type::Int, parameters[0].clone()]
+        } else {
+            parameters
+        };
+        class.interface_types = vec![Type::Nominal {
+            name: if name == "IteratorIterator" {
+                "OuterIterator"
+            } else {
+                "Iterator"
+            }
+            .to_owned(),
+            arguments,
+        }];
     }
 
     let nullable_throwable =
@@ -6208,6 +6487,130 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                 .collect(),
         },
         true,
+    );
+    let outer_parameters = classes["OuterIterator"].type_parameters.clone();
+    let outer_args = outer_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect();
+    add_native_method(
+        &mut classes,
+        "OuterIterator",
+        "getInnerIterator",
+        None,
+        false,
+        vec![],
+        Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: outer_args,
+        },
+        true,
+    );
+    for name in [
+        "VectorIterator",
+        "MapIterator",
+        "EmptyIterator",
+        "IteratorIterator",
+    ] {
+        let parameters = classes[name].type_parameters.clone();
+        let params = parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let constructor_args = match name {
+            "VectorIterator" => vec![native_parameter(
+                "values",
+                Type::Vector(Box::new(params[0].clone())),
+                None,
+                Span::empty(0),
+            )],
+            "MapIterator" => vec![native_parameter(
+                "values",
+                Type::Map(Box::new(params[0].clone()), Box::new(params[1].clone())),
+                None,
+                Span::empty(0),
+            )],
+            "IteratorIterator" => vec![native_parameter(
+                "iterator",
+                Type::Nominal {
+                    name: "Iterator".to_owned(),
+                    arguments: params.clone(),
+                },
+                None,
+                Span::empty(0),
+            )],
+            _ => vec![],
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(Builtin::IteratorConstruct),
+            false,
+            constructor_args,
+            Type::Void,
+            false,
+        );
+        for (method, builtin, result) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            (
+                "key",
+                Builtin::IteratorKey,
+                if name == "VectorIterator" {
+                    Type::Int
+                } else {
+                    params[0].clone()
+                },
+            ),
+            (
+                "value",
+                Builtin::IteratorValue,
+                if name == "VectorIterator" {
+                    params[0].clone()
+                } else {
+                    params[1].clone()
+                },
+            ),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    let params = classes["IteratorIterator"].type_parameters.clone();
+    add_native_method(
+        &mut classes,
+        "IteratorIterator",
+        "getInnerIterator",
+        Some(Builtin::IteratorGetInner),
+        false,
+        vec![],
+        Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: params
+                .iter()
+                .map(|p| Type::Parameter {
+                    id: p.id,
+                    name: p.name.clone(),
+                })
+                .collect(),
+        },
+        false,
     );
     add_native_method(
         &mut classes,
@@ -7312,6 +7715,14 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect()
+    }
+
+    #[test]
+    fn iterator_function_reports_unknown_argument_once() {
+        assert_eq!(
+            diagnostic_codes("<?thp\niterator_count($missing);"),
+            vec!["N0101"]
+        );
     }
 
     fn check_default_nesting(levels: usize) -> (Vec<thp_diagnostics::Diagnostic>, Span, Span) {

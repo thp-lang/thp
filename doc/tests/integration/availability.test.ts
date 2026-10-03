@@ -100,8 +100,8 @@ describe("0.2.0 contract availability", () => {
     ).toBe(true);
     expect(adapterPages.length).toBeGreaterThan(100);
     expect(
-      adapterPages.every(
-        (page) => page.source.data.availability === "proposed",
+      adapterPages.some(
+        (page) => page.source.data.availability === "implemented",
       ),
     ).toBe(true);
 
@@ -146,7 +146,7 @@ describe("0.2.0 contract availability", () => {
     const iteratorCount = model.pages.find(
       (page) => page.source.data.id === "std.spl.iterator_count",
     )!;
-    expect(iteratorCount.source.data.availability).toBe("proposed");
+    expect(iteratorCount.source.data.availability).toBe("implemented");
     if (iteratorCount.source.data.kind !== "function")
       throw new Error("iterator_count must remain a function page");
     expect(iteratorCount.source.data.parameters).toEqual([

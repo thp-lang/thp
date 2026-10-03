@@ -18,11 +18,9 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired interface contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: This experimental contract is implemented in the standalone compiler and VM.
+version: "0.5"
 ---
 
 `OuterIterator` exposes the iterator wrapped by an iterator adapter.
@@ -31,12 +29,14 @@ version: "0.1"
 
 Implementations wrap another iterator and return that same logical iterator from `getInnerIterator()`. Replacing the inner iterator after construction is not part of this contract.
 
+[`getInnerIterator()`](thp:std.spl.OuterIterator::getInnerIterator)
+returns a non-null `Iterator<K, V>`.
+
 ## Example
 
 ```thp
-function inner<K, V>(OuterIterator<K, V> $iterator): ?Iterator<K, V> {
-    return $iterator->getInnerIterator();
-}
+$outer = new IteratorIterator(new VectorIterator([1, 2]));
+$inner: Iterator<int, int> = $outer->getInnerIterator();
 ```
 
 The caller can inspect an adapter without depending on its concrete class.

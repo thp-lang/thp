@@ -5,6 +5,13 @@ All notable user-visible changes to THP are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). GitHub releases
 remain marked as prereleases while THP is experimental.
 
+## [0.5.0]
+
+### Added
+
+- Recognized native iterator generic arities in docblocks and aligned iterator
+  diagnostics with the 0.5.0 compiler.
+
 ## [0.1.0]
 
 ### Added

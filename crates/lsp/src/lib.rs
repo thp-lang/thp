@@ -3074,6 +3074,11 @@ fn validate_type_arity(program: &Program, ty: &TypeSyntax) -> Result<(), String>
         ("Traversable".to_owned(), 2),
         ("Iterator".to_owned(), 2),
         ("IteratorAggregate".to_owned(), 2),
+        ("OuterIterator".to_owned(), 2),
+        ("VectorIterator".to_owned(), 1),
+        ("MapIterator".to_owned(), 2),
+        ("EmptyIterator".to_owned(), 2),
+        ("IteratorIterator".to_owned(), 2),
     ]);
     for name in [
         "Closeable",
@@ -3709,6 +3714,34 @@ mod tests {
     };
     use thp_diagnostics::{SourceFile, Span};
     use thp_syntax::DocblockSpan;
+
+    #[test]
+    fn iterator_diagnostics_match_compiler_and_native_arity() {
+        for source in [
+            "<?thp\n$items: Iterator<int, int> = [1, 2];\necho iterator_count($items);\n",
+            "<?thp\n$items: Iterator<string, int> = [1, 2];\n",
+            "<?thp\n$items = new VectorIterator<int, int>([1]);\n",
+        ] {
+            let path = std::path::Path::new("/iterator.thp");
+            let uri = Uri::from_str("file:///iterator.thp").unwrap();
+            let state = DocumentState::new(&uri, 1, source.to_owned());
+            let compiler = compile_text(path, source.to_owned());
+            let actual = state
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| match diagnostic.code.as_ref() {
+                    Some(lsp_types::NumberOrString::String(code)) => Some(code.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let expected = compiler
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{source}");
+        }
+    }
 
     #[test]
     fn normalizes_docblocks_and_continuation_lines() {
