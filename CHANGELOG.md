@@ -7,7 +7,7 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-09-21
+## [0.4.0] - 2026-10-03
 
 ### Added
 
