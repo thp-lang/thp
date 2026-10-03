@@ -36,7 +36,7 @@ use lsp_types::{
 use thp_compiler::{Compilation, ProjectRequest, compile_project_with_provider, compile_text};
 use thp_config::ProjectConfig;
 use thp_diagnostics::{Severity, SourceFile, Span};
-use thp_hir::Module as HirModule;
+use thp_hir::{Module as HirModule, Type};
 use thp_modules::{
     AutoloadMapping, FilesystemSourceProvider, InMemorySourceProvider, ModuleId,
     ModuleSourceProvider, resolve_type_syntax_in_namespace,
@@ -607,7 +607,32 @@ impl Server {
                         .collect::<Vec<_>>();
                     (matches.len() == 1).then(|| matches[0])
                 })
-                .map(Declaration::markdown)?
+                .map(Declaration::markdown)
+                .or_else(|| {
+                    if !document.tokens.iter().any(|token| {
+                        token.kind == TokenKind::Identifier
+                            && token.span.end == span.end
+                            && token.span.start >= span.start
+                    }) {
+                        return None;
+                    }
+                    let prefix = document
+                        .source
+                        .text()
+                        .get(..span.start as usize)?
+                        .trim_end();
+                    if prefix.ends_with("->") || prefix.ends_with("::") {
+                        return None;
+                    }
+                    if !document
+                        .function_candidates(&name)
+                        .iter()
+                        .any(|candidate| candidate == name.trim_start_matches('\\'))
+                    {
+                        return None;
+                    }
+                    native_collection_declaration(&name).map(|native| native.markdown())
+                })?
         };
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -636,10 +661,26 @@ impl Server {
                 .map(Declaration::completion)
                 .collect()
         } else {
-            self.declarations(document.project())
+            let mut items: Vec<_> = self
+                .declarations(document.project())
                 .filter(|declaration| declaration.owner.is_none())
                 .map(Declaration::completion)
-                .collect()
+                .collect();
+            for (name, _, _) in NATIVE_COLLECTIONS {
+                if !items.iter().any(|item| item.label == *name)
+                    && document
+                        .function_candidates(name)
+                        .iter()
+                        .any(|candidate| candidate == name)
+                {
+                    items.push(
+                        native_collection_declaration(name)
+                            .expect("catalogued native function")
+                            .completion(),
+                    );
+                }
+            }
+            items
         };
         items.sort_by(|left, right| {
             (left.label.as_str(), left.detail.as_deref())
@@ -653,6 +694,27 @@ impl Server {
         let document = self.documents.get(&target.text_document.uri)?;
         let offset = document.offset(target.position)?;
         let call = call_before(document.source.text(), offset)?;
+        if call.variable {
+            let Type::Callable(parameters, result) =
+                document.compiler_local_type(&call.name, offset)?
+            else {
+                return None;
+            };
+            let parameters = parameters
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| (format!("arg{}", index + 1), ty.to_string()))
+                .collect();
+            return Some(
+                callable_declaration(&format!("${}", call.name), parameters, &result.to_string())
+                    .signature_help(call.argument),
+            );
+        }
+        let global = call.receiver.is_none()
+            && document
+                .function_candidates(&call.name)
+                .iter()
+                .any(|candidate| candidate == call.name.trim_start_matches('\\'));
         let declaration = if let Some(receiver) = call.receiver {
             let ty = document.variable_type(&receiver, offset)?;
             let ancestors = self.owner_ancestors(&ty, document.project());
@@ -686,8 +748,15 @@ impl Server {
                         .collect::<Vec<_>>();
                     (matches.len() == 1).then(|| matches[0])
                 })
-        }?;
-        Some(declaration.signature_help(call.argument))
+        };
+        declaration
+            .map(|declaration| declaration.signature_help(call.argument))
+            .or_else(|| {
+                global
+                    .then(|| native_collection_declaration(&call.name))
+                    .flatten()
+                    .map(|native| native.signature_help(call.argument))
+            })
     }
 
     fn definition(
@@ -1318,6 +1387,103 @@ impl Declaration {
     }
 }
 
+type NativeCollectionSpec = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+const NATIVE_COLLECTIONS: &[NativeCollectionSpec] = &[
+    (
+        "vector_map",
+        &[("values", "vector<T>"), ("callback", "callable<T, U>")],
+        "vector<U>",
+    ),
+    (
+        "vector_filter",
+        &[("values", "vector<T>"), ("callback", "callable<T, bool>")],
+        "vector<T>",
+    ),
+    (
+        "vector_slice",
+        &[
+            ("values", "vector<T>"),
+            ("offset", "int"),
+            ("length", "?int"),
+        ],
+        "vector<T>",
+    ),
+    (
+        "vector_concat",
+        &[("first", "vector<T>"), ("second", "vector<T>")],
+        "vector<T>",
+    ),
+    (
+        "map_transform",
+        &[("values", "map<K, V>"), ("callback", "callable<V, K, U>")],
+        "map<K, U>",
+    ),
+    (
+        "map_filter",
+        &[
+            ("values", "map<K, V>"),
+            ("callback", "callable<V, K, bool>"),
+        ],
+        "map<K, V>",
+    ),
+    (
+        "map_merge",
+        &[("first", "map<K, V>"), ("second", "map<K, V>")],
+        "map<K, V>",
+    ),
+    (
+        "iterator_apply",
+        &[
+            ("iterator", "Iterator<K, V>"),
+            ("callback", "callable<V, K, bool>"),
+        ],
+        "int",
+    ),
+];
+
+fn callable_declaration(
+    name: &str,
+    parameters: Vec<(String, String)>,
+    result: &str,
+) -> Declaration {
+    let rendered = parameters
+        .iter()
+        .map(|(name, ty)| format!("{ty} ${name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Declaration {
+        id: DeclarationId::new("<native>", DeclarationKind::Function, None, name),
+        kind: DeclarationKind::Function,
+        name: name.to_owned(),
+        owner: None,
+        name_span: Span::empty(0),
+        start: 0,
+        signature: format!("{name}({rendered}): {result}"),
+        parameters,
+        documentation: None,
+    }
+}
+
+fn native_collection_declaration(name: &str) -> Option<Declaration> {
+    let name = name.strip_prefix('\\').unwrap_or(name);
+    let (_, parameters, result) = NATIVE_COLLECTIONS
+        .iter()
+        .find(|(candidate, _, _)| *candidate == name)?;
+    Some(callable_declaration(
+        name,
+        parameters
+            .iter()
+            .map(|(name, ty)| ((*name).to_owned(), (*ty).to_owned()))
+            .collect(),
+        result,
+    ))
+}
+
 #[derive(Clone, Debug, Default)]
 struct DocblockIndex {
     blocks: Vec<Docblock>,
@@ -1646,27 +1812,8 @@ impl DocumentState {
     }
 
     fn compiler_local(&self, name: &str, offset: usize) -> Option<String> {
-        self.compilation
-            .hir
-            .as_ref()
-            .and_then(|hir| {
-                hir.functions
-                    .iter()
-                    .filter(|function| {
-                        function.span.start as usize <= offset
-                            && offset <= function.span.end as usize
-                    })
-                    .min_by_key(|function| function.span.end - function.span.start)
-                    .or_else(|| {
-                        hir.functions
-                            .iter()
-                            .find(|function| function.owner.is_none())
-                    })?
-                    .locals
-                    .iter()
-                    .find(|local| local.name == name)
-                    .map(|local| local.ty.to_string())
-            })
+        self.compiler_local_type(name, offset)
+            .map(ToString::to_string)
             .or_else(|| source_local_type(&self.program, name, offset))
             .map(|ty| {
                 let base = base_nominal(&ty);
@@ -1682,6 +1829,7 @@ impl DocumentState {
                         | "never"
                         | "vector"
                         | "map"
+                        | "callable"
                 ) {
                     ty
                 } else {
@@ -1689,6 +1837,26 @@ impl DocumentState {
                     ty.replacen(&base, &resolved, 1)
                 }
             })
+    }
+
+    fn compiler_local_type(&self, name: &str, offset: usize) -> Option<&Type> {
+        self.compilation.hir.as_ref().and_then(|hir| {
+            hir.functions
+                .iter()
+                .filter(|function| {
+                    function.span.start as usize <= offset && offset <= function.span.end as usize
+                })
+                .min_by_key(|function| function.span.end - function.span.start)
+                .or_else(|| {
+                    hir.functions
+                        .iter()
+                        .find(|function| function.owner.is_none())
+                })?
+                .locals
+                .iter()
+                .find(|local| local.name == name)
+                .map(|local| &local.ty)
+        })
     }
 
     fn function_candidates(&self, name: &str) -> Vec<String> {
@@ -3269,6 +3437,7 @@ fn receiver_before(text: &str, offset: usize) -> Option<String> {
 struct CallSite {
     receiver: Option<String>,
     name: String,
+    variable: bool,
     argument: u32,
 }
 
@@ -3296,6 +3465,16 @@ fn call_before(text: &str, offset: usize) -> Option<CallSite> {
     }
     let open = open?;
     let name_end = open.checked_sub(1)?;
+    if tokens[name_end].kind == TokenKind::Variable {
+        return Some(CallSite {
+            receiver: None,
+            name: prefix[tokens[name_end].span.range()]
+                .trim_start_matches('$')
+                .to_owned(),
+            variable: true,
+            argument,
+        });
+    }
     if tokens[name_end].kind != TokenKind::Identifier {
         return None;
     }
@@ -3308,6 +3487,9 @@ fn call_before(text: &str, offset: usize) -> Option<CallSite> {
     }
     if name_start > 0 && tokens[name_start - 1].kind == TokenKind::NamespaceSeparator {
         name_start -= 1;
+    }
+    if name_start > 0 && tokens[name_start - 1].kind == TokenKind::DoubleColon {
+        return None;
     }
     let name = prefix[tokens[name_start].span.start as usize..tokens[name_end].span.end as usize]
         .to_owned();
@@ -3322,6 +3504,7 @@ fn call_before(text: &str, offset: usize) -> Option<CallSite> {
     Some(CallSite {
         receiver,
         name,
+        variable: false,
         argument,
     })
 }
@@ -3378,6 +3561,13 @@ fn semantic_kind(document: &DocumentState, token: &Token) -> (u32, u32) {
             let parameter =
                 document.program.statements.iter().any(|statement| {
                     statement_parameters(statement).any(|span| span == token.span)
+                }) || document.compilation.hir.as_ref().is_some_and(|hir| {
+                    hir.functions.iter().any(|function| {
+                        function
+                            .parameters
+                            .iter()
+                            .any(|id| function.locals[id.0 as usize].span == token.span)
+                    })
                 });
             let declaration = parameter
                 // ponytail: linear local lookup keeps the 0.1 index simple; cache it if large files profile poorly.
@@ -3427,6 +3617,7 @@ fn semantic_kind(document: &DocumentState, token: &Token) -> (u32, u32) {
         TokenKind::Integer | TokenKind::Float => (10, 0),
         TokenKind::OpenTag
         | TokenKind::Function
+        | TokenKind::Fn
         | TokenKind::Namespace
         | TokenKind::Class
         | TokenKind::Interface
@@ -3740,6 +3931,67 @@ mod tests {
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn callable_and_collection_features_have_editor_support() {
+        let source = "<?thp\n$callback: callable<int, int> = fn(int $value): int => $value;\n$values = vector_map([1], $callback);\necho $callback(2);\n";
+        let uri = Uri::from_str("file:///collections.thp").unwrap();
+        let document = DocumentState::new(&uri, 1, source.to_owned());
+        assert!(document.diagnostics.is_empty());
+        let token = |text: &str| {
+            document
+                .tokens
+                .iter()
+                .find(|token| &source[token.span.range()] == text)
+                .unwrap()
+        };
+        assert_eq!(super::semantic_kind(&document, token("fn")).0, 8);
+        assert_eq!(super::semantic_kind(&document, token("$value")).0, 6);
+        let mut server = Server::default();
+        server.documents.insert(uri, document);
+        let completion = server
+            .completion(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": "file:///collections.thp" },
+                    "position": position(source, source.find("vector_map").unwrap() + 3)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let lsp_types::CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        for (name, _, _) in super::NATIVE_COLLECTIONS {
+            assert!(items.iter().any(|item| item.label == *name), "{name}");
+        }
+        let hover = server
+            .hover(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": "file:///collections.thp" },
+                    "position": position(source, source.find("vector_map").unwrap() + 2)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(format!("{:?}", hover.contents).contains("vector_map"));
+        for (needle, prefix, label, active) in [
+            ("$callback);", "$callback", "vector_map", 1),
+            ("$callback(2)", "$callback(2", "$callback", 0),
+        ] {
+            let offset = source.find(needle).unwrap() + prefix.len();
+            let help = server
+                .signature_help(
+                    serde_json::from_value(serde_json::json!({
+                        "textDocument": { "uri": "file:///collections.thp" },
+                        "position": position(source, offset)
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(help.signatures[0].label.contains(label));
+            assert_eq!(help.active_parameter, Some(active));
         }
     }
 
@@ -4345,10 +4597,15 @@ function inspect(): void { greet("Ada, Lovelace", 1); }
             let completion = server
                 .completion(serde_json::from_value(params).unwrap())
                 .unwrap();
-            assert_eq!(
-                serde_json::to_value(completion).unwrap(),
-                serde_json::json!([])
-            );
+            let lsp_types::CompletionResponse::Array(items) = completion else {
+                panic!("expected completion array");
+            };
+            assert_eq!(items.len(), super::NATIVE_COLLECTIONS.len());
+            assert!(items.iter().all(|item| {
+                super::NATIVE_COLLECTIONS
+                    .iter()
+                    .any(|(name, _, _)| *name == item.label)
+            }));
         }
     }
 
@@ -4407,6 +4664,19 @@ function inspect(): void { greet("Ada, Lovelace", 1); }
                 )
                 .is_none()
         );
+        let source = "<?thp\nclass User {}\n$user = new User();\n$user->vector_map();\n";
+        let (server, uri) = server_with_source(source);
+        assert!(
+            server
+                .hover(
+                    serde_json::from_value(serde_json::json!({
+                        "textDocument": { "uri": uri },
+                        "position": position(source, source.find("vector_map").unwrap() + 2)
+                    }))
+                    .unwrap()
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -4428,19 +4698,103 @@ function inspect(): void { greet("Ada, Lovelace", 1); }
 
     #[test]
     fn signature_help_on_unknown_methods_returns_none() {
-        let source = "<?thp\nclass User {}\n$user = new User();\n$user->missing();\n";
+        for method in ["missing", "vector_map"] {
+            let source =
+                format!("<?thp\nclass User {{}}\n$user = new User();\n$user->{method}();\n");
+            let (server, uri) = server_with_source(&source);
+            assert!(
+                server
+                    .signature_help(
+                        serde_json::from_value(serde_json::json!({
+                            "textDocument": { "uri": uri },
+                            "position": position(&source, source.rfind("();").unwrap() + 1)
+                        }))
+                        .unwrap()
+                    )
+                    .is_none(),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_collection_signature_does_not_apply_to_static_methods() {
+        let source = "<?thp\nclass User {}\nUser::vector_map();\n";
         let (server, uri) = server_with_source(source);
         assert!(
             server
                 .signature_help(
                     serde_json::from_value(serde_json::json!({
                         "textDocument": { "uri": uri },
-                        "position": position(source, source.rfind("();").unwrap() + 1)
+                        "position": position(source, source.find("();").unwrap() + 1)
                     }))
                     .unwrap()
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn native_collection_signature_does_not_apply_to_imported_aliases() {
+        let source = "<?thp\nuse function App\\missing as vector_map;\nvector_map();\n";
+        let (server, uri) = server_with_source(source);
+        assert!(
+            server
+                .signature_help(
+                    serde_json::from_value(serde_json::json!({
+                        "textDocument": { "uri": uri },
+                        "position": position(source, source.find("();").unwrap() + 1)
+                    }))
+                    .unwrap()
+                )
+                .is_none()
+        );
+        assert!(
+            server
+                .hover(
+                    serde_json::from_value(serde_json::json!({
+                        "textDocument": { "uri": uri },
+                        "position": position(source, source.rfind("vector_map").unwrap() + 2)
+                    }))
+                    .unwrap()
+                )
+                .is_none()
+        );
+        let completion = server
+            .completion(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": position(source, source.rfind("vector_map").unwrap() + 2)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let lsp_types::CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        assert!(!items.iter().any(|item| item.label == "vector_map"));
+    }
+
+    #[test]
+    fn native_collection_hover_ignores_text_in_strings_and_comments() {
+        let source = "<?thp\necho \"vector_map\"; // vector_map\n";
+        let (server, uri) = server_with_source(source);
+        for offset in [
+            source.find("vector_map").unwrap(),
+            source.rfind("vector_map").unwrap(),
+        ] {
+            assert!(
+                server
+                    .hover(
+                        serde_json::from_value(serde_json::json!({
+                            "textDocument": { "uri": uri },
+                            "position": position(source, offset + 2)
+                        }))
+                        .unwrap()
+                    )
+                    .is_none()
+            );
+        }
     }
 
     #[test]
