@@ -13,7 +13,7 @@ notice: >-
   analysis synchronously. Documentation and @var hints affect tooling only.
 ---
 
-`thp-lsp` 0.5.0 is versioned independently from the THP compiler under
+`thp-lsp` 0.6.0 is versioned independently from the THP compiler under
 `thp-lsp-v*` tags. Configure an editor's generic LSP client with language ID
 `thp`, file extension `.thp`, and either `thp-lsp` or `thp-lsp --stdio`. Both
 forms communicate exclusively through Language Server Protocol messages on
@@ -33,7 +33,7 @@ literals, line breaks, blank-line count, line-ending style, and final-newline
 presence; invalid syntax produces no edits.
 
 Editor plugins and syntax grammars are released from separate repositories.
-Version 0.5.0 does not advertise code actions, inlay hints, call hierarchy,
+Version 0.6.0 does not advertise code actions, inlay hints, call hierarchy,
 range formatting, incremental synchronization, or TCP transport.
 
 ## Workspace discovery

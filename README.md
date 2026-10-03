@@ -48,7 +48,7 @@ target/release/thp run examples/hello.thp
 target/release/thp-lsp --version
 ```
 
-`thp-lsp` 0.5.0 is versioned independently under `thp-lsp-v*` tags. Its
+`thp-lsp` 0.6.0 is versioned independently under `thp-lsp-v*` tags. Its
 release archives contain only the experimental language server; editor plugins
 remain separate projects. See the
 [editor support guide](doc/content/guides/editor-support.md).
