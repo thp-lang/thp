@@ -88,7 +88,7 @@ fn serves_every_advertised_request_and_recovers_from_bad_params() {
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}),
     );
     let initialized = response(&mut output, 1);
-    assert_eq!(initialized["result"]["serverInfo"]["version"], "0.5.0");
+    assert_eq!(initialized["result"]["serverInfo"]["version"], "0.6.0");
     send(
         &mut input,
         &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),

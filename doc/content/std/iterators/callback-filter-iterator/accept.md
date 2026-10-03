@@ -9,7 +9,10 @@ typeParameters: []
 parameters:
   - name: value
     type: V
-    description: Value consumed or stored by the operation.
+    description: Current inner value.
+  - name: key
+    type: K
+    description: Current inner key.
 returns:
   type: bool
   description: Invokes the callback for the current value.
@@ -19,11 +22,9 @@ errors:
       being wrapped.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
-version: "0.1"
+availability: implemented
+notice: This experimental callback dispatch executes in the standalone compiler and reference VM.
+version: "0.6"
 owner: std.spl.CallbackFilterIterator
 visibility: public
 modifiers: []
@@ -35,12 +36,14 @@ modifiers: []
 
 Invokes the callback for the current value.
 
-This operation does not change receiver state unless the description explicitly states otherwise.
+The stored callback receives `V` then `K` and returns `bool`. A direct call
+does not advance the cursor. A callback exception or allocation failure
+propagates unchanged.
 
 ## Example
 
 ```thp
-$result = $instance->accept($value);
+$result = $instance->accept($value, $key);
 ```
 
 The call uses the signature and defaults documented above.

@@ -965,6 +965,8 @@ fn collect_body_block(block: &Block, output: &mut Vec<(bool, String)>) {
 
 fn collect_body_expr(expression: &Expr, output: &mut Vec<(bool, String)>) {
     match &expression.kind {
+        ExprKind::Closure { body, .. } => collect_body_block(body, output),
+        ExprKind::Name(name) => output.push((true, name.clone())),
         ExprKind::Call { callee, arguments } => {
             if let ExprKind::Name(name) = &callee.kind {
                 output.push((true, name.clone()));
@@ -1048,8 +1050,7 @@ fn collect_body_expr(expression: &Expr, output: &mut Vec<(bool, String)>) {
         | ExprKind::Bool(_)
         | ExprKind::Null
         | ExprKind::String(_)
-        | ExprKind::Variable(_)
-        | ExprKind::Name(_) => {}
+        | ExprKind::Variable(_) => {}
     }
 }
 
@@ -1468,6 +1469,23 @@ fn resolve_expr(
     index: &ExportIndex,
 ) {
     match &mut expression.kind {
+        ExprKind::Name(name) => {
+            *name = resolve_function_name(name, namespace, function_aliases, index);
+        }
+        ExprKind::Closure {
+            parameters,
+            return_type,
+            body,
+            ..
+        } => {
+            for parameter in parameters {
+                resolve_type(&mut parameter.ty, namespace, type_aliases);
+            }
+            resolve_type(return_type, namespace, type_aliases);
+            for statement in body {
+                resolve_statement(statement, namespace, type_aliases, function_aliases, index);
+            }
+        }
         ExprKind::Call { callee, arguments } => {
             if let ExprKind::Name(name) = &mut callee.kind {
                 *name = resolve_function_name(name, namespace, function_aliases, index);
@@ -1614,8 +1632,7 @@ fn resolve_expr(
         | ExprKind::Bool(_)
         | ExprKind::Null
         | ExprKind::String(_)
-        | ExprKind::Variable(_)
-        | ExprKind::Name(_) => {}
+        | ExprKind::Variable(_) => {}
     }
 }
 
@@ -2229,6 +2246,7 @@ fn is_builtin_type(name: &str) -> bool {
             | "Map"
             | "vector"
             | "map"
+            | "callable"
             | "Stream"
             | "Exception"
             | "Traversable"
@@ -2350,7 +2368,7 @@ mod tests {
         );
         let source = SourceFile::new(
             "main.thp",
-            "<?thp\nuse Vendor\\Client as C;\nuse function Vendor\\make;\nfunction run(C $c): int { return make(); }",
+            "<?thp\nuse Vendor\\Client as C;\nuse function Vendor\\make;\nfunction run(C $c): int { return make(); }\n$callback = make;",
         );
         let mut program = parse(&source).program;
         assert!(resolve_program(&mut program, &index).is_empty());
@@ -2361,6 +2379,10 @@ mod tests {
             panic!("expected named type");
         };
         assert_eq!(name, "Vendor\\Client");
+        let StmtKind::Assign { value, .. } = &program.statements[1].kind else {
+            panic!("expected callable assignment");
+        };
+        assert!(matches!(&value.kind, thp_syntax::ExprKind::Name(name) if name == "Vendor\\make"));
     }
 
     #[test]

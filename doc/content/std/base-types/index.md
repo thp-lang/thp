@@ -52,10 +52,30 @@ generic element and key constraints. `[]` creates a vector,
 `{key => value}` creates a map, and both support bracket access.
 
 Collection operations use global functions prefixed by their native input
-shape rather than methods or PHP's `array_*` names. Proposed functions include
-`vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()`,
-`map_transform()`, `map_filter()`, and `map_merge()`. These transformations are
-proposed. `count(string|vector<T>|map<K, V>): int` reads the collection length
+shape rather than methods or PHP's `array_*` names. The following operations
+execute in the reference VM:
+
+| Operation                                            | Callback arguments and result | Result keys                                  | Empty input inference                                |
+| ---------------------------------------------------- | ----------------------------- | -------------------------------------------- | ---------------------------------------------------- |
+| [`vector_map()`](thp:std.baseTypes.vector_map)       | `(T): U`                      | Dense `0..n-1`                               | `T` from callback, `U` from return type              |
+| [`vector_filter()`](thp:std.baseTypes.vector_filter) | `(T): bool`                   | Dense `0..n-1`                               | `T` from callback                                    |
+| [`vector_slice()`](thp:std.baseTypes.vector_slice)   | None                          | Dense `0..n-1`                               | Expected `vector<T>` required                        |
+| [`vector_concat()`](thp:std.baseTypes.vector_concat) | None                          | Dense `0..n-1`                               | Other operand, or expected `vector<T>` if both empty |
+| [`map_transform()`](thp:std.baseTypes.map_transform) | `(V, K): U`                   | Original keys and positions                  | `V`, `K` from callback; `U` from return type         |
+| [`map_filter()`](thp:std.baseTypes.map_filter)       | `(V, K): bool`                | Retained keys and positions                  | `V`, `K` from callback                               |
+| [`map_merge()`](thp:std.baseTypes.map_merge)         | None                          | First position of each key; right value wins | Other operand, or expected `map<K, V>` if both empty |
+
+Each callback is called once per visited input in source order. Filter
+callbacks must return `bool`; no truthiness conversion occurs. Inputs keep
+their value semantics and are unchanged. A callback exception stops the
+operation at that element and propagates without a partial result. Allocation
+failure, including result growth or closure creation, stops with the runtime's
+allocation error; no partial result is returned. Operations without callbacks
+have no callback exception path, but still report allocation failure. An empty
+result retains its statically determined generic types. An untyped empty
+literal with no expected type is a compile error.
+
+`count(string|vector<T>|map<K, V>): int` reads the collection length
 without consuming, moving, or creating traversal state. Implemented
 [`iterator_count()`](thp:std.spl.iterator_count) instead accepts an
 `Iterator<K, V>`, counts from its current cursor through exhaustion, advances

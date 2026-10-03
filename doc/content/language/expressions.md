@@ -11,7 +11,8 @@ availability: partial
 notice: >-
   Literals, variables, typed operators, statically resolved calls, object
   construction, native collection access and assignment, and `match` execute.
-  Ternaries, general dynamic calls, and general reference expressions remain proposals.
+  Closures and typed callable-value calls also execute. Ternaries, arbitrary
+  dynamic function names, and general reference expressions remain proposals.
 ---
 
 An expression produces a value or performs an operation. Literals, variables,
@@ -42,8 +43,9 @@ from left to right.
 Each executable expression has a type. Assignments, arguments, returns,
 properties, and collection elements are checked against their expected types.
 
-Dynamic calls, capturing closures, and general reference expressions do not yet
-have stable THP contracts.
+Typed callable values can be invoked as `$callback($value)` or through a
+parenthesized closure expression. Arbitrary string-based function calls and
+general reference expressions remain proposals.
 
 Dynamic construction is the narrow exception: `new $class(...)` and
 `new (expression)<T>(...)` accept a statically narrowed `string` target and

@@ -17,7 +17,7 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 4;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 5;
 
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -179,6 +179,14 @@ pub enum InstructionKind {
     },
     Call {
         callee: Callee,
+        arguments: Vec<Register>,
+    },
+    Closure {
+        function: FunctionId,
+        captures: Vec<Register>,
+    },
+    CallValue {
+        callee: Register,
         arguments: Vec<Register>,
     },
     DirectMethod {
@@ -461,6 +469,14 @@ fn lower_instruction(instruction: &thp_mir::InstructionKind) -> InstructionKind 
             value: *value,
         },
         thp_mir::InstructionKind::Call { callee, arguments } => InstructionKind::Call {
+            callee: *callee,
+            arguments: arguments.clone(),
+        },
+        thp_mir::InstructionKind::Closure { function, captures } => InstructionKind::Closure {
+            function: *function,
+            captures: captures.clone(),
+        },
+        thp_mir::InstructionKind::CallValue { callee, arguments } => InstructionKind::CallValue {
             callee: *callee,
             arguments: arguments.clone(),
         },
@@ -1066,6 +1082,12 @@ fn verify_encoded_type(program: &Program, ty: &Type) -> Result<(), VerificationE
             verify_encoded_type(program, key)?;
             verify_encoded_type(program, value)
         }
+        Type::Callable(parameters, result) => {
+            for parameter in parameters {
+                verify_encoded_type(program, parameter)?;
+            }
+            verify_encoded_type(program, result)
+        }
         Type::Union(members) => {
             for member in members {
                 verify_encoded_type(program, member)?;
@@ -1117,6 +1139,7 @@ fn contains_void(ty: &Type) -> bool {
         Type::Void => true,
         Type::Vector(element) => contains_void(element),
         Type::Map(key, value) => contains_void(key) || contains_void(value),
+        Type::Callable(parameters, _) => parameters.iter().any(contains_void),
         Type::Union(members) => members.iter().any(contains_void),
         Type::Nominal { arguments, .. } => arguments.iter().any(contains_void),
         _ => false,
@@ -1267,7 +1290,9 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                 let inherited =
                     instantiate_descriptor_method(inherited, class.parent_type.as_ref(), parent);
                 if method.slot != inherited.slot
-                    || !method_signature_equal(method, &inherited)
+                    || !(method_signature_equal(method, &inherited)
+                        || class.name == "CallbackFilterIterator"
+                            && inherited.name == "__construct")
                     || visibility_rank(method.visibility) < visibility_rank(inherited.visibility)
                     || (method.declaring_class == inherited.declaring_class
                         && method.callee != inherited.callee)
@@ -1429,6 +1454,13 @@ fn substitute_descriptor_type(
             Type::Map(key, value) => Type::Map(
                 Box::new(apply(key, substitutions)),
                 Box::new(apply(value, substitutions)),
+            ),
+            Type::Callable(parameters, result) => Type::Callable(
+                parameters
+                    .iter()
+                    .map(|parameter| apply(parameter, substitutions))
+                    .collect(),
+                Box::new(apply(result, substitutions)),
             ),
             Type::Union(members) => Type::Union(
                 members
@@ -1600,6 +1632,12 @@ fn infer_descriptor_instantiation(
             (Type::Map(pk, pv), Type::Map(ak, av)) => {
                 unify(pk, ak, output);
                 unify(pv, av, output);
+            }
+            (Type::Callable(pp, pr), Type::Callable(ap, ar)) if pp.len() == ap.len() => {
+                for (pattern, actual) in pp.iter().zip(ap) {
+                    unify(pattern, actual, output);
+                }
+                unify(pr, ar, output);
             }
             (
                 Type::Nominal {
@@ -2065,6 +2103,62 @@ fn verify_instruction(
             )
             .map_err(|message| error(&message))?;
         }
+        InstructionKind::Closure {
+            function: target,
+            captures,
+        } => {
+            let Some(target) = program.functions.get(target.0 as usize) else {
+                return Err(error("closure target is out of bounds"));
+            };
+            if target.owner.is_some() || target.parameters.len() < captures.len() {
+                return Err(error("invalid closure target"));
+            }
+            for (capture_index, capture) in captures.iter().enumerate() {
+                check_register(function, *capture, block, Some(index))?;
+                let parameter = target.parameters[capture_index];
+                if !type_accepts(
+                    program,
+                    &target.local_types[parameter.0 as usize],
+                    &function.register_types[capture.0 as usize],
+                ) {
+                    return Err(error("closure capture has the wrong type"));
+                }
+            }
+            let parameters = target.parameters[captures.len()..]
+                .iter()
+                .map(|local| target.local_types[local.0 as usize].clone())
+                .collect::<Vec<_>>();
+            if instruction.ty.as_ref()
+                != Some(&Type::Callable(
+                    parameters,
+                    Box::new(target.return_type.clone()),
+                ))
+            {
+                return Err(error("closure result type does not match target"));
+            }
+        }
+        InstructionKind::CallValue { callee, arguments } => {
+            check_register(function, *callee, block, Some(index))?;
+            let Type::Callable(parameters, result) = &function.register_types[callee.0 as usize]
+            else {
+                return Err(error("dynamic call target is not callable"));
+            };
+            if parameters.len() != arguments.len()
+                || instruction.ty.as_ref() != Some(result.as_ref())
+            {
+                return Err(error("dynamic call signature is incorrect"));
+            }
+            for (argument, expected) in arguments.iter().zip(parameters) {
+                check_register(function, *argument, block, Some(index))?;
+                if !type_accepts(
+                    program,
+                    expected,
+                    &function.register_types[argument.0 as usize],
+                ) {
+                    return Err(error("dynamic call argument type is incorrect"));
+                }
+            }
+        }
         InstructionKind::DirectMethod {
             callee,
             arguments,
@@ -2246,6 +2340,7 @@ fn verify_instruction(
                             | "MapIterator"
                             | "EmptyIterator"
                             | "IteratorIterator"
+                            | "CallbackFilterIterator"
                     ))
             {
                 return Err(error("only a concrete class can be allocated"));
@@ -2565,7 +2660,12 @@ fn verify_method_signature(
     caller: &Function,
 ) -> Result<(), String> {
     if arguments.len() != method.parameter_types.len() {
-        return Err("method argument count does not match signature".to_owned());
+        return Err(format!(
+            "method {} argument count {} does not match signature {}",
+            method.name,
+            arguments.len(),
+            method.parameter_types.len()
+        ));
     }
     for (argument, parameter) in arguments.iter().zip(&method.parameter_types) {
         if !type_accepts(
@@ -2715,6 +2815,113 @@ fn verify_builtin_call(
             .ok_or_else(|| format!("builtin requires a {expected} receiver"))
     };
     match builtin {
+        Builtin::VectorMap | Builtin::VectorFilter => {
+            if arguments.len() != 2 {
+                return Err("vector callback operation requires two arguments".to_owned());
+            }
+            let Type::Vector(element) = argument_type(0) else {
+                return Err("vector callback operation requires a vector".to_owned());
+            };
+            let Type::Callable(parameters, callback_result) = argument_type(1) else {
+                return Err("vector callback operation requires a callable".to_owned());
+            };
+            if parameters.as_slice() != [element.as_ref().clone()] {
+                return Err("vector callback parameter type is wrong".to_owned());
+            }
+            let expected = if builtin == Builtin::VectorMap {
+                Type::Vector(callback_result.clone())
+            } else {
+                if callback_result.as_ref() != &Type::Bool {
+                    return Err("vector filter callback must return bool".to_owned());
+                }
+                argument_type(0).clone()
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "vector callback result type is wrong".to_owned())
+        }
+        Builtin::VectorSlice => {
+            if arguments.len() != 3
+                || !matches!(argument_type(0), Type::Vector(_))
+                || argument_type(1) != &Type::Int
+                || !type_accepts(
+                    program,
+                    &Type::Union(vec![Type::Int, Type::Null]),
+                    argument_type(2),
+                )
+                || result != Some(argument_type(0))
+            {
+                return Err("invalid vector_slice signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::VectorConcat => {
+            if arguments.len() != 2
+                || !matches!(argument_type(0), Type::Vector(_))
+                || !type_accepts(program, argument_type(0), argument_type(1))
+                || result != Some(argument_type(0))
+            {
+                return Err("invalid vector_concat signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::MapTransform | Builtin::MapFilter => {
+            if arguments.len() != 2 {
+                return Err("map callback operation requires two arguments".to_owned());
+            }
+            let Type::Map(key, value) = argument_type(0) else {
+                return Err("map callback operation requires a map".to_owned());
+            };
+            let Type::Callable(parameters, callback_result) = argument_type(1) else {
+                return Err("map callback operation requires a callable".to_owned());
+            };
+            if parameters.as_slice() != [value.as_ref().clone(), key.as_ref().clone()] {
+                return Err("map callback parameter types are wrong".to_owned());
+            }
+            let expected = if builtin == Builtin::MapTransform {
+                Type::Map(key.clone(), callback_result.clone())
+            } else {
+                if callback_result.as_ref() != &Type::Bool {
+                    return Err("map filter callback must return bool".to_owned());
+                }
+                argument_type(0).clone()
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "map callback result type is wrong".to_owned())
+        }
+        Builtin::MapMerge => {
+            if arguments.len() != 2
+                || !matches!(argument_type(0), Type::Map(_, _))
+                || !type_accepts(program, argument_type(0), argument_type(1))
+                || result != Some(argument_type(0))
+            {
+                return Err("invalid map_merge signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::IteratorApply => {
+            if arguments.len() != 2 || result != Some(&Type::Int) {
+                return Err("invalid iterator_apply signature".to_owned());
+            }
+            let Some(iterator_class) = class_by_name(program, "Iterator") else {
+                return Err("Iterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) =
+                instantiation_for_class(program, argument_type(0), iterator_class.id)
+            else {
+                return Err("iterator_apply requires an iterator".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("iterator_apply iterator type is wrong".to_owned());
+            };
+            if argument_type(1)
+                != &Type::Callable(vec![value.clone(), key.clone()], Box::new(Type::Bool))
+            {
+                return Err("iterator_apply callback type is wrong".to_owned());
+            }
+            Ok(())
+        }
         Builtin::IteratorFromCollection => {
             if arguments.len() != 1 {
                 return Err("invalid collection iterator conversion".to_owned());
@@ -2734,7 +2941,7 @@ fn verify_builtin_call(
                 .then_some(())
                 .ok_or_else(|| "collection iterator result type is wrong".to_owned())
         }
-        Builtin::IteratorConstruct => {
+        Builtin::IteratorConstruct | Builtin::CallbackFilterConstruct => {
             let Some((name, type_arguments)) = arguments
                 .first()
                 .and_then(|_| encoded_nominal_parts(argument_type(0)))
@@ -2746,18 +2953,46 @@ fn verify_builtin_call(
                 ("MapIterator", [key, value]) => {
                     Some(Type::Map(Box::new(key.clone()), Box::new(value.clone())))
                 }
-                ("IteratorIterator", [key, value]) => Some(Type::Nominal {
+                (
+                    "IteratorIterator" | "FilterIterator" | "CallbackFilterIterator",
+                    [key, value],
+                ) => Some(Type::Nominal {
                     name: "Iterator".to_owned(),
                     arguments: vec![key.clone(), value.clone()],
                 }),
                 ("EmptyIterator", [_, _]) => None,
-                _ => return Err("invalid iterator constructor receiver".to_owned()),
+                _ => {
+                    let Some(filter) = class_by_name(program, "FilterIterator") else {
+                        return Err("FilterIterator metadata is missing".to_owned());
+                    };
+                    let Some(instantiation) =
+                        instantiation_for_class(program, argument_type(0), filter.id)
+                    else {
+                        return Err("invalid iterator constructor receiver".to_owned());
+                    };
+                    let [key, value] = instantiation.arguments.as_slice() else {
+                        return Err("invalid filter iterator type".to_owned());
+                    };
+                    Some(Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: vec![key.clone(), value.clone()],
+                    })
+                }
             };
-            if arguments.len() != 1 + usize::from(expected_argument.is_some())
+            if (builtin == Builtin::CallbackFilterConstruct) != (name == "CallbackFilterIterator")
+                || arguments.len()
+                    != 1 + usize::from(expected_argument.is_some())
+                        + usize::from(name == "CallbackFilterIterator")
                 || result != Some(&Type::Void)
                 || expected_argument
                     .as_ref()
                     .is_some_and(|expected| !type_accepts(program, expected, argument_type(1)))
+                || (name == "CallbackFilterIterator"
+                    && argument_type(2)
+                        != &Type::Callable(
+                            vec![type_arguments[1].clone(), type_arguments[0].clone()],
+                            Box::new(Type::Bool),
+                        ))
             {
                 return Err("invalid iterator constructor".to_owned());
             }
@@ -2769,17 +3004,24 @@ fn verify_builtin_call(
         | Builtin::IteratorKey
         | Builtin::IteratorValue
         | Builtin::IteratorGetInner => {
-            let Some((name, type_arguments)) = arguments
+            let Some((name, _type_arguments)) = arguments
                 .first()
                 .and_then(|_| encoded_nominal_parts(argument_type(0)))
             else {
                 return Err("invalid iterator cursor receiver".to_owned());
             };
+            let filter = class_by_name(program, name)
+                .and_then(|class| {
+                    class_by_name(program, "FilterIterator")
+                        .map(|base| is_instance_of_id(program, class.id, base.id))
+                })
+                .unwrap_or(false);
             if arguments.len() != 1
-                || !matches!(
-                    name,
-                    "VectorIterator" | "MapIterator" | "EmptyIterator" | "IteratorIterator"
-                )
+                || (!filter
+                    && !matches!(
+                        name,
+                        "VectorIterator" | "MapIterator" | "EmptyIterator" | "IteratorIterator"
+                    ))
             {
                 return Err("invalid iterator cursor call".to_owned());
             }
@@ -2799,10 +3041,12 @@ fn verify_builtin_call(
                 Builtin::IteratorValid => Type::Bool,
                 Builtin::IteratorKey => key.clone(),
                 Builtin::IteratorValue => value.clone(),
-                Builtin::IteratorGetInner if name == "IteratorIterator" => Type::Nominal {
-                    name: "Iterator".to_owned(),
-                    arguments: type_arguments.to_vec(),
-                },
+                Builtin::IteratorGetInner if name == "IteratorIterator" || filter => {
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: vec![key.clone(), value.clone()],
+                    }
+                }
                 _ => return Err("invalid iterator cursor call".to_owned()),
             };
             (result == Some(&expected))
@@ -2832,6 +3076,27 @@ fn verify_builtin_call(
             (result == Some(&expected))
                 .then_some(())
                 .ok_or_else(|| "invalid iterator function result".to_owned())
+        }
+        Builtin::CallbackFilterAccept => {
+            if arguments.len() != 3 || result != Some(&Type::Bool) {
+                return Err("invalid callback filter acceptance call".to_owned());
+            }
+            let Some(class) = class_by_name(program, "CallbackFilterIterator") else {
+                return Err("CallbackFilterIterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) = instantiation_for_class(program, argument_type(0), class.id)
+            else {
+                return Err("callback filter requires a callback filter receiver".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("invalid filter arguments".to_owned());
+            };
+            if !type_accepts(program, value, argument_type(1))
+                || !type_accepts(program, key, argument_type(2))
+            {
+                return Err("callback filter argument types are wrong".to_owned());
+            }
+            Ok(())
         }
         Builtin::IsString
         | Builtin::IsInt
@@ -3338,6 +3603,7 @@ fn valid_checked_narrow(program: &Program, source: &Type, narrowed: &Type) -> bo
                     | Type::Null
                     | Type::Vector(_)
                     | Type::Map(_, _)
+                    | Type::Callable(_, _)
                     | Type::Object(_)
                     | Type::Nominal { .. }
                     | Type::Parameter { .. } => true,
@@ -3561,6 +3827,33 @@ mod tests {
         verify(&decoded).unwrap();
         assert_eq!(decoded.instruction_count(), program.instruction_count());
         assert_eq!(decoded.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn captured_callable_and_collection_call_round_trip_and_reject_bad_target() {
+        let source = "<?thp\n$base: int = 3;\n$callback = fn(int $value): int => $value + $base;\n$values = vector_map([1, 2], $callback);\necho $callback($values[0]);";
+        let mut program = compile(source);
+        verify(&program).unwrap();
+        let decoded = decode(&encode(&program)).unwrap();
+        verify(&decoded).unwrap();
+        assert_eq!(decoded.to_string(), program.to_string());
+
+        let instruction = program.functions[program.entry.0 as usize]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| matches!(instruction.kind, super::InstructionKind::Closure { .. }))
+            .expect("captured closure");
+        let super::InstructionKind::Closure { function, .. } = &mut instruction.kind else {
+            unreachable!()
+        };
+        *function = thp_hir::FunctionId(u32::MAX);
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("closure target is out of bounds")
+        );
     }
 
     #[test]

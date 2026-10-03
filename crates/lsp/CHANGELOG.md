@@ -2,8 +2,16 @@
 
 All notable user-visible changes to THP are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html). GitHub releases
-remain marked as prereleases while THP is experimental.
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.6.0]
+
+### Added
+
+- Highlighted arrow closures and their parameters; added collection-function
+  completion, hover, and signature help, plus callable-variable signature help.
 
 ## [0.5.0]
 

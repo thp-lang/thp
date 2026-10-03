@@ -8,8 +8,9 @@ order: 40
 status: experimental
 availability: partial
 notice:
-  Native collection iterators, EmptyIterator, IteratorIterator, OuterIterator,
-  and three consuming functions are implemented. Other adapters remain proposed.
+  Native collection iterators, EmptyIterator, IteratorIterator, FilterIterator,
+  CallbackFilterIterator, OuterIterator, and four consuming functions are
+  implemented. Other adapters remain proposed.
 ---
 
 | Family                | Classes                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -63,7 +64,8 @@ identity and current cursor. Raw collections have no cursor methods.
 [`iterator_to_map()`](thp:std.spl.iterator_to_map) consume an `Iterator<K, V>`
 from its current cursor without rewinding. The vector conversion discards keys;
 the map conversion preserves order and updates repeated keys at their first
-position. [`iterator_apply()`](thp:std.spl.iterator_apply) remains proposed.
+position. [`iterator_apply()`](thp:std.spl.iterator_apply) consumes with a
+typed callback receiving the current value and key.
 [`count()`](thp:std.baseTypes) reads a string, vector, or map length without
 traversal state.
 

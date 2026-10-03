@@ -865,6 +865,27 @@ impl ExecutionState<'_, '_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 Some(self.invoke_callee(*callee, arguments, depth, None, function, instruction)?)
             }
+            InstructionKind::Closure {
+                function: target,
+                captures,
+            } => {
+                let captures = captures
+                    .iter()
+                    .map(|register| get_register(frame, *register, instruction.span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(
+                    Value::try_closure(*target, captures)
+                        .map_err(|kind| runtime(kind, instruction.span))?,
+                )
+            }
+            InstructionKind::CallValue { callee, arguments } => {
+                let callee = get_register(frame, *callee, instruction.span)?;
+                let values = arguments
+                    .iter()
+                    .map(|register| get_register(frame, *register, instruction.span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(self.invoke_callback(&callee, values, depth, function, instruction)?)
+            }
             InstructionKind::DirectMethod {
                 callee,
                 arguments,
@@ -1145,6 +1166,29 @@ impl ExecutionState<'_, '_> {
         }
     }
 
+    fn invoke_callback(
+        &mut self,
+        callback: &Value,
+        arguments: Vec<Value>,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let Some((target, captures)) = callback.closure_parts() else {
+            return Err(runtime(RuntimeErrorKind::Unreachable, instruction.span));
+        };
+        let mut values = captures.to_vec();
+        values.extend(arguments);
+        self.invoke_callee(
+            Callee::Function(target),
+            values,
+            depth,
+            None,
+            calling_function,
+            instruction,
+        )
+    }
+
     fn dispatch_target(
         &self,
         class: ClassId,
@@ -1210,6 +1254,134 @@ impl ExecutionState<'_, '_> {
             return iterator
                 .property(thp_hir::PropertyId(0))
                 .map_err(|kind| runtime(kind, span));
+        }
+        if is_instance_of_name(self.program, class, "FilterIterator") {
+            let inner = iterator
+                .property(thp_hir::PropertyId(0))
+                .map_err(|kind| runtime(kind, span))?;
+            match builtin {
+                Builtin::IteratorRewind => {
+                    self.iterator_call(&inner, "rewind", depth, calling_function, instruction)?;
+                    iterator
+                        .set_property(thp_hir::PropertyId(1), Value::bool(false))
+                        .map_err(|kind| runtime(kind, span))?;
+                    return Ok(Value::NULL);
+                }
+                Builtin::IteratorAdvance => {
+                    if self
+                        .native_iterator_method(
+                            Builtin::IteratorValid,
+                            iterator,
+                            depth,
+                            calling_function,
+                            instruction,
+                        )?
+                        .as_bool()
+                        == Some(true)
+                    {
+                        self.iterator_call(
+                            &inner,
+                            "advance",
+                            depth,
+                            calling_function,
+                            instruction,
+                        )?;
+                    }
+                    iterator
+                        .set_property(thp_hir::PropertyId(1), Value::bool(false))
+                        .map_err(|kind| runtime(kind, span))?;
+                    return Ok(Value::NULL);
+                }
+                Builtin::IteratorValid | Builtin::IteratorKey | Builtin::IteratorValue => {
+                    let ready = iterator
+                        .property(thp_hir::PropertyId(1))
+                        .map_err(|kind| runtime(kind, span))?
+                        .as_bool()
+                        == Some(true);
+                    if !ready {
+                        while self
+                            .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                            .as_bool()
+                            == Some(true)
+                        {
+                            self.tick(span)?;
+                            let value = self.iterator_call(
+                                &inner,
+                                "value",
+                                depth,
+                                calling_function,
+                                instruction,
+                            )?;
+                            let key = self.iterator_call(
+                                &inner,
+                                "key",
+                                depth,
+                                calling_function,
+                                instruction,
+                            )?;
+                            let method = self.program.classes[class.0 as usize]
+                                .methods
+                                .iter()
+                                .find(|method| method.name == "accept")
+                                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+                            let (callee, _) = self.dispatch_target(class, method.slot, span)?;
+                            let accepted = self.invoke_callee(
+                                callee,
+                                vec![iterator.clone(), value, key],
+                                depth,
+                                Some(class),
+                                calling_function,
+                                instruction,
+                            )?;
+                            if accepted.as_bool() == Some(true) {
+                                iterator
+                                    .set_property(thp_hir::PropertyId(1), Value::bool(true))
+                                    .map_err(|kind| runtime(kind, span))?;
+                                break;
+                            }
+                            self.iterator_call(
+                                &inner,
+                                "advance",
+                                depth,
+                                calling_function,
+                                instruction,
+                            )?;
+                        }
+                    }
+                    if builtin == Builtin::IteratorValid {
+                        return Ok(Value::bool(
+                            iterator
+                                .property(thp_hir::PropertyId(1))
+                                .map_err(|kind| runtime(kind, span))?
+                                .as_bool()
+                                == Some(true),
+                        ));
+                    }
+                    if iterator
+                        .property(thp_hir::PropertyId(1))
+                        .map_err(|kind| runtime(kind, span))?
+                        .as_bool()
+                        != Some(true)
+                    {
+                        return Err(runtime(
+                            RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                            span,
+                        ));
+                    }
+                    return self.iterator_call(
+                        &inner,
+                        if builtin == Builtin::IteratorKey {
+                            "key"
+                        } else {
+                            "value"
+                        },
+                        depth,
+                        calling_function,
+                        instruction,
+                    );
+                }
+                _ => unreachable!(),
+            }
         }
         if name == "IteratorIterator" {
             let inner = iterator
@@ -1367,6 +1539,201 @@ impl ExecutionState<'_, '_> {
         })
     }
 
+    fn execute_collection_builtin(
+        &mut self,
+        builtin: Builtin,
+        arguments: &[Value],
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        match builtin {
+            Builtin::VectorMap | Builtin::VectorFilter => {
+                let Type::Vector(element) =
+                    instruction.ty.as_ref().expect("verified vector result")
+                else {
+                    unreachable!()
+                };
+                let mut result = Value::try_vector(element.as_ref().clone(), Vec::new())
+                    .map_err(|kind| runtime(kind, span))?;
+                for value in arguments[0].vector_values().expect("verified vector") {
+                    self.tick(span)?;
+                    let mapped = self.invoke_callback(
+                        &arguments[1],
+                        vec![value.clone()],
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                    if builtin == Builtin::VectorMap || mapped.as_bool() == Some(true) {
+                        result
+                            .vector_push(if builtin == Builtin::VectorMap {
+                                mapped
+                            } else {
+                                value.clone()
+                            })
+                            .map_err(|kind| runtime(kind, span))?;
+                    }
+                }
+                Ok(result)
+            }
+            Builtin::VectorSlice => {
+                let values = arguments[0].vector_values().expect("verified vector");
+                let count = values.len();
+                let offset = arguments[1].as_int().expect("verified offset");
+                let magnitude = usize::try_from(offset.unsigned_abs()).unwrap_or(usize::MAX);
+                let start = if offset >= 0 {
+                    magnitude.min(count)
+                } else {
+                    count.saturating_sub(magnitude)
+                };
+                let end = match arguments[2].as_int() {
+                    None => count,
+                    Some(length) if length >= 0 => start
+                        .saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
+                        .min(count),
+                    Some(length) => count
+                        .saturating_sub(
+                            usize::try_from(length.unsigned_abs()).unwrap_or(usize::MAX),
+                        )
+                        .max(start),
+                };
+                let Type::Vector(element) =
+                    instruction.ty.as_ref().expect("verified vector result")
+                else {
+                    unreachable!()
+                };
+                let mut result = Value::try_vector(element.as_ref().clone(), Vec::new())
+                    .map_err(|kind| runtime(kind, span))?;
+                for value in &values[start..end] {
+                    self.tick(span)?;
+                    result
+                        .vector_push(value.clone())
+                        .map_err(|kind| runtime(kind, span))?;
+                }
+                Ok(result)
+            }
+            Builtin::VectorConcat => {
+                let Type::Vector(element) =
+                    instruction.ty.as_ref().expect("verified vector result")
+                else {
+                    unreachable!()
+                };
+                let mut result = Value::try_vector(element.as_ref().clone(), Vec::new())
+                    .map_err(|kind| runtime(kind, span))?;
+                for collection in arguments {
+                    for value in collection.vector_values().expect("verified vector") {
+                        self.tick(span)?;
+                        result
+                            .vector_push(value.clone())
+                            .map_err(|kind| runtime(kind, span))?;
+                    }
+                }
+                Ok(result)
+            }
+            Builtin::MapTransform | Builtin::MapFilter => {
+                let Type::Map(key_type, value_type) =
+                    instruction.ty.as_ref().expect("verified map result")
+                else {
+                    unreachable!()
+                };
+                let mut result = Value::try_map(
+                    key_type.as_ref().clone(),
+                    value_type.as_ref().clone(),
+                    Vec::new(),
+                )
+                .map_err(|kind| runtime(kind, span))?;
+                for (key, value) in arguments[0].map_entries().expect("verified map") {
+                    self.tick(span)?;
+                    let mapped = self.invoke_callback(
+                        &arguments[1],
+                        vec![value.clone(), key.clone()],
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                    if builtin == Builtin::MapTransform || mapped.as_bool() == Some(true) {
+                        result
+                            .set_index(
+                                key,
+                                if builtin == Builtin::MapTransform {
+                                    mapped
+                                } else {
+                                    value.clone()
+                                },
+                            )
+                            .map_err(|kind| runtime(kind, span))?;
+                    }
+                }
+                Ok(result)
+            }
+            Builtin::MapMerge => {
+                let Type::Map(key_type, value_type) =
+                    instruction.ty.as_ref().expect("verified map result")
+                else {
+                    unreachable!()
+                };
+                let mut result = Value::try_map(
+                    key_type.as_ref().clone(),
+                    value_type.as_ref().clone(),
+                    Vec::new(),
+                )
+                .map_err(|kind| runtime(kind, span))?;
+                for collection in arguments {
+                    for (key, value) in collection.map_entries().expect("verified map") {
+                        self.tick(span)?;
+                        result
+                            .set_index(key, value.clone())
+                            .map_err(|kind| runtime(kind, span))?;
+                    }
+                }
+                Ok(result)
+            }
+            Builtin::IteratorApply => {
+                let iterator = &arguments[0];
+                let mut count = 0_i64;
+                while self
+                    .iterator_call(iterator, "valid", depth, calling_function, instruction)?
+                    .as_bool()
+                    == Some(true)
+                {
+                    self.tick(span)?;
+                    let value = self.iterator_call(
+                        iterator,
+                        "value",
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                    let key =
+                        self.iterator_call(iterator, "key", depth, calling_function, instruction)?;
+                    let continue_ = self.invoke_callback(
+                        &arguments[1],
+                        vec![value, key],
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                    count = count.checked_add(1).ok_or_else(|| {
+                        runtime(
+                            RuntimeErrorKind::Arithmetic(
+                                "iterator count exceeds int range".to_owned(),
+                            ),
+                            span,
+                        )
+                    })?;
+                    self.iterator_call(iterator, "advance", depth, calling_function, instruction)?;
+                    if continue_.as_bool() == Some(false) {
+                        break;
+                    }
+                }
+                Ok(Value::integer(count))
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn execute_builtin(
         &mut self,
         builtin: Builtin,
@@ -1376,6 +1743,20 @@ impl ExecutionState<'_, '_> {
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
         match builtin {
+            Builtin::VectorMap
+            | Builtin::VectorFilter
+            | Builtin::VectorSlice
+            | Builtin::VectorConcat
+            | Builtin::MapTransform
+            | Builtin::MapFilter
+            | Builtin::MapMerge
+            | Builtin::IteratorApply => self.execute_collection_builtin(
+                builtin,
+                &arguments,
+                depth,
+                calling_function,
+                instruction,
+            ),
             Builtin::IteratorFromCollection => {
                 let class = self.result_class(instruction)?;
                 let (first, second) = arguments[0]
@@ -1394,10 +1775,9 @@ impl ExecutionState<'_, '_> {
                     .map_err(|kind| runtime(kind, instruction.span))?;
                 Ok(object)
             }
-            Builtin::IteratorConstruct => {
-                let name = &self.program.classes
-                    [arguments[0].class_id().expect("iterator object").0 as usize]
-                    .name;
+            Builtin::IteratorConstruct | Builtin::CallbackFilterConstruct => {
+                let class = arguments[0].class_id().expect("iterator object");
+                let name = &self.program.classes[class.0 as usize].name;
                 if name != "EmptyIterator" {
                     arguments[0]
                         .set_property(thp_hir::PropertyId(0), arguments[1].clone())
@@ -1408,7 +1788,29 @@ impl ExecutionState<'_, '_> {
                         .set_property(thp_hir::PropertyId(1), Value::integer(0))
                         .map_err(|kind| runtime(kind, instruction.span))?;
                 }
+                if is_instance_of_name(self.program, class, "FilterIterator") {
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(1), Value::bool(false))
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                if name == "CallbackFilterIterator" {
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(2), arguments[2].clone())
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
                 Ok(Value::NULL)
+            }
+            Builtin::CallbackFilterAccept => {
+                let callback = arguments[0]
+                    .property(thp_hir::PropertyId(2))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                self.invoke_callback(
+                    &callback,
+                    vec![arguments[1].clone(), arguments[2].clone()],
+                    depth,
+                    calling_function,
+                    instruction,
+                )
             }
             Builtin::IteratorRewind
             | Builtin::IteratorValid
@@ -3279,6 +3681,13 @@ fn substitute_type_arguments(ty: &Type, owner: ClassId, arguments: &[Type]) -> T
             Box::new(substitute_type_arguments(key, owner, arguments)),
             Box::new(substitute_type_arguments(value, owner, arguments)),
         ),
+        Type::Callable(parameters, result) => Type::Callable(
+            parameters
+                .iter()
+                .map(|parameter| substitute_type_arguments(parameter, owner, arguments))
+                .collect(),
+            Box::new(substitute_type_arguments(result, owner, arguments)),
+        ),
         Type::Union(members) => Type::Union(
             members
                 .iter()
@@ -3372,6 +3781,17 @@ fn value_type(program: &Program, value: &Value) -> Option<Type> {
             Some(value) => Type::Map(Box::new(first), Box::new(value)),
             None => Type::Vector(Box::new(first)),
         })
+    } else if let Some((target, captures)) = value.closure_parts() {
+        let target = program.functions.get(target.0 as usize)?;
+        Some(Type::Callable(
+            target
+                .parameters
+                .get(captures.len()..)?
+                .iter()
+                .map(|local| target.local_types[local.0 as usize].clone())
+                .collect(),
+            Box::new(target.return_type.clone()),
+        ))
     } else {
         let class = value.class_id()?;
         let metadata = &program.classes[class.0 as usize];
@@ -3489,6 +3909,7 @@ fn value_matches_type(program: &Program, value: &Value, expected: &Type) -> bool
         Type::Null => value.is_null(),
         Type::Vector(_) => value.vector_values().is_some(),
         Type::Map(_, _) => value.map_entries().is_some(),
+        Type::Callable(_, _) => value_type(program, value).as_ref() == Some(expected),
         Type::Union(members) => members
             .iter()
             .any(|member| value_matches_type(program, value, member)),
@@ -3589,6 +4010,7 @@ fn runtime_argument_matches(
         Type::Map(key, value) if key.as_ref() != &Type::Mixed || value.as_ref() != &Type::Mixed => {
             false
         }
+        Type::Callable(_, _) => value_type(program, value).as_ref() == Some(expected),
         _ => value_matches_type(program, value, expected),
     }
 }
@@ -3610,6 +4032,13 @@ fn substitute_runtime_type(
             Type::Map(key, value) => Type::Map(
                 Box::new(apply(key, substitutions)),
                 Box::new(apply(value, substitutions)),
+            ),
+            Type::Callable(parameters, result) => Type::Callable(
+                parameters
+                    .iter()
+                    .map(|parameter| apply(parameter, substitutions))
+                    .collect(),
+                Box::new(apply(result, substitutions)),
             ),
             Type::Union(members) => Type::Union(
                 members

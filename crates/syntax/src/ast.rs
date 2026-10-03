@@ -361,6 +361,13 @@ pub enum ExprKind {
     String(Vec<u8>),
     Variable(String),
     Name(String),
+    Closure {
+        parameters: Vec<Parameter>,
+        captures: Vec<String>,
+        implicit_captures: bool,
+        return_type: TypeSyntax,
+        body: Block,
+    },
     Vector(Vec<Expr>),
     Map(Vec<MapEntry>),
     Unary {

@@ -171,6 +171,7 @@ impl Lexer<'_, '_> {
             let text = &self.source[start..self.offset];
             let kind = match text {
                 "function" => TokenKind::Function,
+                "fn" => TokenKind::Fn,
                 "namespace" => TokenKind::Namespace,
                 "class" => TokenKind::Class,
                 "interface" => TokenKind::Interface,
