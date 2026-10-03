@@ -58,19 +58,19 @@ compiler if used as though it were available.
 
 ### Collection and iterator symbols
 
-| Symbol                                                                 | Availability | Input and cursor behavior                                                                         |
-| ---------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------- |
-| `count(string\|vector<T>\|map<K, V>): int`                             | implemented  | Reads the value's byte or collection length; it does not consume, move, or create traversal state |
-| `Traversable<K, V>`                                                    | implemented  | Executable invariant marker interface; `K` has no additional constraint                           |
-| `Iterator<K, V>`                                                       | implemented  | Executable cursor interface extending `Traversable<K, V>`                                         |
-| `IteratorAggregate<K, V>`                                              | implemented  | Executable aggregate interface; `getIterator()` returns `Traversable<K, V>`                       |
-| `foreach (Traversable<K, V>)`                                          | proposed     | Iterator-object dispatch and execution are not implemented                                        |
-| `iterator_count<K, V>(Iterator<K, V>): int`                            | proposed     | Counts from the current cursor through exhaustion, advances it, and never rewinds                 |
-| `iterator_apply()`                                                     | proposed     | Callback-driven consuming traversal is not implemented                                            |
-| `iterator_to_vector()`, `iterator_to_map()`                            | proposed     | Consuming iterator conversions are not implemented                                                |
-| `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()` | proposed     | Native-vector transformations are not implemented                                                 |
-| `map_transform()`, `map_filter()`, `map_merge()`                       | proposed     | Native-map transformations are not implemented                                                    |
-| Iterator adapters and recursive iterators                              | proposed     | All classes and members in the iterator module are documentation-only                             |
+| Symbol                                                                 | Availability | Input and cursor behavior                                                                                                        |
+| ---------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `count(string\|vector<T>\|map<K, V>): int`                             | implemented  | Reads the value's byte or collection length; it does not consume, move, or create traversal state                                |
+| `Traversable<K, V>`                                                    | implemented  | Executable invariant marker interface; `K` has no additional constraint                                                          |
+| `Iterator<K, V>`                                                       | implemented  | Executable cursor interface extending `Traversable<K, V>`                                                                        |
+| `IteratorAggregate<K, V>`                                              | implemented  | Executable aggregate interface; `getIterator()` returns `Traversable<K, V>`                                                      |
+| `foreach (Traversable<K, V>)`                                          | implemented  | Resolves aggregate layers, rewinds the direct iterator, and dispatches `valid`, `value`, optional `key`, and `advance` virtually |
+| `iterator_count<K, V>(Iterator<K, V>): int`                            | proposed     | Counts from the current cursor through exhaustion, advances it, and never rewinds                                                |
+| `iterator_apply()`                                                     | proposed     | Callback-driven consuming traversal is not implemented                                                                           |
+| `iterator_to_vector()`, `iterator_to_map()`                            | proposed     | Consuming iterator conversions are not implemented                                                                               |
+| `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()` | proposed     | Native-vector transformations are not implemented                                                                                |
+| `map_transform()`, `map_filter()`, `map_merge()`                       | proposed     | Native-map transformations are not implemented                                                                                   |
+| Iterator adapters and recursive iterators                              | proposed     | All classes and members in the iterator module are documentation-only                                                            |
 
 [`count()`](thp:std.baseTypes) and
 [`iterator_count()`](thp:std.spl.iterator_count) are separate functions, not
@@ -145,8 +145,8 @@ The current executable subset rejects unsupported syntax instead of inheriting
 PHP behavior. Pending work includes:
 
 - closures, call-site argument unpacking, by-reference parameters, general
-  assignment expressions, property-rooted collection mutation, iterator-object
-  `foreach`, and numeric `break`/`continue` levels;
+  assignment expressions, property-rooted collection mutation, and numeric
+  `break`/`continue` levels;
 - generic functions, methods, and traits, multiple-parent interfaces, interface
   state, trait constants, static properties, property hooks, magic methods,
   anonymous classes, enums, reflection attributes/source inspection, and flow

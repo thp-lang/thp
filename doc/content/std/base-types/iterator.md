@@ -19,7 +19,7 @@ constants: []
 properties: []
 status: experimental
 availability: implemented
-notice: The interface and method-dispatch contract executes; object-based foreach remains proposed.
+notice: The interface, method-dispatch contract, and object-based foreach execute.
 version: "0.1"
 ---
 
@@ -87,8 +87,8 @@ function printEntries(Iterator<int, string> $iterator): void
 }
 ```
 
-The example invokes the executable protocol directly. Passing the iterator to
-`foreach` remains proposed until iterator-object traversal is implemented.
+The example invokes the protocol directly; passing the iterator to `foreach`
+uses the same method order through virtual dispatch.
 
 ## See also
 

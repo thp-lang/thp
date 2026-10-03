@@ -15,7 +15,7 @@ constants: []
 properties: []
 status: experimental
 availability: implemented
-notice: The interface contract and generic hierarchy checks execute; object-based foreach remains proposed.
+notice: The interface contract, generic hierarchy checks, and object-based foreach execute.
 version: "0.1"
 ---
 
@@ -54,7 +54,7 @@ function acceptNames(Traversable<int, string> $values): void
 ```
 
 The parameter accepts either iterator strategy without exposing its concrete
-implementation. Iterator-object `foreach` is not executable yet.
+implementation and can be traversed directly with `foreach`.
 
 These concrete declarations are invalid:
 

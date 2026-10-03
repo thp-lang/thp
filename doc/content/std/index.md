@@ -86,10 +86,10 @@ collection function in this checkout and reads length without traversal state.
 It is distinct from proposed
 [`iterator_count()`](thp:std.spl.iterator_count), which consumes an explicit
 iterator from its current cursor without rewinding.
-The executable `foreach` implementation currently works with native vectors
-and maps, preserves single evaluation and keys, and supports `break` and
-`continue`. The proposed object protocol uses `Iterator<K, V>` for both vector
-and map iterators; iterator-object traversal remains unimplemented.
+The executable `foreach` implementation works with native vectors and maps and
+with `Traversable<K, V>` objects. It preserves single evaluation and keys and
+supports `break` and `continue`; object traversal dispatches through
+`Iterator<K, V>` or delegated `IteratorAggregate<K, V>` layers.
 
 Native collection storage is intended to let the compiler and VM lower
 construction, indexing, mutation, and iteration directly instead of wrapping

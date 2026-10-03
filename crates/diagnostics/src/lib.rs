@@ -170,7 +170,10 @@ impl SourceFile {
 
     /// Returns a one-based line and Unicode-scalar column.
     pub fn line_column(&self, offset: usize) -> (usize, usize) {
-        let offset = offset.min(self.text.len());
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
         let line_index = self
             .line_starts
             .partition_point(|start| *start as usize <= offset)
@@ -312,9 +315,7 @@ impl Diagnostic {
         );
         if let Some(text) = source.line_text(line) {
             let _ = writeln!(rendered, " {line:>4} | {text}");
-            let width = primary.map_or(1, |span| {
-                usize::max(1, (span.end.saturating_sub(span.start)) as usize)
-            });
+            let width = primary.map_or(1, |span| underline_width(source, span, line, column, text));
             let message = self
                 .labels
                 .first()
@@ -324,7 +325,7 @@ impl Diagnostic {
                 rendered,
                 "      | {}{}{}",
                 " ".repeat(column.saturating_sub(1)),
-                "^".repeat(width.min(text.len().saturating_sub(column - 1).max(1))),
+                "^".repeat(width.min(text.chars().count().saturating_sub(column - 1).max(1)),),
                 message,
             );
         }
@@ -339,7 +340,8 @@ impl Diagnostic {
                 label_column
             );
             if let Some(text) = label_source.line_text(label_line) {
-                let width = usize::max(1, label.span.end.saturating_sub(label.span.start) as usize);
+                let width =
+                    underline_width(label_source, label.span, label_line, label_column, text);
                 let message = label
                     .message
                     .as_deref()
@@ -349,7 +351,9 @@ impl Diagnostic {
                     rendered,
                     "      | {}{}{}",
                     " ".repeat(label_column.saturating_sub(1)),
-                    "^".repeat(width.min(text.len().saturating_sub(label_column - 1).max(1))),
+                    "^".repeat(
+                        width.min(text.chars().count().saturating_sub(label_column - 1).max(1),),
+                    ),
                     message,
                 );
             }
@@ -358,6 +362,21 @@ impl Diagnostic {
             let _ = writeln!(rendered, " note: {note}");
         }
         rendered
+    }
+}
+
+fn underline_width(
+    source: &SourceFile,
+    span: Span,
+    line: usize,
+    column: usize,
+    text: &str,
+) -> usize {
+    let (end_line, end_column) = source.line_column(span.end as usize);
+    if end_line == line {
+        end_column.saturating_sub(column).max(1)
+    } else {
+        text.chars().count().saturating_sub(column - 1).max(1)
     }
 }
 
@@ -372,12 +391,26 @@ mod tests {
     }
 
     #[test]
+    fn locations_tolerate_offsets_inside_unicode_scalars() {
+        let source = SourceFile::new("test.thp", "éx");
+        assert_eq!(source.line_column(1), (1, 1));
+    }
+
+    #[test]
     fn renders_source_location_and_code() {
         let source = SourceFile::new("test.thp", "<?thp\n$x = nope;\n");
         let diagnostic = Diagnostic::error("typing", "T1001", Span::new(11, 15), "unknown name");
         let rendered = diagnostic.render(&source);
         assert!(rendered.contains("test.thp:2:6: error[T1001]"));
         assert!(rendered.contains("^^^^"));
+    }
+
+    #[test]
+    fn renders_unicode_spans_in_scalar_columns() {
+        let source = SourceFile::new("test.thp", "<?thp\nπ;\n");
+        let diagnostic = Diagnostic::error("typing", "T1001", Span::new(6, 8), "unknown name");
+        let rendered = diagnostic.render(&source);
+        assert!(rendered.contains("      | ^\n"), "{rendered}");
     }
 
     #[test]

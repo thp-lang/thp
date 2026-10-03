@@ -540,6 +540,18 @@ pub struct Statement {
     pub span: Span,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ForeachObjectProtocol {
+    pub iterator: ClassId,
+    pub aggregate: ClassId,
+    pub get_iterator: MethodSlot,
+    pub rewind: MethodSlot,
+    pub valid: MethodSlot,
+    pub key: MethodSlot,
+    pub value: MethodSlot,
+    pub advance: MethodSlot,
+}
+
 #[derive(Clone, Debug)]
 pub enum StatementKind {
     Assign {
@@ -569,6 +581,7 @@ pub enum StatementKind {
         value: LocalId,
         key_type: Type,
         value_type: Type,
+        object_protocol: Option<ForeachObjectProtocol>,
         body: Vec<Statement>,
     },
     Break,
@@ -2646,19 +2659,52 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 body,
             } => {
                 let source = self.lower_expression(source, None)?;
-                let (key_type, value_type) = match &source.ty {
-                    Type::Vector(value) => (Type::Int, value.as_ref().clone()),
-                    Type::Map(key, value) => (key.as_ref().clone(), value.as_ref().clone()),
+                let (key_type, value_type, object_protocol) = match &source.ty {
+                    Type::Vector(value) => (Type::Int, value.as_ref().clone(), None),
+                    Type::Map(key, value) => (key.as_ref().clone(), value.as_ref().clone(), None),
                     other => {
-                        self.diagnostics.push(Diagnostic::error(
-                            "typing",
-                            "T0610",
-                            source.span,
-                            format!(
-                                "`foreach` requires `vector<T>` or `map<K, V>`, found `{other}`"
-                            ),
-                        ));
-                        return None;
+                        let nominal = match other {
+                            Type::Object(_) | Type::Nominal { .. } => Some(other.clone()),
+                            Type::Parameter { id, .. } => self
+                                .classes
+                                .values()
+                                .flat_map(|class| &class.type_parameters)
+                                .find(|parameter| parameter.id == *id)
+                                .and_then(|parameter| parameter.bound.clone()),
+                            _ => None,
+                        };
+                        let Some(Type::Nominal { arguments, .. }) = nominal
+                            .as_ref()
+                            .and_then(|ty| instantiated_ancestor(ty, "Traversable", self.classes))
+                        else {
+                            self.diagnostics.push(Diagnostic::error(
+                                "typing",
+                                "T0610",
+                                source.span,
+                                format!(
+                                    "`foreach` requires `vector<T>`, `map<K, V>`, or `Traversable<K, V>`, found `{other}`"
+                                ),
+                            ));
+                            return None;
+                        };
+                        let [key_type, value_type] = arguments.as_slice() else {
+                            unreachable!("validated Traversable types have two arguments")
+                        };
+                        (
+                            key_type.clone(),
+                            value_type.clone(),
+                            Some(ForeachObjectProtocol {
+                                iterator: self.classes["Iterator"].id,
+                                aggregate: self.classes["IteratorAggregate"].id,
+                                get_iterator:
+                                    self.classes["IteratorAggregate"].methods["getIterator"].slot,
+                                rewind: self.classes["Iterator"].methods["rewind"].slot,
+                                valid: self.classes["Iterator"].methods["valid"].slot,
+                                key: self.classes["Iterator"].methods["key"].slot,
+                                value: self.classes["Iterator"].methods["value"].slot,
+                                advance: self.classes["Iterator"].methods["advance"].slot,
+                            }),
+                        )
                     }
                 };
                 if key.as_ref().is_some_and(|key| key.name == value.name) {
@@ -2688,6 +2734,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     value: value_binding.0,
                     key_type,
                     value_type,
+                    object_protocol,
                     body: lowered_body,
                 }
             }
@@ -7446,6 +7493,39 @@ class Concrete extends Both {}
             "{:?}",
             deferred.diagnostics
         );
+    }
+
+    #[test]
+    fn foreach_accepts_typed_iterators_and_aggregates() {
+        let output = typecheck(
+            r#"<?thp
+class Cursor implements Iterator<int, string> {
+    public function rewind(): void {}
+    public function valid(): bool { return false; }
+    public function key(): int { return 0; }
+    public function value(): string { return ""; }
+    public function advance(): void {}
+}
+class Values implements IteratorAggregate<int, string> {
+    public function getIterator(): Traversable<int, string> { return new Cursor(); }
+}
+function consume(Traversable<int, string> $items): void {
+    foreach ($items as $key => $value) {
+        $typedKey: int = $key;
+        $typedValue: string = $value;
+    }
+}
+foreach (new Cursor() as $key => $value) {}
+foreach (new Values() as $value) {}
+consume(new Values());
+"#,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+
+        let codes = diagnostic_codes(
+            "<?thp\nclass Plain {}\n$nullable: Traversable<int, string>|null = null;\nforeach (new Plain() as $plain) {}\nforeach (\"text\" as $character) {}\nforeach (1 as $number) {}\nforeach ($nullable as $item) {}",
+        );
+        assert_eq!(codes.iter().filter(|code| **code == "T0610").count(), 4);
     }
 
     #[test]

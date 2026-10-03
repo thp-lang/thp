@@ -7,6 +7,14 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-21
+
+### Added
+
+- lang: Implemented keyed and value-only `foreach` over invariant
+  `Traversable<K, V>` objects, including nested aggregate delegation, virtual
+  iterator dispatch, loop transfers, and cleanup-preserving failures.
+
 ## [0.3.0] - 2026-09-21
 
 ### Added

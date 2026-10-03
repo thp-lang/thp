@@ -39,6 +39,23 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                 .map_err(|_| "arguments must be valid UTF-8".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Some(argument) = arguments.iter().find(|argument| {
+        !matches!(argument.as_str(), "--help" | "--version" | "--frozen")
+            && ![
+                "--metrics=",
+                "--project=",
+                "--emit=",
+                "--engine=",
+                "--opcache=",
+                "--max-instructions=",
+                "--max-bytes=",
+            ]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix))
+            && argument.starts_with("--")
+    }) {
+        return Err(format!("unknown option `{argument}`"));
+    }
     if arguments.is_empty() || arguments.iter().any(|argument| argument == "--help") {
         print_help();
         return Ok(());
@@ -59,7 +76,38 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     let Some(command) = positional.first().copied() else {
         return Err("missing command; use `thp --help`".to_owned());
     };
+    let allowed_options: Option<&[&str]> = match command.as_str() {
+        "lock" => Some(&["--project"]),
+        "check" => Some(&["--project", "--metrics"]),
+        "inspect" => Some(&["--project", "--emit", "--metrics"]),
+        "run" => Some(&[
+            "--project",
+            "--engine",
+            "--opcache",
+            "--max-instructions",
+            "--metrics",
+            "--frozen",
+        ]),
+        "cache-warm" => Some(&["--project", "--opcache", "--metrics"]),
+        "cache-prune" => Some(&["--opcache", "--max-bytes", "--metrics"]),
+        _ => None,
+    };
+    if let Some(allowed_options) = allowed_options
+        && let Some(argument) = arguments.iter().find(|argument| {
+            argument.starts_with("--")
+                && !allowed_options.contains(
+                    &argument
+                        .split_once('=')
+                        .map_or(argument.as_str(), |(name, _)| name),
+                )
+        })
+    {
+        return Err(format!("option `{argument}` is not valid for `{command}`"));
+    }
     let path = positional.get(1).map(|value| PathBuf::from(*value));
+    if let Some(argument) = positional.get(2) {
+        return Err(format!("unexpected argument `{argument}`"));
+    }
     let project_root = option_value(&arguments, "--project")
         .map(PathBuf::from)
         .map_or_else(env::current_dir, Ok)
@@ -258,6 +306,9 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
             print_metrics(&compilation.metrics, metrics_format)
         }
         "cache-prune" => {
+            if path.is_some() {
+                return Err("`thp cache-prune` does not accept a source file".to_owned());
+            }
             let cache = option_value(&arguments, "--opcache")
                 .ok_or_else(|| "`thp cache-prune` requires `--opcache=PATH`".to_owned())?;
             if cache == "off" {

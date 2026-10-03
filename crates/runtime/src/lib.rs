@@ -1274,6 +1274,11 @@ impl Value {
     /// Returns a type error when this value is not a vector.
     pub fn vector_push(&mut self, value: Self) -> Result<usize, RuntimeErrorKind> {
         self.ensure_same_owner(&value)?;
+        if !matches!(self.heap_data(), Some(HeapData::Vector { .. })) {
+            return Err(RuntimeErrorKind::TypeError(
+                "array_push requires a vector".to_owned(),
+            ));
+        }
         self.make_heap_unique()?;
         let needs_growth = matches!(
             self.heap_data(),
@@ -1290,9 +1295,7 @@ impl Value {
                 values.push(value);
                 Ok(values.len())
             }
-            _ => Err(RuntimeErrorKind::TypeError(
-                "array_push requires a vector".to_owned(),
-            )),
+            _ => unreachable!("vector kind was validated"),
         }
     }
 
@@ -1926,6 +1929,30 @@ impl Value {
     pub fn set_index(&mut self, index: &Self, value: Self) -> Result<(), RuntimeErrorKind> {
         self.ensure_same_owner(index)?;
         self.ensure_same_owner(&value)?;
+        let vector_index = match self.heap_data() {
+            Some(HeapData::Vector { values, .. }) => {
+                let Some(index) = index.as_int() else {
+                    return Err(RuntimeErrorKind::TypeError(
+                        "vector index must be int".to_owned(),
+                    ));
+                };
+                let index = usize::try_from(index)
+                    .map_err(|_| RuntimeErrorKind::Bounds("negative vector index".to_owned()))?;
+                if index >= values.len() {
+                    return Err(RuntimeErrorKind::Bounds(
+                        "vector index out of bounds".to_owned(),
+                    ));
+                }
+                Some(index)
+            }
+            Some(HeapData::Map { .. }) => None,
+            _ => {
+                return Err(RuntimeErrorKind::TypeError(format!(
+                    "{} does not support element assignment",
+                    self.type_name()
+                )));
+            }
+        };
         self.make_heap_unique()?;
         let map_needs_growth = matches!(
             self.heap_data(),
@@ -1937,16 +1964,11 @@ impl Value {
         self.charge_growth(map_growth)?;
         match self.heap_data_mut() {
             Some(HeapData::Vector { values, .. }) => {
-                let Some(index) = index.as_int() else {
-                    return Err(RuntimeErrorKind::TypeError(
-                        "vector index must be int".to_owned(),
+                let Some(slot) = vector_index.and_then(|index| values.get_mut(index)) else {
+                    return Err(RuntimeErrorKind::Bounds(
+                        "vector index out of bounds".to_owned(),
                     ));
                 };
-                let index = usize::try_from(index)
-                    .map_err(|_| RuntimeErrorKind::Bounds("negative vector index".to_owned()))?;
-                let slot = values.get_mut(index).ok_or_else(|| {
-                    RuntimeErrorKind::Bounds("vector index out of bounds".to_owned())
-                })?;
                 *slot = value;
                 Ok(())
             }
@@ -1962,13 +1984,7 @@ impl Value {
                 }
                 Ok(())
             }
-            _ => {
-                self.release_growth(map_growth);
-                Err(RuntimeErrorKind::TypeError(format!(
-                    "{} does not support element assignment",
-                    self.type_name()
-                )))
-            }
+            _ => unreachable!("collection kind was validated"),
         }
     }
 
@@ -2714,6 +2730,27 @@ mod tests {
         left.vector_push(Value::integer(2)).unwrap();
         assert_eq!(left.count(), Some(2));
         assert_eq!(right.count(), Some(1));
+    }
+
+    #[test]
+    fn failed_collection_assignment_validates_before_detaching() {
+        let heap = RequestHeap::new(Some(1024 * 1024), None).unwrap();
+        let _active = heap.activate();
+        let mut value = Value::try_vector(Type::Int, vec![Value::integer(1)]).unwrap();
+        let _alias = value.clone();
+        let mut map = Value::try_map(Type::Int, Type::Int, Vec::new()).unwrap();
+        let _map_alias = map.clone();
+        heap.fail_allocations_after(0);
+
+        assert!(matches!(
+            value.set_index(&Value::integer(2), Value::integer(3)),
+            Err(RuntimeErrorKind::Bounds(message)) if message == "vector index out of bounds"
+        ));
+
+        assert!(matches!(
+            map.vector_push(Value::integer(1)),
+            Err(RuntimeErrorKind::TypeError(message)) if message == "array_push requires a vector"
+        ));
     }
 
     #[test]

@@ -5,9 +5,9 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    ArgumentTarget, BoundArguments, CalledClass, Callee, ClassId, FunctionId, LocalId, LoopClause,
-    LoopClauseKind, MethodSlot, PropertyId, Statement, StatementKind, Type, TypedExpr,
-    TypedExprKind,
+    ArgumentTarget, BoundArguments, CalledClass, Callee, ClassId, ForeachObjectProtocol,
+    FunctionId, LocalId, LoopClause, LoopClauseKind, MethodSlot, PropertyId, Statement,
+    StatementKind, Type, TypedExpr, TypedExprKind,
 };
 use thp_syntax::{BinaryOp, UnaryOp};
 
@@ -360,6 +360,7 @@ impl<'hir> FunctionBuilder<'hir> {
                 value,
                 key_type,
                 value_type,
+                object_protocol,
                 body,
             } => self.lower_foreach(
                 source,
@@ -367,6 +368,7 @@ impl<'hir> FunctionBuilder<'hir> {
                 *value,
                 key_type,
                 value_type,
+                *object_protocol,
                 body,
                 statement.span,
             ),
@@ -864,9 +866,16 @@ impl<'hir> FunctionBuilder<'hir> {
         value: LocalId,
         key_type: &Type,
         value_type: &Type,
+        object_protocol: Option<ForeachObjectProtocol>,
         body: &[Statement],
         span: Span,
     ) {
+        if let Some(protocol) = object_protocol {
+            self.lower_object_foreach(
+                source, key, value, key_type, value_type, protocol, body, span,
+            );
+            return;
+        }
         let source = self.lower_expression(source);
         let length = self.emit_value(InstructionKind::CollectionLen(source), Type::Int, span);
         let offset_local = LocalId(
@@ -975,6 +984,225 @@ impl<'hir> FunctionBuilder<'hir> {
                 local: offset_local,
                 value: next,
             },
+            span,
+        );
+        self.terminate(Terminator::Jump(condition_block));
+        self.switch_to(end);
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn lower_object_foreach(
+        &mut self,
+        source: &TypedExpr,
+        key: Option<LocalId>,
+        value: LocalId,
+        key_type: &Type,
+        value_type: &Type,
+        protocol: ForeachObjectProtocol,
+        body: &[Statement],
+        span: Span,
+    ) {
+        let traversable_type = Type::Nominal {
+            name: "Traversable".to_owned(),
+            arguments: vec![key_type.clone(), value_type.clone()],
+        };
+        let aggregate_type = Type::Nominal {
+            name: "IteratorAggregate".to_owned(),
+            arguments: vec![key_type.clone(), value_type.clone()],
+        };
+        let iterator_type = Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: vec![key_type.clone(), value_type.clone()],
+        };
+        let current_local = self.new_internal_local(traversable_type.clone());
+        let source = self.lower_expression(source);
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: current_local,
+                value: source,
+            },
+            span,
+        );
+
+        let aggregate_check = self.new_block();
+        let aggregate_body = self.new_block();
+        let iterator_setup = self.new_block();
+        let condition_block = self.new_block();
+        let body_block = self.new_block();
+        let advance_block = self.new_block();
+        let end = self.new_block();
+        self.terminate(Terminator::Jump(aggregate_check));
+
+        self.switch_to(aggregate_check);
+        let current = self.emit_value(
+            InstructionKind::LoadLocal(current_local),
+            traversable_type.clone(),
+            span,
+        );
+        let is_aggregate = self.emit_value(
+            InstructionKind::InstanceOf {
+                value: current,
+                class: protocol.aggregate,
+            },
+            Type::Bool,
+            span,
+        );
+        self.terminate(Terminator::Branch {
+            condition: is_aggregate,
+            then_block: aggregate_body,
+            else_block: iterator_setup,
+        });
+
+        self.switch_to(aggregate_body);
+        let current = self.emit_value(
+            InstructionKind::LoadLocal(current_local),
+            traversable_type.clone(),
+            span,
+        );
+        let aggregate = self.emit_value(
+            InstructionKind::CheckedNarrow {
+                value: current,
+                narrowed: aggregate_type.clone(),
+            },
+            aggregate_type,
+            span,
+        );
+        let next = self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: aggregate,
+                slot: protocol.get_iterator,
+                arguments: Vec::new(),
+            },
+            traversable_type.clone(),
+            span,
+        );
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: current_local,
+                value: next,
+            },
+            span,
+        );
+        self.terminate(Terminator::Jump(aggregate_check));
+
+        self.switch_to(iterator_setup);
+        let current = self.emit_value(
+            InstructionKind::LoadLocal(current_local),
+            traversable_type,
+            span,
+        );
+        let iterator = self.emit_value(
+            InstructionKind::CheckedNarrow {
+                value: current,
+                narrowed: iterator_type.clone(),
+            },
+            iterator_type.clone(),
+            span,
+        );
+        let iterator_local = self.new_internal_local(iterator_type.clone());
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: iterator_local,
+                value: iterator,
+            },
+            span,
+        );
+        self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.rewind,
+                arguments: Vec::new(),
+            },
+            Type::Void,
+            span,
+        );
+        self.terminate(Terminator::Jump(condition_block));
+
+        self.switch_to(condition_block);
+        let iterator = self.emit_value(
+            InstructionKind::LoadLocal(iterator_local),
+            iterator_type.clone(),
+            span,
+        );
+        let valid = self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.valid,
+                arguments: Vec::new(),
+            },
+            Type::Bool,
+            span,
+        );
+        self.terminate(Terminator::Branch {
+            condition: valid,
+            then_block: body_block,
+            else_block: end,
+        });
+
+        self.switch_to(body_block);
+        let iterator = self.emit_value(
+            InstructionKind::LoadLocal(iterator_local),
+            iterator_type.clone(),
+            span,
+        );
+        let entry_value = self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.value,
+                arguments: Vec::new(),
+            },
+            value_type.clone(),
+            span,
+        );
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: value,
+                value: entry_value,
+            },
+            span,
+        );
+        if let Some(key) = key {
+            let entry_key = self.emit_value(
+                InstructionKind::VirtualMethod {
+                    receiver: iterator,
+                    slot: protocol.key,
+                    arguments: Vec::new(),
+                },
+                key_type.clone(),
+                span,
+            );
+            self.emit_effect(
+                InstructionKind::StoreLocal {
+                    local: key,
+                    value: entry_key,
+                },
+                span,
+            );
+        }
+        self.loops.push(LoopTargets {
+            break_target: end,
+            continue_target: advance_block,
+            cleanup_depth: self.cleanups.len(),
+        });
+        self.lower_statements(body);
+        self.loops.pop();
+        if !self.terminated() {
+            self.terminate(Terminator::Jump(advance_block));
+        }
+
+        self.switch_to(advance_block);
+        let iterator = self.emit_value(
+            InstructionKind::LoadLocal(iterator_local),
+            iterator_type,
+            span,
+        );
+        self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.advance,
+                arguments: Vec::new(),
+            },
+            Type::Void,
             span,
         );
         self.terminate(Terminator::Jump(condition_block));
@@ -1689,6 +1917,39 @@ foreach ($values as $index => $value) {
             instructions
                 .iter()
                 .any(|kind| matches!(kind, InstructionKind::Phi(_)))
+        );
+    }
+
+    #[test]
+    fn object_foreach_uses_virtual_dispatch_without_changing_native_lowering() {
+        let module = compile(
+            r#"<?thp
+class Cursor implements Iterator<int, string> {
+    public function rewind(): void {}
+    public function valid(): bool { return false; }
+    public function key(): int { return 0; }
+    public function value(): string { return ""; }
+    public function advance(): void {}
+}
+foreach (new Cursor() as $key => $value) {}
+foreach ([1] as $native) {}
+"#,
+        );
+        let instructions = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| &instruction.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            instructions
+                .iter()
+                .any(|kind| matches!(kind, InstructionKind::VirtualMethod { .. }))
+        );
+        assert!(
+            instructions
+                .iter()
+                .any(|kind| matches!(kind, InstructionKind::CollectionLen(_)))
         );
     }
 

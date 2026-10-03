@@ -75,11 +75,10 @@ a map key must be compatible with `K`. Their generic arguments let THP reject
 incorrect indices, keys, and values.
 
 Map traversal follows insertion order. Keyed `foreach` binds the map's `K` and
-`V` directly; vector traversal binds an `int` offset and `T` value. Iterator
-objects are not yet accepted by the executable `foreach` implementation.
-The proposed object protocol represents both shapes as `Iterator<K, V>`;
-vector iterators use `int` for `K`, while map iterators preserve their declared
-key type.
+`V` directly; vector traversal binds an `int` offset and `T` value. Executable
+object traversal accepts `Traversable<K, V>` and binds its invariant `K` and
+`V`. Iterator implementations use `int` keys for vector shapes and preserve
+the declared key type for map shapes.
 
 Vectors and maps are native values rather than ordinary class instances. This
 allows the compiler and VM to lower common collection operations directly

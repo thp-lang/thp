@@ -42,7 +42,7 @@ All iterators expose typed keys and values through
 protocol does not construct an option or entry object during ordinary
 `foreach` traversal.
 
-The proposed object protocol evaluates the source once, calls `getIterator()`
+The executable object protocol evaluates the source once, calls `getIterator()`
 once per aggregate layer, then calls `rewind()` on the direct iterator. Each
 iteration is `valid() → value() → optional key() → body → advance()`.
 `continue` advances; `break`, `return`, and a throw do not. Iterator failures

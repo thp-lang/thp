@@ -10,8 +10,8 @@ status: experimental
 availability: partial
 notice: >-
   The compiler and reference VM implement the forms described here. Their
-  syntax and diagnostics remain experimental; iterator objects, numeric
-  `break`/`continue` levels, and multi-catch syntax are not implemented.
+  syntax and diagnostics remain experimental; numeric `break`/`continue`
+  levels and multi-catch syntax are not implemented.
 ---
 
 THP uses brace-delimited control structures.
@@ -72,10 +72,9 @@ for ($left: int = 0, $right: int = 5;
 }
 ```
 
-Executable `foreach` evaluates its source once and accepts native `vector<T>`
-and insertion-ordered `map<K, V>` values. The proposed object form additionally
-accepts every `Traversable<K, V>` object; ordinary object properties are never
-an implicit traversal source.
+Executable `foreach` evaluates its source once and accepts native `vector<T>`,
+insertion-ordered `map<K, V>`, and every `Traversable<K, V>` object. Ordinary
+object properties are never an implicit traversal source.
 
 ```thp
 foreach ($values as $key => $value) {
@@ -103,13 +102,11 @@ foreach ($values as $value) {
 New key and value variables are scoped to the loop. A compatible existing
 local is reused and retains its final assigned value. Reusing an incompatible
 local, using the same variable for key and value, or iterating a string or
-scalar is a compile error. In the proposed object form, loop bindings are the
+scalar is a compile error. In the object form, loop bindings are the
 invariant `K` and `V` from `Traversable<K, V>`. Keys remain strict THP values;
 there is no PHP array-key coercion.
 
-### Proposed object traversal protocol
-
-Iterator-object traversal is not implemented. Its contract is:
+### Object traversal protocol
 
 1. Evaluate the `foreach` source exactly once.
 2. For an `IteratorAggregate<K, V>`, call `getIterator()` exactly once at that
@@ -220,9 +217,9 @@ failure is suppressed on the iterator throwable.
 `break` exits the innermost loop and `continue` starts its next iteration.
 Both are rejected outside a loop. Only level-one `break;` and `continue;` are
 accepted; numeric levels are diagnosed during parsing. Transfers leaving a
-`using` or `finally` region still run its cleanup. These loop forms use direct
-VM collection operations; execution modes that cannot compile them fall back
-to the reference VM.
+`using` or `finally` region still run its cleanup. Native loops use direct VM
+collection operations and object loops use virtual dispatch; execution modes
+that cannot compile them fall back to the reference VM.
 
 ## Transfers and failures
 

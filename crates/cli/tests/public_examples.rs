@@ -62,6 +62,27 @@ fn check_reports_an_expected_diagnostic_failure() {
 }
 
 #[test]
+fn rejects_extra_and_unknown_arguments() {
+    let output = thp(&["check", "examples/hello.thp", "examples/jit.thp"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+
+    let output = thp(&["check", "--engin=vm", "examples/hello.thp"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option"));
+
+    let output = thp(&["check", "--max-bytes=1", "examples/hello.thp"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not valid for `check`"));
+
+    let directory = tempfile::tempdir().expect("cache directory");
+    let cache = format!("--opcache={}", directory.path().display());
+    let output = thp(&["cache-prune", "ignored.thp", &cache]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not accept a source file"));
+}
+
+#[test]
 fn lock_command_and_package_entrypoint_use_discovered_packages() {
     let directory = tempfile::tempdir().expect("project");
     let package = directory.path().join("vendor/acme/tool");

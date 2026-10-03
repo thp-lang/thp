@@ -61,9 +61,9 @@ without consuming, moving, or creating traversal state. Proposed
 [`iterator_count()`](thp:std.spl.iterator_count) instead accepts an
 `Iterator<K, V>`, counts from its current cursor through exhaustion, advances
 it, and does not rewind; the two names are neither aliases nor overloads.
-The executable `foreach` implementation currently works with native vectors
-and maps, preserves single evaluation and keys, and supports `break` and
-`continue`. Iterator objects remain a proposal.
+The executable `foreach` implementation works with native vectors and maps and
+with `Traversable<K, V>` objects. It preserves single evaluation and keys and
+supports `break` and `continue`.
 
 Native collection storage is intended to let the compiler and VM lower
 construction, indexing, mutation, and iteration directly instead of wrapping

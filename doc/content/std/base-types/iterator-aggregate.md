@@ -19,7 +19,7 @@ constants: []
 properties: []
 status: experimental
 availability: implemented
-notice: The interface and method-dispatch contract executes; object-based foreach remains proposed.
+notice: The interface, method-dispatch contract, and object-based foreach execute.
 version: "0.1"
 ---
 
