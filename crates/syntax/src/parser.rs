@@ -1613,6 +1613,9 @@ impl Parser<'_, '_> {
                 kind: ExprKind::String(self.decode_string(token.span)?),
                 span: token.span,
             },
+            TokenKind::Function | TokenKind::Fn => {
+                self.parse_closure(token.span, token.kind == TokenKind::Fn)?
+            }
             TokenKind::New => {
                 let (mut target, target_span) = if self.at(TokenKind::Variable) {
                     let variable = self.advance();
@@ -1732,6 +1735,80 @@ impl Parser<'_, '_> {
             expression = self.finish_call(expression)?;
         }
         Some(expression)
+    }
+
+    fn parse_closure(&mut self, start: Span, arrow: bool) -> Option<Expr> {
+        self.expect(
+            TokenKind::LParen,
+            "P1120",
+            "expected `(` after closure keyword",
+        )?;
+        let mut parameters = Vec::new();
+        while !self.at(TokenKind::RParen) {
+            let ty = self.parse_type()?;
+            let variable =
+                self.expect(TokenKind::Variable, "P1121", "expected a closure parameter")?;
+            parameters.push(Parameter {
+                name: self.text(variable.span)[1..].to_owned(),
+                name_span: variable.span,
+                span: ty.span.join(variable.span),
+                ty,
+                default: None,
+                variadic: false,
+            });
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(
+            TokenKind::RParen,
+            "P1122",
+            "expected `)` after closure parameters",
+        )?;
+        let mut captures = Vec::new();
+        if !arrow && self.consume(TokenKind::Use) {
+            self.expect(TokenKind::LParen, "P1123", "expected `(` after `use`")?;
+            while !self.at(TokenKind::RParen) {
+                let variable =
+                    self.expect(TokenKind::Variable, "P1124", "expected a captured variable")?;
+                captures.push(self.text(variable.span)[1..].to_owned());
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen, "P1125", "expected `)` after captures")?;
+        }
+        self.expect(TokenKind::Colon, "P1126", "expected a closure return type")?;
+        let return_type = self.parse_type()?;
+        let (body, end) = if arrow {
+            self.expect(
+                TokenKind::FatArrow,
+                "P1127",
+                "expected `=>` in arrow function",
+            )?;
+            let value = self.parse_expression(0)?;
+            let end = value.span;
+            (
+                vec![Stmt {
+                    kind: StmtKind::Return(Some(value)),
+                    span: end,
+                }],
+                end,
+            )
+        } else {
+            self.expect(TokenKind::LBrace, "P1128", "expected a closure body")?;
+            self.parse_block_after_open()?
+        };
+        Some(Expr {
+            kind: ExprKind::Closure {
+                parameters,
+                captures,
+                implicit_captures: arrow,
+                return_type,
+                body,
+            },
+            span: start.join(end),
+        })
     }
 
     fn try_parse_static_type_arguments(&mut self) -> Option<(Vec<TypeSyntax>, Span)> {
@@ -2136,6 +2213,7 @@ fn is_property_initializer(expression: &Expr) -> bool {
         ExprKind::Unary { operand, .. } => is_property_initializer(operand),
         ExprKind::Variable(_)
         | ExprKind::Name(_)
+        | ExprKind::Closure { .. }
         | ExprKind::Binary { .. }
         | ExprKind::Call { .. }
         | ExprKind::Index { .. }

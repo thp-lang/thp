@@ -7,6 +7,14 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-03
+
+### Added
+
+- lang: Added typed `callable<P..., R>` values, explicit value captures in block closures, implicit value captures in arrow closures, and checked callable invocation.
+- std: Added vector and map transformations, `iterator_apply()`, `FilterIterator`, and `CallbackFilterIterator`.
+- runtime: Advanced the bytecode schema to version 5 for closure values and verified dynamic calls.
+
 ## [0.5.0] - 2026-10-03
 
 ### Added

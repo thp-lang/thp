@@ -19,11 +19,9 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: This experimental adapter executes in the standalone compiler and reference VM.
+version: "0.6"
 ---
 
 `CallbackFilterIterator` keeps values accepted by a callback.
@@ -36,17 +34,26 @@ version: "0.1"
 
 ## Behavior
 
-The callback receives each current value and decides whether it is retained.
-Callback failures propagate and stop traversal.
+The callback receives the current `V` value then its `K` key and returns
+`bool`. Accepted entries keep their original keys and relative order. The
+adapter tests lazily and caches an accepted entry until `advance()`; repeated
+`valid()` calls do not invoke the callback again. An empty inner iterator
+never calls the callback. Its `K` and `V` types come from the iterator or
+explicit generic arguments; an untyped empty literal needs an expected
+iterator shape.
 
 ## Errors
 
-Construction validates the parameters shown above. Cursor operations propagate failures from the wrapped iterator, callback, pattern engine, or filesystem when that dependency is present; each member page identifies the applicable source. Concrete THP error classes remain unsettled.
+Construction and callback creation can fail to allocate. Callback exceptions,
+inner cursor failures, and allocation failures propagate without a partial
+result or another advance of the failing entry. External cursor mutation
+through `getInnerIterator()` while filtering is active has no coordinated
+cache invalidation.
 
 ## Example
 
 ```thp
-$even = new CallbackFilterIterator<int, int>($numbers, function (int $value): bool {
+$even = new CallbackFilterIterator<int, int>($numbers, function (int $value, int $key): bool {
     return $value % 2 === 0;
 });
 ```

@@ -866,6 +866,21 @@ impl Value {
         })
     }
 
+    pub fn try_closure(
+        function: FunctionId,
+        captures: Vec<Self>,
+    ) -> Result<Self, RuntimeErrorKind> {
+        Self::ensure_values_match_active(captures.iter())?;
+        Self::try_allocate(HeapData::Closure { function, captures })
+    }
+
+    pub fn closure_parts(&self) -> Option<(FunctionId, &[Self])> {
+        match self.heap_data()? {
+            HeapData::Closure { function, captures } => Some((*function, captures)),
+            _ => None,
+        }
+    }
+
     pub fn map(key_type: Type, value_type: Type, entries: Vec<(Self, Self)>) -> Self {
         Self::allocate_unmanaged(HeapData::Map {
             key_type,
@@ -1203,6 +1218,7 @@ impl Value {
             HeapData::Bytes(bytes) => Some(bytes),
             HeapData::Vector { .. }
             | HeapData::Map { .. }
+            | HeapData::Closure { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
             | HeapData::Exception { .. }
@@ -1215,6 +1231,7 @@ impl Value {
             HeapData::Vector { values, .. } => Some(values),
             HeapData::Bytes(_)
             | HeapData::Map { .. }
+            | HeapData::Closure { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
             | HeapData::Exception { .. }
@@ -1227,6 +1244,7 @@ impl Value {
             HeapData::Map { entries, .. } => Some(entries),
             HeapData::Bytes(_)
             | HeapData::Vector { .. }
+            | HeapData::Closure { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
             | HeapData::Exception { .. }
@@ -1309,6 +1327,7 @@ impl Value {
                 HeapData::Bytes(_) => "string",
                 HeapData::Vector { .. } => "vector",
                 HeapData::Map { .. } => "map",
+                HeapData::Closure { .. } => "callable",
                 HeapData::Object { .. } => "object",
                 HeapData::Stream { .. } => "stream",
                 HeapData::Exception { .. } => "exception",
@@ -1323,6 +1342,7 @@ impl Value {
             HeapData::Bytes(bytes) => Some(bytes.len()),
             HeapData::Vector { values, .. } => Some(values.len()),
             HeapData::Map { entries, .. } => Some(entries.len()),
+            HeapData::Closure { .. } => None,
             HeapData::Object { .. } => None,
             HeapData::Stream { .. } => None,
             HeapData::Exception { .. } => None,
@@ -1410,7 +1430,10 @@ impl Value {
             | HeapData::Stream { class, .. }
             | HeapData::Exception { class, .. }
             | HeapData::Reflection { class, .. } => Some(*class),
-            HeapData::Bytes(_) | HeapData::Vector { .. } | HeapData::Map { .. } => None,
+            HeapData::Bytes(_)
+            | HeapData::Vector { .. }
+            | HeapData::Map { .. }
+            | HeapData::Closure { .. } => None,
         }
     }
 
@@ -1909,6 +1932,7 @@ impl Value {
             }
             Some(
                 HeapData::Object { .. }
+                | HeapData::Closure { .. }
                 | HeapData::Stream { .. }
                 | HeapData::Exception { .. }
                 | HeapData::Reflection { .. },
@@ -2002,6 +2026,7 @@ impl Value {
                 HeapData::Bytes(bytes) => Some(bytes.clone()),
                 HeapData::Vector { .. }
                 | HeapData::Map { .. }
+                | HeapData::Closure { .. }
                 | HeapData::Object { .. }
                 | HeapData::Stream { .. }
                 | HeapData::Exception { .. }
@@ -2036,6 +2061,7 @@ impl Value {
                     format!("vector({})\n", values.len()).into_bytes()
                 }
                 HeapData::Map { entries, .. } => format!("map({})\n", entries.len()).into_bytes(),
+                HeapData::Closure { .. } => b"callable(closure)\n".to_vec(),
                 HeapData::Object { class, .. } => {
                     format!("object(class#{})\n", class.0).into_bytes()
                 }
@@ -2329,6 +2355,10 @@ enum HeapData {
         value_type: Type,
         entries: Vec<(Value, Value)>,
     },
+    Closure {
+        function: FunctionId,
+        captures: Vec<Value>,
+    },
     Object {
         class: ClassId,
         type_arguments: Vec<Type>,
@@ -2360,6 +2390,7 @@ impl HeapData {
             Self::Bytes(bytes) => bytes.capacity(),
             Self::Vector { values, .. } => values.capacity() * mem::size_of::<Value>(),
             Self::Map { entries, .. } => entries.capacity() * mem::size_of::<(Value, Value)>(),
+            Self::Closure { captures, .. } => captures.capacity() * mem::size_of::<Value>(),
             Self::Object { properties, .. } => {
                 properties.borrow().capacity() * mem::size_of::<Option<Value>>()
             }
@@ -2386,7 +2417,11 @@ impl HeapData {
     fn is_collectable(&self) -> bool {
         matches!(
             self,
-            Self::Vector { .. } | Self::Map { .. } | Self::Object { .. } | Self::Exception { .. }
+            Self::Vector { .. }
+                | Self::Map { .. }
+                | Self::Closure { .. }
+                | Self::Object { .. }
+                | Self::Exception { .. }
         )
     }
 
@@ -2405,6 +2440,11 @@ impl HeapData {
             Self::Map { entries, .. } => {
                 for (key, value) in entries {
                     visit_value(key);
+                    visit_value(value);
+                }
+            }
+            Self::Closure { captures, .. } => {
+                for value in captures {
                     visit_value(value);
                 }
             }
@@ -2437,6 +2477,7 @@ impl HeapData {
         match self {
             Self::Vector { values, .. } => values.clear(),
             Self::Map { entries, .. } => entries.clear(),
+            Self::Closure { captures, .. } => captures.clear(),
             Self::Object { properties, .. } => properties.get_mut().clear(),
             Self::Exception {
                 properties,

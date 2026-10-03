@@ -40,6 +40,7 @@ compiler if used as though it were available.
 | `int`, `float`, `bool`, `string`, `null`, `void`, `mixed`, nullable types, unions           | implemented  | `string` values are arbitrary bytes at runtime                                                                                                                          |
 | `vector<T>`, `map<K, V>`                                                                    | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                                                                                |
 | Variables and functions                                                                     | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                                                                         |
+| Typed callables and closures                                                                | implemented  | Fixed `callable<P..., R>` signatures, named function values, value captures, arrow and block closures, and positional invocation                                        |
 | `if`, `match`, `while`, `for`, `return`, `echo`                                             | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                                                                         |
 | `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Direct collection lowering; the source is evaluated once and traversal uses its captured COW snapshot                                                                   |
 | `break`, `continue`                                                                         | partial      | Level one only; numeric levels are rejected                                                                                                                             |
@@ -68,10 +69,11 @@ compiler if used as though it were available.
 | `VectorIterator<T>`, `MapIterator<K, V>`                               | implemented  | Rewindable cursors over COW collection snapshots; typed iterator targets create fresh cursors                                    |
 | `EmptyIterator<K, V>`, `IteratorIterator<K, V>`, `OuterIterator<K, V>` | implemented  | Empty cursor and shared wrapper delegation through the outer iterator interface                                                  |
 | `iterator_count<K, V>(Iterator<K, V>): int`                            | implemented  | Counts from the current cursor through exhaustion, advances it, and never rewinds                                                |
-| `iterator_apply()`                                                     | proposed     | Callback-driven consuming traversal is not implemented                                                                           |
+| `iterator_apply()`                                                     | implemented  | Consumes from the current cursor, passes value then key, advances after each callback, and stops after `false`                   |
 | `iterator_to_vector()`, `iterator_to_map()`                            | implemented  | Consume remaining values; vector discards keys, map preserves first key position when keys repeat                                |
-| `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()` | proposed     | Native-vector transformations are not implemented                                                                                |
-| `map_transform()`, `map_filter()`, `map_merge()`                       | proposed     | Native-map transformations are not implemented                                                                                   |
+| `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()` | implemented  | Dense vector results; typed value callbacks; negative slice offsets and lengths                                                  |
+| `map_transform()`, `map_filter()`, `map_merge()`                       | implemented  | Insertion order and first key position preserved; typed value-then-key callbacks                                                 |
+| `FilterIterator<K, V>`, `CallbackFilterIterator<K, V>`                 | implemented  | Lazy filtering over an inner cursor with preserved keys; base `accept(V, K)` is abstract                                         |
 | Other iterator adapters and recursive iterators                        | proposed     | Remaining iterator module classes are documentation-only                                                                         |
 
 [`count()`](thp:std.baseTypes) and
@@ -146,7 +148,7 @@ the JIT subset, so automatic mode executes them in the VM.
 The current executable subset rejects unsupported syntax instead of inheriting
 PHP behavior. Pending work includes:
 
-- closures, call-site argument unpacking, by-reference parameters, general
+- call-site argument unpacking, by-reference parameters, general
   assignment expressions, property-rooted collection mutation, and numeric
   `break`/`continue` levels;
 - generic functions, methods, and traits, multiple-parent interfaces, interface
@@ -154,7 +156,7 @@ PHP behavior. Pending work includes:
   anonymous classes, enums, reflection attributes/source inspection, and flow
   narrowing after `instanceof`;
 - global constants, general dynamic calls and member names, runtime
-  includes/autoload callbacks, attributes, generators, closures, and cooperative
+  includes/autoload callbacks, attributes, generators, and cooperative
   async;
 - the broader standard library, extension registration/dispatch, concrete
   FastCGI and web-server SAPI adapters, relocatable module code generation,

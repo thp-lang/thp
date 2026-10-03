@@ -122,6 +122,14 @@ pub enum InstructionKind {
         callee: Callee,
         arguments: Vec<Register>,
     },
+    Closure {
+        function: FunctionId,
+        captures: Vec<Register>,
+    },
+    CallValue {
+        callee: Register,
+        arguments: Vec<Register>,
+    },
     DirectMethod {
         callee: Callee,
         arguments: Vec<Register>,
@@ -1356,6 +1364,20 @@ impl<'hir> FunctionBuilder<'hir> {
                     TypedExprKind::Call { callee, arguments } => InstructionKind::Call {
                         callee: *callee,
                         arguments: self.lower_bound_arguments(arguments),
+                    },
+                    TypedExprKind::Closure { function, captures } => InstructionKind::Closure {
+                        function: *function,
+                        captures: captures
+                            .iter()
+                            .map(|value| self.lower_expression(value))
+                            .collect(),
+                    },
+                    TypedExprKind::CallValue { callee, arguments } => InstructionKind::CallValue {
+                        callee: self.lower_expression(callee),
+                        arguments: arguments
+                            .iter()
+                            .map(|value| self.lower_expression(value))
+                            .collect(),
                     },
                     TypedExprKind::DirectMethod {
                         callee,

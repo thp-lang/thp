@@ -7,10 +7,9 @@ module: standard-library
 order: 0
 status: experimental
 availability: proposed
-notice:
-  This section defines THP's intended library contracts. Async, Base, SPL, and
-  typed collections are not presented as available runtime APIs in this
-  documentation checkout.
+notice: This section defines THP's intended library contracts. Native collection
+  operations and selected iterator APIs execute; the broader Async, Base, and
+  SPL surface remains proposed.
 ---
 
 ## Async
@@ -77,10 +76,14 @@ generic element and key constraints. `[]` creates a vector,
 `{key => value}` creates a map, and both support bracket access.
 
 Collection operations use global functions prefixed by their native input
-shape rather than methods or PHP's `array_*` names. The proposed vector family
-includes `vector_map()`, `vector_filter()`, `vector_slice()`, and
-`vector_concat()`. The proposed map family includes `map_transform()`,
-`map_filter()`, and `map_merge()`. These helpers are all proposed.
+shape rather than methods or PHP's `array_*` names. The vector family
+[`vector_map()`](thp:std.baseTypes.vector_map),
+[`vector_filter()`](thp:std.baseTypes.vector_filter),
+[`vector_slice()`](thp:std.baseTypes.vector_slice), and
+[`vector_concat()`](thp:std.baseTypes.vector_concat) and the map family
+[`map_transform()`](thp:std.baseTypes.map_transform),
+[`map_filter()`](thp:std.baseTypes.map_filter), and
+[`map_merge()`](thp:std.baseTypes.map_merge) execute in the reference VM.
 `count(string|vector<T>|map<K, V>): int` reads length without traversal state.
 It is distinct from implemented
 [`iterator_count()`](thp:std.spl.iterator_count), which consumes an explicit

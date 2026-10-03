@@ -10,9 +10,9 @@ status: experimental
 availability: partial
 notice: >-
   Typed declarations, statically resolved calls, constant defaults, named
-  arguments, and variadic parameters execute in the compiler and reference VM.
-  Generics, by-reference parameters, call-site unpacking, and dynamic calls
-  remain proposals.
+  arguments, variadic parameters, typed callable values, closures, and callable
+  invocation execute. Generic functions, by-reference parameters, call-site
+  unpacking, and arbitrary dynamic function names remain proposals.
 ---
 
 Functions declare parameter types before variable names and a return type after
@@ -102,16 +102,46 @@ does not complete normally.
 
 ## Anonymous callables
 
-The proposed non-capturing arrow-function syntax provides concise callbacks for
-collection pipelines. Arrow functions and `vector_map()` are not implemented in
-this checkout.
+`callable<P1, ..., R>` is a value type whose final type argument is its return
+type; `callable<R>` accepts no arguments. Parameters are invariant and must
+match exactly. A bare `callable` has no executable type contract. Callable
+values may be passed as parameters, returned, stored, and invoked with
+positional arguments. Invocation checks argument count and types at the call
+site. Named arguments, defaults, and variadics are not supported when invoking
+through a callable value. A named function with only required, fixed
+parameters can be used as a callable value.
 
 ```thp
-$doubled = vector_map($values, fn(int $value): int => $value * 2);
+function apply(callable<int, int> $operation, int $value): int {
+    return $operation($value);
+}
+
+$offset: int = 3;
+$add = fn(int $value): int => $value + $offset;
+echo apply($add, 4);
 ```
 
-Captured variables and general dynamic invocation do not yet have stable THP
-contracts.
+Arrow functions capture referenced outer locals implicitly. Block closures
+list captures explicitly with `use ($name, ...)`:
+
+```thp
+$add = function (int $value) use ($offset): int {
+    return $value + $offset;
+};
+```
+
+Both forms require parameter and return types. A capture copies the value when
+the closure is created. Later reassignment of the outer local does not update
+the capture. Collection captures keep copy-on-write storage; object captures
+keep the same object identity. Captures are owned by the closure and released
+when it is reclaimed, including through cycle collection. Duplicate or
+unknown explicit captures are errors at the closure expression. Unlisted outer
+locals in a block closure are unresolved inside it. Arrow captures include
+values needed by nested arrow closures.
+
+An allocation failure while creating a closure stops evaluation with a runtime
+allocation error. A thrown exception from a callable propagates through its
+invocation with normal stack traces and `try`/`finally` cleanup.
 
 ## See also
 

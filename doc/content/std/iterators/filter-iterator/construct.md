@@ -20,11 +20,9 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
-version: "0.1"
+availability: implemented
+notice: This constructor executes on concrete subclasses of the abstract FilterIterator.
+version: "0.6"
 owner: std.spl.FilterIterator
 visibility: public
 modifiers: []
@@ -41,7 +39,7 @@ This operation does not change receiver state unless the description explicitly 
 ## Example
 
 ```thp
-$instance = new FilterIterator($iterator);
+$instance = new EvenFilter($iterator);
 ```
 
 The call uses the signature and defaults documented above.

@@ -180,6 +180,14 @@ impl Encoder {
                 self.u32(id.index);
                 self.string(name);
             }
+            Type::Callable(parameters, result) => {
+                self.u8(14);
+                self.len(parameters.len());
+                for parameter in parameters {
+                    self.ty(parameter);
+                }
+                self.ty(result);
+            }
         }
     }
 
@@ -633,6 +641,22 @@ impl Encoder {
                 self.u32(value.0);
                 self.ty(narrowed);
             }
+            InstructionKind::Closure { function, captures } => {
+                self.u8(29);
+                self.u32(function.0);
+                self.len(captures.len());
+                for capture in captures {
+                    self.u32(capture.0);
+                }
+            }
+            InstructionKind::CallValue { callee, arguments } => {
+                self.u8(30);
+                self.u32(callee.0);
+                self.len(arguments.len());
+                for argument in arguments {
+                    self.u32(argument.0);
+                }
+            }
         }
     }
 
@@ -736,6 +760,16 @@ impl Encoder {
             Callee::Builtin(Builtin::IteratorCount) => self.u8(39),
             Callee::Builtin(Builtin::IteratorToVector) => self.u8(40),
             Callee::Builtin(Builtin::IteratorToMap) => self.u8(41),
+            Callee::Builtin(Builtin::VectorMap) => self.u8(42),
+            Callee::Builtin(Builtin::VectorFilter) => self.u8(43),
+            Callee::Builtin(Builtin::VectorSlice) => self.u8(44),
+            Callee::Builtin(Builtin::VectorConcat) => self.u8(45),
+            Callee::Builtin(Builtin::MapTransform) => self.u8(46),
+            Callee::Builtin(Builtin::MapFilter) => self.u8(47),
+            Callee::Builtin(Builtin::MapMerge) => self.u8(48),
+            Callee::Builtin(Builtin::IteratorApply) => self.u8(49),
+            Callee::Builtin(Builtin::CallbackFilterAccept) => self.u8(50),
+            Callee::Builtin(Builtin::CallbackFilterConstruct) => self.u8(51),
         }
     }
 
@@ -899,6 +933,10 @@ impl Decoder<'_> {
                 },
                 name: self.string()?,
             },
+            14 => Type::Callable(
+                self.vector(|decoder| decoder.ty(depth + 1))?,
+                Box::new(self.ty(depth + 1)?),
+            ),
             tag => return Err(self.error(format!("unknown type tag {tag}"))),
         })
     }
@@ -1263,6 +1301,14 @@ impl Decoder<'_> {
                 value: Register(self.u32()?),
                 narrowed: self.ty(0)?,
             },
+            29 => InstructionKind::Closure {
+                function: FunctionId(self.u32()?),
+                captures: self.vector(|decoder| Ok(Register(decoder.u32()?)))?,
+            },
+            30 => InstructionKind::CallValue {
+                callee: Register(self.u32()?),
+                arguments: self.vector(|decoder| Ok(Register(decoder.u32()?)))?,
+            },
             tag => return Err(self.error(format!("unknown instruction tag {tag}"))),
         };
         Ok(Instruction {
@@ -1366,6 +1412,16 @@ impl Decoder<'_> {
             39 => Ok(Callee::Builtin(Builtin::IteratorCount)),
             40 => Ok(Callee::Builtin(Builtin::IteratorToVector)),
             41 => Ok(Callee::Builtin(Builtin::IteratorToMap)),
+            42 => Ok(Callee::Builtin(Builtin::VectorMap)),
+            43 => Ok(Callee::Builtin(Builtin::VectorFilter)),
+            44 => Ok(Callee::Builtin(Builtin::VectorSlice)),
+            45 => Ok(Callee::Builtin(Builtin::VectorConcat)),
+            46 => Ok(Callee::Builtin(Builtin::MapTransform)),
+            47 => Ok(Callee::Builtin(Builtin::MapFilter)),
+            48 => Ok(Callee::Builtin(Builtin::MapMerge)),
+            49 => Ok(Callee::Builtin(Builtin::IteratorApply)),
+            50 => Ok(Callee::Builtin(Builtin::CallbackFilterAccept)),
+            51 => Ok(Callee::Builtin(Builtin::CallbackFilterConstruct)),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }

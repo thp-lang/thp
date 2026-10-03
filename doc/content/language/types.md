@@ -22,20 +22,20 @@ using distinct literal syntax.
 
 ## Core types
 
-| Type        | Meaning                                                   |
-| ----------- | --------------------------------------------------------- |
-| `int`       | Signed 64-bit integer.                                    |
-| `float`     | Double-precision floating-point number.                   |
-| `bool`      | `true` or `false`.                                        |
-| `string`    | Arbitrary byte string.                                    |
-| `null`      | The null value.                                           |
-| `object`    | An object value.                                          |
-| `callable`  | A callable value.                                         |
-| `mixed`     | A value whose more precise type is unknown.               |
-| `void`      | A callable that returns no useful value.                  |
-| `never`     | A callable that does not return normally.                 |
-| `vector<T>` | Ordered native collection containing values of type `T`.  |
-| `map<K, V>` | Native collection mapping keys `K` to values of type `V`. |
+| Type                | Meaning                                                          |
+| ------------------- | ---------------------------------------------------------------- |
+| `int`               | Signed 64-bit integer.                                           |
+| `float`             | Double-precision floating-point number.                          |
+| `bool`              | `true` or `false`.                                               |
+| `string`            | Arbitrary byte string.                                           |
+| `null`              | The null value.                                                  |
+| `object`            | An object value.                                                 |
+| `callable<P..., R>` | A callable with fixed parameter types followed by a return type. |
+| `mixed`             | A value whose more precise type is unknown.                      |
+| `void`              | A callable that returns no useful value.                         |
+| `never`             | A callable that does not return normally.                        |
+| `vector<T>`         | Ordered native collection containing values of type `T`.         |
+| `map<K, V>`         | Native collection mapping keys `K` to values of type `V`.        |
 
 ## Collections
 
@@ -67,6 +67,12 @@ $scores = {"Ada" => 10, "Grace" => 9};
 A non-empty literal infers its generic types from its entries. An empty literal
 uses its declared or otherwise expected type when its generic arguments cannot
 be inferred.
+
+Collection callbacks supply expected element types for empty literals:
+`vector_map([], fn(int $value): string => "x")` yields `vector<string>`.
+`vector_slice([], 0)` needs an expected `vector<T>` result type, while
+`vector_concat([], $known)` can infer from `$known`. The map family follows the
+same rule using its callback's value and key parameter types or its other map.
 
 Keyed entries are not valid inside `[]`, and unkeyed entries are not valid
 inside `{}`. Both collection types use bracket access, variable-rooted element

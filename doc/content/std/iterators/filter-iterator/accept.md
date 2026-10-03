@@ -9,7 +9,10 @@ typeParameters: []
 parameters:
   - name: value
     type: V
-    description: Value consumed or stored by the operation.
+    description: Current inner value.
+  - name: key
+    type: K
+    description: Current inner key.
 returns:
   type: bool
   description: Reports whether the current value passes the filter.
@@ -19,11 +22,9 @@ errors:
       being wrapped.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
-version: "0.1"
+availability: implemented
+notice: Concrete FilterIterator subclasses implement this abstract method.
+version: "0.6"
 owner: std.spl.FilterIterator
 visibility: public
 modifiers:
@@ -36,12 +37,14 @@ modifiers:
 
 Reports whether the current value passes the filter.
 
-This operation does not change receiver state unless the description explicitly states otherwise.
+The adapter invokes `accept(V, K): bool` at most once for each current entry
+until it advances. It preserves the original key when the method returns
+`true`. An exception propagates and leaves the inner cursor at that entry.
 
 ## Example
 
 ```thp
-$result = $instance->accept($value);
+$result = $instance->accept($value, $key);
 ```
 
 The call uses the signature and defaults documented above.

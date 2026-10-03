@@ -2,8 +2,10 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::rc::Rc;
 
 use thp_diagnostics::{Diagnostic, Span};
 use thp_syntax::{
@@ -39,6 +41,7 @@ pub enum Type {
     Mixed,
     Vector(Box<Type>),
     Map(Box<Type>, Box<Type>),
+    Callable(Vec<Type>, Box<Type>),
     Union(Vec<Type>),
     Object(String),
     Nominal { name: String, arguments: Vec<Type> },
@@ -52,9 +55,11 @@ impl Type {
             Self::Float => Representation::F64,
             Self::Bool => Representation::Bool,
             Self::String => Representation::Bytes,
-            Self::Vector(_) | Self::Map(_, _) | Self::Object(_) | Self::Nominal { .. } => {
-                Representation::Reference
-            }
+            Self::Vector(_)
+            | Self::Map(_, _)
+            | Self::Callable(_, _)
+            | Self::Object(_)
+            | Self::Nominal { .. } => Representation::Reference,
             Self::Null
             | Self::Void
             | Self::Never
@@ -115,6 +120,13 @@ impl fmt::Display for Type {
             Self::Mixed => formatter.write_str("mixed"),
             Self::Vector(element) => write!(formatter, "vector<{element}>"),
             Self::Map(key, value) => write!(formatter, "map<{key}, {value}>"),
+            Self::Callable(parameters, result) => {
+                formatter.write_str("callable<")?;
+                for parameter in parameters {
+                    write!(formatter, "{parameter}, ")?;
+                }
+                write!(formatter, "{result}>")
+            }
             Self::Object(name) | Self::Parameter { name, .. } => formatter.write_str(name),
             Self::Nominal { name, arguments } => {
                 write!(formatter, "{name}<")?;
@@ -204,6 +216,16 @@ pub enum Builtin {
     IteratorCount,
     IteratorToVector,
     IteratorToMap,
+    VectorMap,
+    VectorFilter,
+    VectorSlice,
+    VectorConcat,
+    MapTransform,
+    MapFilter,
+    MapMerge,
+    IteratorApply,
+    CallbackFilterAccept,
+    CallbackFilterConstruct,
     VarDump,
     MemoryStreamOpen,
     TempStreamOpen,
@@ -688,6 +710,14 @@ pub enum TypedExprKind {
         callee: Callee,
         arguments: BoundArguments,
     },
+    Closure {
+        function: FunctionId,
+        captures: Vec<TypedExpr>,
+    },
+    CallValue {
+        callee: Box<TypedExpr>,
+        arguments: Vec<TypedExpr>,
+    },
     DirectMethod {
         callee: Callee,
         receiver: Option<Box<TypedExpr>>,
@@ -888,6 +918,7 @@ struct TypeChecker {
     pending_methods: Vec<PendingMethod>,
     method_slots: BTreeMap<String, MethodSlot>,
     declaration_modules: BTreeMap<String, String>,
+    closures: Rc<RefCell<Vec<Option<Function>>>>,
 }
 
 impl TypeChecker {
@@ -900,6 +931,7 @@ impl TypeChecker {
             pending_methods: Vec::new(),
             method_slots: BTreeMap::new(),
             declaration_modules: declaration_modules.clone(),
+            closures: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -924,6 +956,7 @@ impl TypeChecker {
             .cloned()
             .collect::<Vec<_>>();
         let entry = FunctionId(0);
+        let closure_base = u32::try_from(self.functions.len()).expect("function count fits u32");
         let mut main = FunctionChecker::new(
             &self.signatures,
             &self.classes,
@@ -937,6 +970,8 @@ impl TypeChecker {
             program.span,
             None,
             false,
+            closure_base,
+            Rc::clone(&self.closures),
         );
         let body = main.lower_block(&top_level);
         self.functions[0] = Some(main.finish(body));
@@ -961,6 +996,8 @@ impl TypeChecker {
                 statement.span,
                 None,
                 false,
+                closure_base,
+                Rc::clone(&self.closures),
             );
             checker.declare_parameters(declaration, &signature.parameters);
             let body = checker.lower_block(&declaration.body);
@@ -988,6 +1025,8 @@ impl TypeChecker {
                 pending.span,
                 Some(class.id),
                 pending.declaration.static_method,
+                closure_base,
+                Rc::clone(&self.closures),
             );
             if !pending.declaration.static_method {
                 checker.declare_receiver(&class);
@@ -998,6 +1037,7 @@ impl TypeChecker {
             self.functions[pending.id.0 as usize] = Some(checker.finish(body));
         }
 
+        self.functions.extend(self.closures.borrow_mut().drain(..));
         let functions = self
             .functions
             .into_iter()
@@ -2322,7 +2362,9 @@ impl TypeChecker {
                 .with_label(parent.span, "final method is declared here"),
             );
         }
-        if !method_contract_equal(replacement, parent) {
+        if !(method_contract_equal(replacement, parent)
+            || class_name == "CallbackFilterIterator" && method_name == "__construct")
+        {
             self.diagnostics.push(
                 Diagnostic::error(
                     "typing",
@@ -2365,6 +2407,8 @@ struct FunctionChecker<'signatures, 'diagnostics> {
     static_method: bool,
     type_parameters: BTreeMap<String, Type>,
     narrowed: HashMap<LocalId, Type>,
+    closure_base: u32,
+    closures: Rc<RefCell<Vec<Option<Function>>>>,
 }
 
 impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
@@ -2380,6 +2424,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         span: Span,
         owner: Option<ClassId>,
         static_method: bool,
+        closure_base: u32,
+        closures: Rc<RefCell<Vec<Option<Function>>>>,
     ) -> Self {
         let type_parameters = owner
             .and_then(|owner| classes.values().find(|class| class.id == owner))
@@ -2404,6 +2450,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             static_method,
             type_parameters,
             narrowed: HashMap::new(),
+            closure_base,
+            closures,
         }
     }
 
@@ -3147,6 +3195,147 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         Some((root, collection_types, lowered_indices, value))
     }
 
+    fn lower_closure(
+        &mut self,
+        parameters: &[thp_syntax::Parameter],
+        declared_captures: &[String],
+        implicit_captures: bool,
+        return_type: &TypeSyntax,
+        body: &Block,
+        span: Span,
+    ) -> Option<TypedExpr> {
+        let result = resolve_type(
+            return_type,
+            self.classes,
+            &self.type_parameters,
+            self.diagnostics,
+        )?;
+        let mut capture_names = declared_captures.to_vec();
+        if implicit_captures {
+            let mut used = BTreeSet::new();
+            for statement in body {
+                if let StmtKind::Return(Some(value)) = &statement.kind {
+                    collect_expr_variables(value, &mut used);
+                }
+            }
+            capture_names.extend(used.into_iter().filter(|name| {
+                self.names.contains_key(name)
+                    && !parameters.iter().any(|parameter| parameter.name == *name)
+            }));
+        }
+        let mut seen = BTreeSet::new();
+        let mut captures = Vec::new();
+        for name in capture_names {
+            if !seen.insert(name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0320",
+                    span,
+                    format!("`${name}` is captured more than once"),
+                ));
+                continue;
+            }
+            let Some(id) = self.names.get(&name).copied() else {
+                self.diagnostics.push(Diagnostic::error(
+                    "name_resolution",
+                    "N0101",
+                    span,
+                    format!("unknown captured variable `${name}`"),
+                ));
+                continue;
+            };
+            captures.push((
+                name,
+                TypedExpr {
+                    kind: TypedExprKind::Local(id),
+                    ty: self.locals[id.0 as usize].ty.clone(),
+                    span,
+                },
+            ));
+        }
+        let parameter_types = parameters
+            .iter()
+            .filter_map(|parameter| {
+                resolve_type(
+                    &parameter.ty,
+                    self.classes,
+                    &self.type_parameters,
+                    self.diagnostics,
+                )
+            })
+            .collect::<Vec<_>>();
+        if parameter_types.len() != parameters.len() {
+            return None;
+        }
+        let id = {
+            let mut closures = self.closures.borrow_mut();
+            let id = FunctionId(
+                self.closure_base + u32::try_from(closures.len()).expect("closure count fits u32"),
+            );
+            closures.push(None);
+            id
+        };
+        let mut checker = FunctionChecker::new(
+            self.signatures,
+            self.classes,
+            self.diagnostics,
+            id,
+            &format!("<closure:{}>", id.0),
+            &self.module_name,
+            result.clone(),
+            span,
+            None,
+            false,
+            self.closure_base,
+            Rc::clone(&self.closures),
+        );
+        for (name, value) in &captures {
+            let local = checker.add_local(name.clone(), value.ty.clone(), span, true);
+            checker.parameters.push(local);
+            checker.parameter_metadata.push(ParameterMetadata {
+                name: name.clone(),
+                ty: value.ty.clone(),
+                default: None,
+                variadic: false,
+            });
+        }
+        for (parameter, ty) in parameters.iter().zip(&parameter_types) {
+            if checker.names.contains_key(&parameter.name) {
+                checker.diagnostics.push(Diagnostic::error(
+                    "name_resolution",
+                    "N0002",
+                    parameter.name_span,
+                    format!("duplicate closure parameter `${}`", parameter.name),
+                ));
+                continue;
+            }
+            let local = checker.add_local(
+                parameter.name.clone(),
+                ty.clone(),
+                parameter.name_span,
+                true,
+            );
+            checker.parameters.push(local);
+            checker.parameter_metadata.push(ParameterMetadata {
+                name: parameter.name.clone(),
+                ty: ty.clone(),
+                default: None,
+                variadic: false,
+            });
+        }
+        let lowered = checker.lower_block(body);
+        let function = checker.finish(lowered);
+        self.closures.borrow_mut()[(id.0 - self.closure_base) as usize] = Some(function);
+        Some(TypedExpr {
+            kind: TypedExprKind::Closure {
+                function: id,
+                captures: captures.into_iter().map(|(_, value)| value).collect(),
+            },
+            ty: Type::Callable(parameter_types, Box::new(result)),
+            span,
+        })
+    }
+
     fn lower_expression(
         &mut self,
         expression: &Expr,
@@ -3186,13 +3375,51 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 }
             }
             ExprKind::Name(name) => {
+                if let Some(signature) = self.signatures.get(name)
+                    && signature
+                        .parameters
+                        .iter()
+                        .all(|parameter| parameter.default.is_none() && !parameter.variadic)
+                {
+                    return Some(TypedExpr {
+                        kind: TypedExprKind::Closure {
+                            function: signature.id,
+                            captures: Vec::new(),
+                        },
+                        ty: Type::Callable(
+                            signature
+                                .parameters
+                                .iter()
+                                .map(|parameter| parameter.ty.clone())
+                                .collect(),
+                            Box::new(signature.return_type.clone()),
+                        ),
+                        span: expression.span,
+                    });
+                }
                 self.diagnostics.push(Diagnostic::error(
-                    "name_resolution",
-                    "N0102",
+                    "typing",
+                    "T0301",
                     expression.span,
-                    format!("name `{name}` is only valid as a callable in this language subset"),
+                    format!("`{name}` cannot be used as a callable value"),
                 ));
                 return None;
+            }
+            ExprKind::Closure {
+                parameters,
+                captures,
+                implicit_captures,
+                return_type,
+                body,
+            } => {
+                return self.lower_closure(
+                    parameters,
+                    captures,
+                    *implicit_captures,
+                    return_type,
+                    body,
+                    expression.span,
+                );
             }
             ExprKind::Vector(values) => {
                 let target_element = expected
@@ -3339,16 +3566,62 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 )
             }
             ExprKind::Call { callee, arguments } => {
-                let ExprKind::Name(name) = &callee.kind else {
-                    self.diagnostics.push(Diagnostic::error(
-                        "typing",
-                        "T0301",
-                        callee.span,
-                        "dynamic callable invocation is not supported",
-                    ));
-                    return None;
+                let value = if let ExprKind::Name(name) = &callee.kind {
+                    self.lower_call(name, arguments, expression.span, expected)?
+                } else {
+                    let callee = self.lower_expression(callee, None)?;
+                    let Type::Callable(parameters, result) = &callee.ty else {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0301",
+                            callee.span,
+                            format!("type `{}` is not callable", callee.ty),
+                        ));
+                        return None;
+                    };
+                    let parameters = parameters.clone();
+                    let result = result.as_ref().clone();
+                    if arguments.len() != parameters.len() {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0303",
+                            expression.span,
+                            format!(
+                                "callable expects {} arguments, found {}",
+                                parameters.len(),
+                                arguments.len()
+                            ),
+                        ));
+                    }
+                    let values = arguments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, argument)| {
+                            if argument.name.is_some() {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "typing",
+                                    "T0318",
+                                    argument.span,
+                                    "named arguments are not supported for callable values",
+                                ));
+                            }
+                            let value =
+                                self.lower_expression(&argument.value, parameters.get(index))?;
+                            if let Some(expected) = parameters.get(index) {
+                                self.expect_type(expected, &value.ty, value.span);
+                            }
+                            Some(value)
+                        })
+                        .collect();
+                    TypedExpr {
+                        kind: TypedExprKind::CallValue {
+                            callee: Box::new(callee),
+                            arguments: values,
+                        },
+                        ty: result,
+                        span: expression.span,
+                    }
                 };
-                let value = self.lower_call(name, arguments, expression.span)?;
                 return Some(match expected {
                     Some(expected) => coerce_collection_iterator(value, expected, self.classes),
                     None => value,
@@ -3483,6 +3756,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             | "MapIterator"
                             | "EmptyIterator"
                             | "IteratorIterator"
+                            | "CallbackFilterIterator"
                     )
                 {
                     self.diagnostics.push(Diagnostic::error(
@@ -4110,7 +4384,310 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         intersect_narrow(current, &guard, self.classes).map(|ty| (local, ty))
     }
 
-    fn lower_call(&mut self, name: &str, arguments: &[Argument], span: Span) -> Option<TypedExpr> {
+    fn lower_collection_call(
+        &mut self,
+        name: &str,
+        arguments: &[Argument],
+        span: Span,
+        expected: Option<&Type>,
+    ) -> Option<TypedExpr> {
+        let (names, callback_index, builtin): (&[&str], Option<usize>, Builtin) = match name {
+            "vector_map" => (&["values", "callback"], Some(1), Builtin::VectorMap),
+            "vector_filter" => (&["values", "callback"], Some(1), Builtin::VectorFilter),
+            "vector_slice" => (&["values", "offset", "length"], None, Builtin::VectorSlice),
+            "vector_concat" => (&["first", "second"], None, Builtin::VectorConcat),
+            "map_transform" => (&["values", "callback"], Some(1), Builtin::MapTransform),
+            "map_filter" => (&["values", "callback"], Some(1), Builtin::MapFilter),
+            "map_merge" => (&["first", "second"], None, Builtin::MapMerge),
+            "iterator_apply" => (&["iterator", "callback"], Some(1), Builtin::IteratorApply),
+            _ => unreachable!(),
+        };
+        let mut slots = vec![None; names.len()];
+        let mut targets = Vec::new();
+        let mut positional = 0;
+        let mut named_seen = false;
+        for argument in arguments {
+            let target = if let Some(argument_name) = &argument.name {
+                named_seen = true;
+                names.iter().position(|name| *name == argument_name)
+            } else {
+                if named_seen {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0313",
+                        argument.span,
+                        "positional arguments cannot follow named arguments",
+                    ));
+                }
+                let index = positional;
+                positional += 1;
+                (index < names.len()).then_some(index)
+            };
+            let Some(target) = target else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0303",
+                    argument.span,
+                    format!("unexpected argument for `{name}`"),
+                ));
+                return None;
+            };
+            if slots[target].replace(argument).is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0315",
+                    argument.span,
+                    format!("argument `{}` is supplied more than once", names[target]),
+                ));
+                return None;
+            }
+            targets.push(target);
+        }
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.is_none() && !(name == "vector_slice" && index == 2) {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0304",
+                    span,
+                    format!("missing argument `{}` for `{name}`", names[index]),
+                ));
+                return None;
+            }
+        }
+        let mut values = vec![None; names.len()];
+        let callback_type = if let Some(index) = callback_index {
+            let callback = self.lower_expression(&slots[index]?.value, None)?;
+            let ty = callback.ty.clone();
+            values[index] = Some(callback);
+            let Type::Callable(parameters, result) = ty else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    slots[index]?.span,
+                    format!("`{name}` requires a typed callable"),
+                ));
+                return None;
+            };
+            if matches!(name, "vector_map" | "map_transform") && result.as_ref() == &Type::Void {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    slots[index]?.value.span,
+                    format!("`{name}` callback must return a value"),
+                ));
+                return None;
+            }
+            Some((parameters, *result))
+        } else {
+            None
+        };
+        let input_hint = match (name, callback_type.as_ref()) {
+            ("vector_map" | "vector_filter", Some((parameters, _))) if parameters.len() == 1 => {
+                Some(Type::Vector(Box::new(parameters[0].clone())))
+            }
+            ("map_transform" | "map_filter", Some((parameters, _))) if parameters.len() == 2 => {
+                Some(Type::Map(
+                    Box::new(parameters[1].clone()),
+                    Box::new(parameters[0].clone()),
+                ))
+            }
+            _ => expected.cloned(),
+        };
+        let first_syntax = &slots[0]?.value;
+        let first_is_empty = matches!(&first_syntax.kind, ExprKind::Vector(items) if items.is_empty())
+            || matches!(&first_syntax.kind, ExprKind::Map(items) if items.is_empty());
+        let binary = matches!(name, "vector_concat" | "map_merge");
+        if binary && first_is_empty && input_hint.is_none() {
+            values[1] = Some(self.lower_expression(&slots[1]?.value, None)?);
+        }
+        let first_expected = input_hint
+            .as_ref()
+            .or_else(|| values[1].as_ref().map(|value| &value.ty));
+        values[0] = Some(self.lower_expression(first_syntax, first_expected)?);
+        if binary && values[1].is_none() {
+            let input_type = values[0].as_ref().map(|value| &value.ty);
+            values[1] = Some(self.lower_expression(&slots[1]?.value, input_type)?);
+        }
+        if name == "vector_slice" {
+            values[1] = Some(self.lower_expression(&slots[1]?.value, Some(&Type::Int))?);
+            if let Some(argument) = slots[2] {
+                values[2] = Some(self.lower_expression(
+                    &argument.value,
+                    Some(&normalize_union(vec![Type::Int, Type::Null])),
+                )?);
+            }
+        }
+        let input = values[0].as_ref()?;
+        let input_ty = input.ty.clone();
+        let result_ty = match name {
+            "vector_map" | "vector_filter" | "vector_slice" | "vector_concat" => {
+                let Type::Vector(element) = &input_ty else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        input.span,
+                        format!("`{name}` requires `vector<T>`, found `{input_ty}`"),
+                    ));
+                    return None;
+                };
+                if name == "vector_concat" {
+                    self.expect_type(&input_ty, &values[1].as_ref()?.ty, values[1].as_ref()?.span);
+                }
+                if name == "vector_slice" {
+                    self.expect_type(
+                        &Type::Int,
+                        &values[1].as_ref()?.ty,
+                        values[1].as_ref()?.span,
+                    );
+                    if let Some(length) = &values[2] {
+                        self.expect_type(
+                            &normalize_union(vec![Type::Int, Type::Null]),
+                            &length.ty,
+                            length.span,
+                        );
+                    }
+                }
+                if let Some((parameters, result)) = &callback_type {
+                    if parameters.as_slice() != [element.as_ref().clone()] {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0302",
+                            slots[1]?.span,
+                            format!("`{name}` callback must accept `{element}`"),
+                        ));
+                    }
+                    if name == "vector_filter" {
+                        self.expect_type(&Type::Bool, result, slots[1]?.span);
+                    }
+                }
+                if name == "vector_map" {
+                    Type::Vector(Box::new(callback_type.as_ref()?.1.clone()))
+                } else {
+                    input_ty.clone()
+                }
+            }
+            "map_transform" | "map_filter" | "map_merge" => {
+                let Type::Map(key, value) = &input_ty else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        input.span,
+                        format!("`{name}` requires `map<K, V>`, found `{input_ty}`"),
+                    ));
+                    return None;
+                };
+                if name == "map_merge" {
+                    self.expect_type(&input_ty, &values[1].as_ref()?.ty, values[1].as_ref()?.span);
+                }
+                if let Some((parameters, result)) = &callback_type {
+                    if parameters.as_slice() != [value.as_ref().clone(), key.as_ref().clone()] {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0302",
+                            slots[1]?.span,
+                            format!("`{name}` callback must accept `({value}, {key})`"),
+                        ));
+                    }
+                    if name == "map_filter" {
+                        self.expect_type(&Type::Bool, result, slots[1]?.span);
+                    }
+                }
+                if name == "map_transform" {
+                    Type::Map(key.clone(), Box::new(callback_type.as_ref()?.1.clone()))
+                } else {
+                    input_ty.clone()
+                }
+            }
+            "iterator_apply" => {
+                let Some((key, value)) = iterator_types(&input_ty, self.classes) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        input.span,
+                        format!("`iterator_apply` requires `Iterator<K, V>`, found `{input_ty}`"),
+                    ));
+                    return None;
+                };
+                let parameter_type = Type::Nominal {
+                    name: "Iterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                };
+                values[0] = Some(coerce_collection_iterator(
+                    input.clone(),
+                    &parameter_type,
+                    self.classes,
+                ));
+                if let Some((parameters, result)) = &callback_type {
+                    if parameters.as_slice() != [value, key] {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0302",
+                            slots[1]?.span,
+                            "`iterator_apply` callback must accept the value and key",
+                        ));
+                    }
+                    self.expect_type(&Type::Bool, result, slots[1]?.span);
+                }
+                Type::Int
+            }
+            _ => unreachable!(),
+        };
+        let explicit = arguments
+            .iter()
+            .zip(targets)
+            .map(|(_, target)| BoundArgument {
+                target: ArgumentTarget::Parameter(target),
+                value: values[target].take().expect("argument was lowered"),
+            })
+            .collect();
+        let defaults = if name == "vector_slice" && slots[2].is_none() {
+            vec![BoundArgument {
+                target: ArgumentTarget::Parameter(2),
+                value: TypedExpr {
+                    kind: TypedExprKind::Null,
+                    ty: Type::Null,
+                    span,
+                },
+            }]
+        } else {
+            Vec::new()
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::Call {
+                callee: Callee::Builtin(builtin),
+                arguments: BoundArguments {
+                    explicit,
+                    defaults,
+                    parameter_count: names.len(),
+                    variadic_parameter: None,
+                    variadic_type: None,
+                },
+            },
+            ty: result_ty,
+            span,
+        })
+    }
+
+    fn lower_call(
+        &mut self,
+        name: &str,
+        arguments: &[Argument],
+        span: Span,
+        expected: Option<&Type>,
+    ) -> Option<TypedExpr> {
+        if matches!(
+            name,
+            "vector_map"
+                | "vector_filter"
+                | "vector_slice"
+                | "vector_concat"
+                | "map_transform"
+                | "map_filter"
+                | "map_merge"
+                | "iterator_apply"
+        ) {
+            return self.lower_collection_call(name, arguments, span, expected);
+        }
         let guard = match name {
             "is_string" => Some(Builtin::IsString),
             "is_int" => Some(Builtin::IsInt),
@@ -4574,7 +5151,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             let Some(value) = self.lower_expression(&argument.value, None) else {
                 continue;
             };
-            let actual = if class.name == "IteratorIterator" {
+            let actual = if matches!(
+                class.name.as_str(),
+                "IteratorIterator" | "FilterIterator" | "CallbackFilterIterator"
+            ) && target == ArgumentTarget::Parameter(0)
+            {
                 iterator_types(&value.ty, self.classes)
                     .map(|(key, value)| Type::Nominal {
                         name: "Iterator".to_owned(),
@@ -5511,6 +6092,102 @@ fn loop_clause_type(clause: &LoopClause) -> &Type {
     }
 }
 
+fn collect_expr_variables(expression: &Expr, names: &mut BTreeSet<String>) {
+    match &expression.kind {
+        ExprKind::Variable(name) => {
+            names.insert(name.clone());
+        }
+        ExprKind::Vector(values) => {
+            for value in values {
+                collect_expr_variables(value, names);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for entry in entries {
+                collect_expr_variables(&entry.key, names);
+                collect_expr_variables(&entry.value, names);
+            }
+        }
+        ExprKind::Unary { operand, .. } => collect_expr_variables(operand, names),
+        ExprKind::Binary { left, right, .. } => {
+            collect_expr_variables(left, names);
+            collect_expr_variables(right, names);
+        }
+        ExprKind::Call { callee, arguments } => {
+            collect_expr_variables(callee, names);
+            for argument in arguments {
+                collect_expr_variables(&argument.value, names);
+            }
+        }
+        ExprKind::Index { collection, index } => {
+            collect_expr_variables(collection, names);
+            collect_expr_variables(index, names);
+        }
+        ExprKind::New {
+            target, arguments, ..
+        } => {
+            if let NewTarget::Dynamic(value) = target {
+                collect_expr_variables(value, names);
+            }
+            for argument in arguments {
+                collect_expr_variables(&argument.value, names);
+            }
+        }
+        ExprKind::Property { object, .. } | ExprKind::MethodCall { object, .. } => {
+            collect_expr_variables(object, names);
+            if let ExprKind::MethodCall { arguments, .. } = &expression.kind {
+                for argument in arguments {
+                    collect_expr_variables(&argument.value, names);
+                }
+            }
+        }
+        ExprKind::StaticCall { arguments, .. } => {
+            for argument in arguments {
+                collect_expr_variables(&argument.value, names);
+            }
+        }
+        ExprKind::InstanceOf { value, .. } => collect_expr_variables(value, names),
+        ExprKind::Match { subject, arms } => {
+            collect_expr_variables(subject, names);
+            for arm in arms {
+                for condition in &arm.conditions {
+                    collect_expr_variables(condition, names);
+                }
+                collect_expr_variables(&arm.value, names);
+            }
+        }
+        ExprKind::Closure {
+            parameters,
+            captures,
+            implicit_captures,
+            body,
+            ..
+        } => {
+            names.extend(captures.iter().cloned());
+            if *implicit_captures {
+                let mut inner = BTreeSet::new();
+                for statement in body {
+                    if let StmtKind::Return(Some(value)) = &statement.kind {
+                        collect_expr_variables(value, &mut inner);
+                    }
+                }
+                names.extend(
+                    inner
+                        .into_iter()
+                        .filter(|name| !parameters.iter().any(|parameter| parameter.name == *name)),
+                );
+            }
+        }
+        ExprKind::Integer(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Null
+        | ExprKind::String(_)
+        | ExprKind::Name(_)
+        | ExprKind::ClassConstant { .. } => {}
+    }
+}
+
 fn resolve_type(
     syntax: &TypeSyntax,
     classes: &BTreeMap<String, ClassSignature>,
@@ -5613,6 +6290,31 @@ fn resolve_type_with_bound_check(
                         check_bounds,
                     )?),
                 )),
+                "callable" if arity >= 1 => {
+                    let mut types = arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            resolve_type_with_bound_check(
+                                argument,
+                                classes,
+                                type_parameters,
+                                diagnostics,
+                                check_bounds,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let result = types.pop()?;
+                    Some(Type::Callable(types, Box::new(result)))
+                }
+                "callable" => {
+                    diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1002",
+                        syntax.span,
+                        "`callable` requires parameter types followed by a return type",
+                    ));
+                    None
+                }
                 "vector" | "map" => {
                     let expected = if name == "vector" { 1 } else { 2 };
                     diagnostics.push(Diagnostic::error(
@@ -5755,6 +6457,12 @@ fn validate_type_argument_bounds(
             validate_type_argument_bounds(key, span, classes, diagnostics);
             validate_type_argument_bounds(value, span, classes, diagnostics);
         }
+        Type::Callable(parameters, result) => {
+            for parameter in parameters {
+                validate_type_argument_bounds(parameter, span, classes, diagnostics);
+            }
+            validate_type_argument_bounds(result, span, classes, diagnostics);
+        }
         Type::Union(members) => {
             for member in members {
                 validate_type_argument_bounds(member, span, classes, diagnostics);
@@ -5841,6 +6549,7 @@ fn type_contains_void(ty: &Type) -> bool {
         Type::Void => true,
         Type::Vector(element) => type_contains_void(element),
         Type::Map(key, value) => type_contains_void(key) || type_contains_void(value),
+        Type::Callable(parameters, _) => parameters.iter().any(type_contains_void),
         Type::Union(members) => members.iter().any(type_contains_void),
         Type::Nominal { arguments, .. } => arguments.iter().any(type_contains_void),
         _ => false,
@@ -5854,6 +6563,13 @@ fn substitute_type(ty: &Type, substitutions: &BTreeMap<TypeParameterId, Type>) -
         Type::Map(key, value) => Type::Map(
             Box::new(substitute_type(key, substitutions)),
             Box::new(substitute_type(value, substitutions)),
+        ),
+        Type::Callable(parameters, result) => Type::Callable(
+            parameters
+                .iter()
+                .map(|parameter| substitute_type(parameter, substitutions))
+                .collect(),
+            Box::new(substitute_type(result, substitutions)),
         ),
         Type::Union(members) => normalize_union(
             members
@@ -5962,6 +6678,12 @@ fn unify_inference(
                 if unify_inference(pattern_key, actual_key, class_parameters, inferred)
                     && unify_inference(pattern_value, actual_value, class_parameters, inferred)
         ),
+        Type::Callable(pattern_parameters, pattern_result) => matches!(actual,
+            Type::Callable(actual_parameters, actual_result)
+                if pattern_parameters.len() == actual_parameters.len()
+                    && pattern_parameters.iter().zip(actual_parameters).all(|(pattern, actual)|
+                        unify_inference(pattern, actual, class_parameters, inferred))
+                    && unify_inference(pattern_result, actual_result, class_parameters, inferred)),
         Type::Nominal {
             name: pattern_name,
             arguments: pattern_arguments,
@@ -6056,6 +6778,22 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             true,
             None,
             &["OuterIterator"],
+        ),
+        (
+            "FilterIterator",
+            NominalKind::Class,
+            true,
+            false,
+            None,
+            &["OuterIterator"],
+        ),
+        (
+            "CallbackFilterIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("FilterIterator"),
+            &[],
         ),
         ("Closeable", NominalKind::Interface, true, false, None, &[]),
         (
@@ -6331,6 +7069,8 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "MapIterator",
         "EmptyIterator",
         "IteratorIterator",
+        "FilterIterator",
+        "CallbackFilterIterator",
     ] {
         let class = classes
             .get_mut(name)
@@ -6382,6 +7122,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "MapIterator",
         "EmptyIterator",
         "IteratorIterator",
+        "FilterIterator",
     ] {
         let class = classes.get_mut(name).expect("native iterator exists");
         let parameters = class
@@ -6398,7 +7139,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             parameters
         };
         class.interface_types = vec![Type::Nominal {
-            name: if name == "IteratorIterator" {
+            name: if matches!(name, "IteratorIterator" | "FilterIterator") {
                 "OuterIterator"
             } else {
                 "Iterator"
@@ -6406,6 +7147,69 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             .to_owned(),
             arguments,
         }];
+    }
+    {
+        let class = classes
+            .get_mut("CallbackFilterIterator")
+            .expect("callback iterator exists");
+        class.parent_type = Some(Type::Nominal {
+            name: "FilterIterator".to_owned(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|p| Type::Parameter {
+                    id: p.id,
+                    name: p.name.clone(),
+                })
+                .collect(),
+        });
+    }
+    for name in ["FilterIterator", "CallbackFilterIterator"] {
+        let class = classes.get_mut(name).expect("filter iterator exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let properties = if name == "FilterIterator" {
+            vec![
+                (
+                    "__inner",
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: params.clone(),
+                    },
+                ),
+                ("__ready", Type::Bool),
+            ]
+        } else {
+            vec![(
+                "__callback",
+                Type::Callable(
+                    vec![params[1].clone(), params[0].clone()],
+                    Box::new(Type::Bool),
+                ),
+            )]
+        };
+        for (property_name, ty) in properties {
+            class.declared_properties.push(Property {
+                id: PropertyId(
+                    u32::try_from(class.declared_properties.len())
+                        .expect("native property count fits u32"),
+                ),
+                name: property_name.to_owned(),
+                ty,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
     }
 
     let nullable_throwable =
@@ -6612,6 +7416,92 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         },
         false,
     );
+    for name in ["FilterIterator", "CallbackFilterIterator"] {
+        let params = classes[name]
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let inner = Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: params.clone(),
+        };
+        let mut constructor = vec![native_parameter(
+            "iterator",
+            inner.clone(),
+            None,
+            Span::empty(0),
+        )];
+        if name == "CallbackFilterIterator" {
+            constructor.push(native_parameter(
+                "callback",
+                Type::Callable(
+                    vec![params[1].clone(), params[0].clone()],
+                    Box::new(Type::Bool),
+                ),
+                None,
+                Span::empty(0),
+            ));
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(if name == "CallbackFilterIterator" {
+                Builtin::CallbackFilterConstruct
+            } else {
+                Builtin::IteratorConstruct
+            }),
+            false,
+            constructor,
+            Type::Void,
+            false,
+        );
+        for (method, builtin, result) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            ("key", Builtin::IteratorKey, params[0].clone()),
+            ("value", Builtin::IteratorValue, params[1].clone()),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "getInnerIterator",
+            Some(Builtin::IteratorGetInner),
+            false,
+            vec![],
+            inner,
+            false,
+        );
+        add_native_method(
+            &mut classes,
+            name,
+            "accept",
+            (name == "CallbackFilterIterator").then_some(Builtin::CallbackFilterAccept),
+            false,
+            vec![
+                native_parameter("value", params[1].clone(), None, Span::empty(0)),
+                native_parameter("key", params[0].clone(), None, Span::empty(0)),
+            ],
+            Type::Bool,
+            name == "FilterIterator",
+        );
+    }
     add_native_method(
         &mut classes,
         "Throwable",
@@ -7601,6 +8491,10 @@ fn count_expression(expression: &TypedExpr) -> usize {
             count_expression(left) + count_expression(right)
         }
         TypedExprKind::Call { arguments, .. } => count_bound_arguments(arguments),
+        TypedExprKind::Closure { captures, .. } => captures.iter().map(count_expression).sum(),
+        TypedExprKind::CallValue { callee, arguments } => {
+            count_expression(callee) + arguments.iter().map(count_expression).sum::<usize>()
+        }
         TypedExprKind::DirectMethod {
             receiver,
             arguments,
