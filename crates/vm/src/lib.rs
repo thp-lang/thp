@@ -2,6 +2,8 @@
 
 #![allow(clippy::float_cmp, clippy::too_many_lines)]
 
+mod serialization;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
@@ -299,6 +301,8 @@ pub fn execute_to(
         request_input: context.request_input.clone(),
         request_input_stream: None,
         request_heap: &request_heap,
+        call_stack: Vec::new(),
+        active_functions: Vec::new(),
         started: Instant::now(),
     };
     let result = match state.execute_function(program.entry, Vec::new(), 1, None) {
@@ -387,6 +391,8 @@ struct ExecutionState<'program, 'output> {
     request_input: RequestInput,
     request_input_stream: Option<Value>,
     request_heap: &'output RequestHeap,
+    call_stack: Vec<StackFrame>,
+    active_functions: Vec<FunctionId>,
     started: Instant,
 }
 
@@ -500,6 +506,14 @@ impl ExecutionState<'_, '_> {
             class.properties.len(),
             instruction.span,
         )?;
+        if is_instance_of_name(self.program, class.id, "Throwable") {
+            object
+                .set_exception_origin(
+                    instruction.span,
+                    self.captured_trace(calling_function, instruction.span),
+                )
+                .map_err(|kind| runtime(kind, instruction.span))?;
+        }
         for property in &class.properties {
             let Some(initializer) = &property.default else {
                 continue;
@@ -665,7 +679,7 @@ impl ExecutionState<'_, '_> {
         called_class: Option<ClassId>,
     ) -> Result<Value, VmError> {
         let mut frame = self.new_frame(id, arguments, called_class);
-        match self.run_frame(id, &mut frame, depth, false)? {
+        match self.run_active_frame(id, &mut frame, depth, false)? {
             FrameOutcome::Return(value) => Ok(value),
             FrameOutcome::Yield(_, _) => Err(runtime(
                 RuntimeErrorKind::Unreachable,
@@ -812,6 +826,19 @@ impl ExecutionState<'_, '_> {
                 }
             }
         }
+    }
+
+    fn run_active_frame(
+        &mut self,
+        id: FunctionId,
+        frame: &mut Frame,
+        depth: usize,
+        closing: bool,
+    ) -> Result<FrameOutcome, VmError> {
+        self.active_functions.push(id);
+        let result = self.run_frame(id, frame, depth, closing);
+        self.active_functions.pop();
+        result
     }
 
     fn execute_instruction(
@@ -1074,12 +1101,21 @@ impl ExecutionState<'_, '_> {
                     }
                     _ => Vec::new(),
                 };
-                Some(self.allocate_object(
+                let value = self.allocate_object(
                     class.id,
                     type_arguments,
                     class.properties.len(),
                     instruction.span,
-                )?)
+                )?;
+                if is_instance_of_name(self.program, class.id, "Throwable") {
+                    value
+                        .set_exception_origin(
+                            instruction.span,
+                            self.captured_trace(function, instruction.span),
+                        )
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                Some(value)
             }
             InstructionKind::NewDynamic {
                 target,
@@ -1132,8 +1168,20 @@ impl ExecutionState<'_, '_> {
                 object,
                 property,
                 value,
+            } => {
+                let object = get_register(frame, *object, instruction.span)?;
+                if object.class_id() == self.classes_by_name.get("TraceLine").copied() {
+                    return Err(
+                        self.type_error("TraceLine properties are read-only", instruction.span)
+                    );
+                }
+                let value = get_register(frame, *value, instruction.span)?;
+                object
+                    .set_property(*property, value)
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                None
             }
-            | InstructionKind::InitializeProperty {
+            InstructionKind::InitializeProperty {
                 object,
                 property,
                 value,
@@ -1266,8 +1314,32 @@ impl ExecutionState<'_, '_> {
                     )
                     .map_err(|kind| runtime(kind, instruction.span));
                 }
-                match self.execute_function(target, arguments, depth + 1, called_class) {
-                    Ok(value) => Ok(value),
+                let target_function = &self.program.functions[target.0 as usize];
+                let countable_call = target_function.owner.is_some()
+                    && !target_function.static_method
+                    && target_function.name.ends_with("::count")
+                    && arguments
+                        .first()
+                        .and_then(Value::class_id)
+                        .is_some_and(|class| is_instance_of_name(self.program, class, "Countable"));
+                self.call_stack
+                    .push(self.stack_frame(calling_function, instruction.span));
+                let called = self.execute_function(target, arguments, depth + 1, called_class);
+                self.call_stack.pop();
+                match called {
+                    Ok(value) => {
+                        if countable_call && value.as_int().is_none_or(|count| count < 0) {
+                            Err(self.native_exception(
+                                "UnexpectedValueException",
+                                b"Countable::count() must return a non-negative int".to_vec(),
+                                None,
+                                0,
+                                instruction.span,
+                            ))
+                        } else {
+                            Ok(value)
+                        }
+                    }
                     Err(VmError::Runtime(mut error)) => {
                         error.push_frame(calling_function.name.clone(), instruction.span);
                         Err(VmError::Runtime(error))
@@ -1277,10 +1349,7 @@ impl ExecutionState<'_, '_> {
                         span,
                         mut trace,
                     }) => {
-                        trace.push(StackFrame {
-                            function: calling_function.name.clone(),
-                            span: instruction.span,
-                        });
+                        trace.push(self.stack_frame(calling_function, instruction.span));
                         Err(VmError::Thrown { value, span, trace })
                     }
                     Err(error) => Err(error),
@@ -1371,7 +1440,7 @@ impl ExecutionState<'_, '_> {
     ) -> Result<(), VmError> {
         let mut frame = Frame::from_generator(std::mem::take(&mut state.frame));
         loop {
-            match self.run_frame(state.function, &mut frame, depth + 1, false) {
+            match self.run_active_frame(state.function, &mut frame, depth + 1, false) {
                 Ok(FrameOutcome::Yield(key, value)) => {
                     let key = if let Some(key) = key {
                         if let Some(number) = key.as_int()
@@ -1462,7 +1531,7 @@ impl ExecutionState<'_, '_> {
         let current = frame.current;
         let handled = catch_exception(self.program, function, &mut frame, current, marker.clone());
         let result = if handled {
-            self.run_frame(state.function, &mut frame, depth + 1, true)
+            self.run_active_frame(state.function, &mut frame, depth + 1, true)
         } else {
             Ok(FrameOutcome::Return(Value::NULL))
         };
@@ -2186,23 +2255,47 @@ impl ExecutionState<'_, '_> {
             Builtin::IsVector => Ok(Value::bool(arguments[0].vector_values().is_some())),
             Builtin::IsMap => Ok(Value::bool(arguments[0].map_entries().is_some())),
             Builtin::Count => {
-                let count = arguments[0].count().ok_or_else(|| {
-                    runtime(
-                        RuntimeErrorKind::TypeError(format!(
-                            "cannot count {}",
-                            arguments[0].type_name()
-                        )),
+                let value = if arguments[0]
+                    .class_id()
+                    .is_some_and(|class| is_instance_of_name(self.program, class, "Countable"))
+                {
+                    self.iterator_call(
+                        &arguments[0],
+                        "count",
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?
+                } else {
+                    let count = arguments[0].count().ok_or_else(|| {
+                        runtime(
+                            RuntimeErrorKind::TypeError(format!(
+                                "cannot count {}",
+                                arguments[0].type_name()
+                            )),
+                            instruction.span,
+                        )
+                    })?;
+                    Value::integer(i64::try_from(count).map_err(|_| {
+                        runtime(
+                            RuntimeErrorKind::Arithmetic(
+                                "count exceeds the signed 64-bit range".to_owned(),
+                            ),
+                            instruction.span,
+                        )
+                    })?)
+                };
+                if value.as_int().is_some_and(|count| count >= 0) {
+                    Ok(value)
+                } else {
+                    Err(self.native_exception(
+                        "UnexpectedValueException",
+                        b"Countable::count() must return a non-negative int".to_vec(),
+                        None,
+                        0,
                         instruction.span,
-                    )
-                })?;
-                Ok(Value::integer(i64::try_from(count).map_err(|_| {
-                    runtime(
-                        RuntimeErrorKind::Arithmetic(
-                            "count exceeds the signed 64-bit range".to_owned(),
-                        ),
-                        instruction.span,
-                    )
-                })?))
+                    ))
+                }
             }
             Builtin::VarDump => {
                 for argument in arguments {
@@ -2398,8 +2491,15 @@ impl ExecutionState<'_, '_> {
                 let message = arguments
                     .first()
                     .map_or_else(Vec::new, |value| value.as_bytes().unwrap().to_vec());
-                Value::try_exception(self.result_class(instruction)?, message, None, 0)
-                    .map_err(|kind| runtime(kind, instruction.span))
+                let value = Value::try_exception(self.result_class(instruction)?, message, None, 0)
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                value
+                    .set_exception_origin(
+                        instruction.span,
+                        self.captured_trace(calling_function, instruction.span),
+                    )
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(value)
             }
             Builtin::ExceptionConstruct => {
                 let previous = (!arguments[3].is_null()).then(|| arguments[3].clone());
@@ -2413,6 +2513,18 @@ impl ExecutionState<'_, '_> {
                         previous,
                     )
                     .map_err(|kind| runtime(kind, instruction.span))?;
+                if arguments[0]
+                    .exception_origin()
+                    .map_err(|kind| runtime(kind, instruction.span))?
+                    .is_none()
+                {
+                    arguments[0]
+                        .set_exception_origin(
+                            instruction.span,
+                            self.captured_trace(calling_function, instruction.span),
+                        )
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
                 Ok(Value::NULL)
             }
             Builtin::ExceptionGetMessage => Value::try_bytes(
@@ -2448,6 +2560,176 @@ impl ExecutionState<'_, '_> {
                     .map_err(|kind| runtime(kind, instruction.span))?,
             )
             .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::OptionSome | Builtin::OptionNone => {
+                let Type::Nominal {
+                    arguments: type_arguments,
+                    ..
+                } = instruction.ty.as_ref().expect("verified option result")
+                else {
+                    unreachable!("verified option result is nominal")
+                };
+                let option = self.allocate_object(
+                    self.classes_by_name["Option"],
+                    type_arguments.clone(),
+                    2,
+                    instruction.span,
+                )?;
+                option
+                    .set_property(
+                        thp_hir::PropertyId(0),
+                        Value::bool(builtin == Builtin::OptionSome),
+                    )
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                if builtin == Builtin::OptionSome {
+                    option
+                        .set_property(thp_hir::PropertyId(1), arguments[0].clone())
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                Ok(option)
+            }
+            Builtin::OptionIsSome | Builtin::OptionIsNone => {
+                let present = arguments[0]
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, instruction.span))?
+                    .as_bool()
+                    .expect("verified option presence");
+                Ok(Value::bool(if builtin == Builtin::OptionIsSome {
+                    present
+                } else {
+                    !present
+                }))
+            }
+            Builtin::OptionGet => {
+                let present = arguments[0]
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, instruction.span))?
+                    .as_bool()
+                    .expect("verified option presence");
+                if !present {
+                    return Err(self.native_exception(
+                        "OutOfBoundsException",
+                        b"Option::get() called on none".to_vec(),
+                        None,
+                        0,
+                        instruction.span,
+                    ));
+                }
+                arguments[0]
+                    .property(thp_hir::PropertyId(1))
+                    .map_err(|kind| runtime(kind, instruction.span))
+            }
+            Builtin::TraceLineConstruct => {
+                if arguments[0].property(thp_hir::PropertyId(0)).is_ok() {
+                    return Err(
+                        self.type_error("TraceLine is already initialized", instruction.span)
+                    );
+                }
+                let line = arguments[2].as_int().expect("verified trace line");
+                let operator = arguments[6].as_bytes().expect("verified trace operator");
+                if line < 0
+                    || !matches!(operator, b"" | b"->" | b"::")
+                    || (!arguments[5].is_null() && arguments[5].class_id().is_none())
+                    || (!arguments[7].is_null() && arguments[7].vector_values().is_none())
+                {
+                    return Err(self.native_exception(
+                        "InvalidArgumentException",
+                        b"invalid TraceLine fields".to_vec(),
+                        None,
+                        0,
+                        instruction.span,
+                    ));
+                }
+                for (slot, value) in arguments.iter().skip(1).enumerate() {
+                    arguments[0]
+                        .set_property(
+                            thp_hir::PropertyId(
+                                u32::try_from(slot).expect("TraceLine has seven fields"),
+                            ),
+                            value.clone(),
+                        )
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                Ok(Value::NULL)
+            }
+            Builtin::ExceptionGetFile => {
+                let origin = arguments[0]
+                    .exception_origin()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                self.bytes(
+                    origin.map_or("", |span| self.source_location(span).0),
+                    instruction.span,
+                )
+            }
+            Builtin::ExceptionGetLine => {
+                let origin = arguments[0]
+                    .exception_origin()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(Value::integer(
+                    origin.map_or(0, |span| self.source_location(span).1),
+                ))
+            }
+            Builtin::ExceptionGetTrace => {
+                let frames = arguments[0]
+                    .exception_trace()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                let values = frames
+                    .iter()
+                    .map(|frame| self.trace_line_value(frame, instruction.span))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Value::try_vector(Type::Object("TraceLine".to_owned()), values)
+                    .map_err(|kind| runtime(kind, instruction.span))
+            }
+            Builtin::ExceptionGetTraceAsString => {
+                let frames = arguments[0]
+                    .exception_trace()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                self.bytes(self.trace_text(&frames), instruction.span)
+            }
+            Builtin::ExceptionToString => {
+                let class = arguments[0].class_id().expect("verified throwable class");
+                let name = &self.program.classes[class.0 as usize].name;
+                let message = arguments[0]
+                    .exception_message()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                let origin = arguments[0]
+                    .exception_origin()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                let (file, line) = origin.map_or(("", 0), |span| self.source_location(span));
+                let frames = arguments[0]
+                    .exception_trace()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                let description = format!(
+                    "{name}: {} in {file}:{line}\n{}",
+                    String::from_utf8_lossy(&message),
+                    self.trace_text(&frames)
+                );
+                self.bytes(description, instruction.span)
+            }
+            Builtin::Serialize => {
+                let bytes = serialization::serialize(&arguments[0]).map_err(|message| {
+                    self.native_exception(
+                        "InvalidArgumentException",
+                        message.into_bytes(),
+                        None,
+                        0,
+                        instruction.span,
+                    )
+                })?;
+                Value::try_bytes(bytes).map_err(|kind| runtime(kind, instruction.span))
+            }
+            Builtin::Unserialize => serialization::unserialize(
+                arguments[0].as_bytes().expect("verified serialized string"),
+            )
+            .map_err(|error| match error {
+                serialization::DecodeError::Malformed(message) => self.native_exception(
+                    "UnexpectedValueException",
+                    message.as_bytes().to_vec(),
+                    None,
+                    0,
+                    instruction.span,
+                ),
+                serialization::DecodeError::Runtime(kind) => runtime(kind, instruction.span),
+            }),
             Builtin::Reflection(operation) => {
                 self.execute_reflection(operation, &arguments, depth, calling_function, instruction)
             }
@@ -3162,6 +3444,9 @@ impl ExecutionState<'_, '_> {
                         .property(property.id)
                         .map_err(|kind| runtime(kind, span))
                 } else {
+                    if receiver.class_id() == self.classes_by_name.get("TraceLine").copied() {
+                        return Err(self.type_error("TraceLine properties are read-only", span));
+                    }
                     let value = &arguments[2];
                     if !value_matches(self.program, value, &property_type) {
                         return Err(self.reflection_error(
@@ -3843,13 +4128,102 @@ impl ExecutionState<'_, '_> {
             .expect("native exception class is present")
             .id;
         match Value::try_exception(class, message, target, system_code) {
-            Ok(value) => VmError::Thrown {
-                value,
+            Ok(value) => match value.set_exception_origin(
                 span,
-                trace: Vec::new(),
+                self.active_functions
+                    .last()
+                    .map(|id| self.stack_frame(&self.program.functions[id.0 as usize], span))
+                    .into_iter()
+                    .chain(self.call_stack.iter().rev().cloned())
+                    .collect(),
+            ) {
+                Ok(()) => VmError::Thrown {
+                    value,
+                    span,
+                    trace: Vec::new(),
+                },
+                Err(kind) => runtime(kind, span),
             },
             Err(kind) => runtime(kind, span),
         }
+    }
+
+    fn captured_trace(&self, function: &Function, span: Span) -> Vec<StackFrame> {
+        std::iter::once(self.stack_frame(function, span))
+            .chain(self.call_stack.iter().rev().cloned())
+            .collect()
+    }
+
+    fn stack_frame(&self, function: &Function, span: Span) -> StackFrame {
+        StackFrame {
+            function: function.name.clone(),
+            span,
+            class: function
+                .owner
+                .map(|owner| self.program.classes[owner.0 as usize].name.clone()),
+            static_method: function.static_method,
+        }
+    }
+
+    fn source_location(&self, span: Span) -> (&str, i64) {
+        let source = span.source.map_or(0, |source| source.0 as usize);
+        let Some(source) = self.program.sources.get(source) else {
+            return ("", 0);
+        };
+        let line = source
+            .line_starts
+            .partition_point(|start| *start <= span.start);
+        (&source.path, i64::try_from(line).unwrap_or(i64::MAX))
+    }
+
+    fn trace_text(&self, frames: &[StackFrame]) -> String {
+        frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let (file, line) = self.source_location(frame.span);
+                format!("#{index} {file}({line}): {}", frame.function)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn trace_line_value(&self, frame: &StackFrame, span: Span) -> Result<Value, VmError> {
+        let class = self.classes_by_name["TraceLine"];
+        let value = self.allocate_object(class, Vec::new(), 7, span)?;
+        let (file, line) = self.source_location(frame.span);
+        let owner = frame.class.as_deref().unwrap_or("");
+        let function = frame
+            .function
+            .rsplit_once("::")
+            .map_or(frame.function.as_str(), |(_, name)| name);
+        let operator = if owner.is_empty() {
+            ""
+        } else if frame.static_method {
+            "::"
+        } else {
+            "->"
+        };
+        for (slot, part) in [
+            self.bytes(function, span)?,
+            Value::integer(line),
+            self.bytes(file, span)?,
+            self.bytes(owner, span)?,
+            Value::NULL,
+            self.bytes(operator, span)?,
+            Value::NULL,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            value
+                .set_property(
+                    thp_hir::PropertyId(u32::try_from(slot).expect("TraceLine has seven fields")),
+                    part,
+                )
+                .map_err(|kind| runtime(kind, span))?;
+        }
+        Ok(value)
     }
 
     fn stream_exception(&self, kind: RuntimeErrorKind, span: Span) -> VmError {
@@ -4746,7 +5120,20 @@ mod tests {
         let hir = lower_hir(&parsed.program);
         assert!(hir.diagnostics.is_empty(), "{:?}", hir.diagnostics);
         let mir = lower_mir(&hir.module);
-        let bytecode = lower_bytecode(&mir);
+        let mut bytecode = lower_bytecode(&mir);
+        bytecode.sources.push(thp_bytecode::SourceInfo {
+            path: "test.thp".to_owned(),
+            line_starts: std::iter::once(0)
+                .chain(
+                    source
+                        .text()
+                        .bytes()
+                        .enumerate()
+                        .filter(|(_, byte)| *byte == b'\n')
+                        .map(|(index, _)| u32::try_from(index + 1).expect("test source fits u32")),
+                )
+                .collect(),
+        });
         execute(&bytecode, Limits::default())
     }
 
@@ -5211,6 +5598,137 @@ try {
             execution.output,
             b"body failed\n./definitely-missing-thp-resource-test\nbool(true)\n"
         );
+    }
+
+    #[test]
+    fn foundational_option_and_interfaces() {
+        let execution = run(r#"<?thp
+class Box implements Countable, Stringable, MapAccess<string, int> {
+    private int $value = 1;
+    public function count(): int { return 1; }
+    public function __toString(): string { return "box"; }
+    public function offsetExists(string $offset): bool { return $offset === "value"; }
+    public function offsetGet(string $offset): int { return $this->value; }
+    public function offsetSet(?string $offset, int $value): void { $this->value = $value; }
+    public function offsetUnset(string $offset): void { $this->value = 0; }
+}
+function label(Stringable $value): string { return $value->__toString(); }
+$some = Option::some(7);
+$none: Option<?int> = Option::none();
+var_dump($some->isSome());
+var_dump($some->get());
+var_dump($none->isNone());
+try {
+    $none->get();
+} catch (OutOfBoundsException $error) {
+    echo $error->getMessage();
+}
+echo "\n" . count(new Box()) . label(new Box());
+"#)
+        .unwrap();
+        assert_eq!(
+            execution.output,
+            b"bool(true)\nint(7)\nbool(true)\nOption::get() called on none\n1box"
+        );
+    }
+
+    #[test]
+    fn serialization_round_trips_values_and_rejects_invalid_input() {
+        let execution = run(r#"<?thp
+$copy = unserialize(serialize({"a" => [1, 2, 3]}));
+var_dump($copy);
+try { unserialize("bad"); } catch (UnexpectedValueException $error) { echo "invalid\n"; }
+try { serialize(new Exception("x")); } catch (InvalidArgumentException $error) { echo "object\n"; }
+"#)
+        .unwrap();
+        assert!(execution.output.starts_with(b"map("));
+        assert!(execution.output.ends_with(b"invalid\nobject\n"));
+    }
+
+    #[test]
+    fn unserialize_preserves_heap_limit_failures() {
+        let program = bytecode(&format!(
+            "<?thp\n$value = unserialize(serialize(\"{}\"));",
+            "x".repeat(512)
+        ));
+        let failure = execute_captured(
+            &program,
+            &ExecutionContext {
+                limits: Limits {
+                    max_heap_bytes: Some(2800),
+                    ..Limits::default()
+                },
+                ..ExecutionContext::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            VmError::Runtime(RuntimeError {
+                kind: RuntimeErrorKind::HeapLimit { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn throwable_origin_trace_and_trace_line_are_observable() {
+        let execution = run(r#"<?thp
+function fail(): void { throw new LogicException("boom"); }
+try { fail(); } catch (LogicException $error) {
+    echo $error->getFile() . ":" . $error->getLine() . "\n";
+    echo count($error->getTrace()) . "\n";
+    echo $error->getTraceAsString() . "\n";
+    echo $error->__toString() . "\n";
+}
+$frame = new TraceLine("f", 1, "p", "", null, "", null);
+echo $frame->function . $frame->line;
+try { $frame->line = 2; } catch (TypeError $error) { echo " immutable"; }
+"#)
+        .unwrap();
+        assert!(
+            execution.output.starts_with(b"test.thp:2\n"),
+            "{:?}",
+            execution.output
+        );
+        assert!(
+            execution.output.ends_with(b"f1 immutable"),
+            "{:?}",
+            execution.output
+        );
+    }
+
+    #[test]
+    fn native_exception_trace_includes_current_function() {
+        let execution = run(r#"<?thp
+function invalid(): void { unserialize("bad"); }
+try { invalid(); } catch (UnexpectedValueException $error) {
+    echo count($error->getTrace());
+}
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"2");
+    }
+
+    #[test]
+    fn trace_lines_identify_instance_and_static_methods() {
+        let execution = run(r#"<?thp
+class Origin {
+    public function instance(): void { throw new Exception("instance"); }
+    public static function statically(): void { throw new Exception("static"); }
+}
+$origin = new Origin();
+try { $origin->instance(); } catch (Exception $error) {
+    $line = $error->getTrace()[0];
+    echo $line->class . $line->type . $line->function . "\n";
+}
+try { Origin::statically(); } catch (Exception $error) {
+    $line = $error->getTrace()[0];
+    echo $line->class . $line->type . $line->function . "\n";
+}
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"Origin->instance\nOrigin::statically\n");
     }
 
     #[test]

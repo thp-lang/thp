@@ -314,11 +314,16 @@ test("desktop class interactions and accessibility", async ({
   await page.goto("/");
   await expect(
     page.getByRole("heading", {
-      name: "A typed language with its own runtime.",
+      name: "Familiar syntax. Precise types.",
     }),
   ).toBeVisible();
-  await expect(page.locator(".code-window")).toContainText("thp run hello.thp");
-  await expect(page.locator(".code-window")).toContainText("Hello, world!");
+  await expect(page.locator(".code-window")).toContainText("vector<string>");
+  await expect(page.locator(".code-window")).toContainText("map<string, int>");
+  await expect(page.locator(".code-window")).toContainText("Ada: 10");
+  await expect(
+    page.getByRole("heading", { name: "Generics you can use today" }),
+  ).toBeVisible();
+  await expect(page.locator(".home-prose")).toContainText("class Box<T>");
   await expect(
     page.getByRole("heading", { name: "When to choose THP over PHP" }),
   ).toBeVisible();

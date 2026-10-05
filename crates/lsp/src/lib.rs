@@ -1474,6 +1474,8 @@ const NATIVE_COLLECTIONS: &[NativeCollectionSpec] = &[
         ],
         "int",
     ),
+    ("serialize", &[("value", "mixed")], "string"),
+    ("unserialize", &[("value", "string")], "mixed"),
 ];
 
 const GENERATOR_METHODS: &[(&str, &str)] = &[
@@ -3298,6 +3300,8 @@ fn validate_type_arity(program: &Program, ty: &TypeSyntax) -> Result<(), String>
         ("MapIterator".to_owned(), 2),
         ("EmptyIterator".to_owned(), 2),
         ("IteratorIterator".to_owned(), 2),
+        ("Option".to_owned(), 1),
+        ("MapAccess".to_owned(), 2),
     ]);
     for name in [
         "Closeable",
@@ -3305,6 +3309,9 @@ fn validate_type_arity(program: &Program, ty: &TypeSyntax) -> Result<(), String>
         "WritableStream",
         "SeekableStream",
         "Throwable",
+        "Countable",
+        "Stringable",
+        "TraceLine",
         "MemoryStream",
         "TempStream",
         "Streams",
@@ -3321,6 +3328,19 @@ fn validate_type_arity(program: &Program, ty: &TypeSyntax) -> Result<(), String>
         "InvalidStreamUriException",
         "Error",
         "UnhandledMatchError",
+        "LogicException",
+        "BadFunctionCallException",
+        "BadMethodCallException",
+        "DomainException",
+        "InvalidArgumentException",
+        "LengthException",
+        "OutOfRangeException",
+        "RuntimeException",
+        "OutOfBoundsException",
+        "OverflowException",
+        "RangeException",
+        "UnderflowException",
+        "UnexpectedValueException",
     ] {
         arities.insert(name.to_owned(), 0);
     }

@@ -11,15 +11,11 @@ returns:
   type: int
   description: Returns the number of represented items.
 errors:
-  - description:
-      No additional runtime failure beyond parameter validation and failures
-      propagated by delegated operations is specified.
+  - description: The VM throws UnexpectedValueException if the result is negative.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method executes in the reference VM.
 version: "0.1"
 owner: std.baseTypes.Countable
 visibility: public

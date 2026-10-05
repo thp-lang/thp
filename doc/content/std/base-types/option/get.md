@@ -15,15 +15,11 @@ returns:
     Returns the value supplied to some(). Calling get() on an absent option
     raises a runtime error.
 errors:
-  - description:
-      No additional runtime failure beyond parameter validation and failures
-      propagated by delegated operations is specified.
+  - description: Throws OutOfBoundsException when the option is absent.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method executes in the reference VM.
 version: "0.1"
 owner: std.baseTypes.Option
 visibility: public

@@ -32,7 +32,7 @@ limits an outstanding wait.
 
 ## PHP-inspired library categories
 
-[`Exceptions`](thp:std.exceptions) documents the proposed exception
+[`Exceptions`](thp:std.exceptions) documents the executable exception
 hierarchy. [`Iterators`](thp:std.iterators) covers adapters and recursive
 traversal. [`Filesystem`](thp:std.filesystem) documents filesystem metadata,
 files, temporary files, and locking results.
@@ -84,7 +84,7 @@ shape rather than methods or PHP's `array_*` names. The vector family
 [`map_transform()`](thp:std.baseTypes.map_transform),
 [`map_filter()`](thp:std.baseTypes.map_filter), and
 [`map_merge()`](thp:std.baseTypes.map_merge) execute in the reference VM.
-`count(string|vector<T>|map<K, V>): int` reads length without traversal state.
+`count(string|vector<T>|map<K, V>|Countable): int` reads length without traversal state.
 It is distinct from implemented
 [`iterator_count()`](thp:std.spl.iterator_count), which consumes an explicit
 iterator from its current cursor without rewinding.

@@ -42,7 +42,7 @@ The value must be assignable to `V`. An explicit key must be assignable to `K`.
 An omitted key is an `int`, so `K` must accept `int`. A `yield` outside a
 generator function, a generator with another declared return type, and a
 `yield` expression are compile errors. `yield` has no result slot and callers
-cannot send values into a suspended generator in 0.7.0.
+cannot send values into a suspended generator.
 
 Automatic keys start at zero. Each automatic key consumes the next integer.
 An explicit integer key at or above that next integer moves the following

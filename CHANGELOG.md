@@ -7,6 +7,17 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-05
+
+### Added
+
+- std: Implemented foundational contracts for `Option`, `Countable`, `MapAccess`, `Stringable`, throwable traces, the exception hierarchy, and `serialize()`/`unserialize()`.
+- tooling: Added cross-platform release installers with archive checksum verification.
+
+### Changed
+
+- runtime: Advanced the bytecode schema to version 7 for foundational standard-library values and serialization.
+
 ## [0.7.0] - 2026-10-03
 
 ### Added

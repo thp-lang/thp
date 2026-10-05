@@ -11,8 +11,8 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 use crate::{
     BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, DynamicArgument, ExceptionHandler,
-    Function, Instruction, InstructionKind, Method, NominalType, Program, Property, Terminator,
-    verify,
+    Function, Instruction, InstructionKind, Method, NominalType, Program, Property, SourceInfo,
+    Terminator, verify,
 };
 
 const MAGIC: &[u8; 8] = b"THPBC\0\0\0";
@@ -43,6 +43,14 @@ pub fn encode(program: &Program) -> Vec<u8> {
     encoder.bytes(MAGIC);
     encoder.u16(program.schema_version);
     encoder.u32(program.entry.0);
+    encoder.len(program.sources.len());
+    for source in &program.sources {
+        encoder.string(&source.path);
+        encoder.len(source.line_starts.len());
+        for start in &source.line_starts {
+            encoder.u32(*start);
+        }
+    }
     encoder.len(program.classes.len());
     for class in &program.classes {
         encoder.class(class);
@@ -73,6 +81,11 @@ pub fn decode(bytes: &[u8]) -> Result<Program, DecodeError> {
         )));
     }
     let entry = FunctionId(decoder.u32()?);
+    let sources = decoder.vector(|decoder| {
+        let path = decoder.string()?;
+        let line_starts = decoder.vector(Decoder::u32)?;
+        Ok(SourceInfo { path, line_starts })
+    })?;
     let classes = decoder.vector(Decoder::class)?;
     let count = decoder.len()?;
     let mut functions = Vec::with_capacity(count);
@@ -84,6 +97,7 @@ pub fn decode(bytes: &[u8]) -> Result<Program, DecodeError> {
     }
     let program = Program {
         schema_version,
+        sources,
         functions,
         classes,
         entry,
@@ -134,6 +148,7 @@ impl Encoder {
     fn span(&mut self, span: Span) {
         self.u32(span.start);
         self.u32(span.end);
+        self.u32(span.source.map_or(NONE, |source| source.0));
     }
 
     fn ty(&mut self, ty: &Type) {
@@ -773,6 +788,19 @@ impl Encoder {
             Callee::Builtin(Builtin::CallbackFilterConstruct) => self.u8(51),
             Callee::Builtin(Builtin::GeneratorGetReturn) => self.u8(52),
             Callee::Builtin(Builtin::GeneratorClose) => self.u8(53),
+            Callee::Builtin(Builtin::OptionSome) => self.u8(54),
+            Callee::Builtin(Builtin::OptionNone) => self.u8(55),
+            Callee::Builtin(Builtin::OptionIsSome) => self.u8(56),
+            Callee::Builtin(Builtin::OptionIsNone) => self.u8(57),
+            Callee::Builtin(Builtin::OptionGet) => self.u8(58),
+            Callee::Builtin(Builtin::Serialize) => self.u8(59),
+            Callee::Builtin(Builtin::Unserialize) => self.u8(60),
+            Callee::Builtin(Builtin::TraceLineConstruct) => self.u8(61),
+            Callee::Builtin(Builtin::ExceptionGetFile) => self.u8(62),
+            Callee::Builtin(Builtin::ExceptionGetLine) => self.u8(63),
+            Callee::Builtin(Builtin::ExceptionGetTrace) => self.u8(64),
+            Callee::Builtin(Builtin::ExceptionGetTraceAsString) => self.u8(65),
+            Callee::Builtin(Builtin::ExceptionToString) => self.u8(66),
         }
     }
 
@@ -894,13 +922,14 @@ impl Decoder<'_> {
     fn span(&mut self) -> Result<Span, DecodeError> {
         let start = self.u32()?;
         let end = self.u32()?;
+        let source = self.u32()?;
         if end < start {
             return Err(self.error("source span ends before it starts"));
         }
         Ok(Span {
             start,
             end,
-            source: None,
+            source: (source != NONE).then_some(thp_diagnostics::SourceId(source)),
         })
     }
 
@@ -1435,6 +1464,19 @@ impl Decoder<'_> {
             51 => Ok(Callee::Builtin(Builtin::CallbackFilterConstruct)),
             52 => Ok(Callee::Builtin(Builtin::GeneratorGetReturn)),
             53 => Ok(Callee::Builtin(Builtin::GeneratorClose)),
+            54 => Ok(Callee::Builtin(Builtin::OptionSome)),
+            55 => Ok(Callee::Builtin(Builtin::OptionNone)),
+            56 => Ok(Callee::Builtin(Builtin::OptionIsSome)),
+            57 => Ok(Callee::Builtin(Builtin::OptionIsNone)),
+            58 => Ok(Callee::Builtin(Builtin::OptionGet)),
+            59 => Ok(Callee::Builtin(Builtin::Serialize)),
+            60 => Ok(Callee::Builtin(Builtin::Unserialize)),
+            61 => Ok(Callee::Builtin(Builtin::TraceLineConstruct)),
+            62 => Ok(Callee::Builtin(Builtin::ExceptionGetFile)),
+            63 => Ok(Callee::Builtin(Builtin::ExceptionGetLine)),
+            64 => Ok(Callee::Builtin(Builtin::ExceptionGetTrace)),
+            65 => Ok(Callee::Builtin(Builtin::ExceptionGetTraceAsString)),
+            66 => Ok(Callee::Builtin(Builtin::ExceptionToString)),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }

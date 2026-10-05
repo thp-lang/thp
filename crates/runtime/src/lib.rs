@@ -1024,6 +1024,8 @@ impl Value {
             target: None,
             system_code: 0,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -1037,6 +1039,8 @@ impl Value {
             target: None,
             system_code: 0,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -1129,6 +1133,8 @@ impl Value {
             target,
             system_code,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -1147,6 +1153,8 @@ impl Value {
             target,
             system_code,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -1938,6 +1946,52 @@ impl Value {
         }
     }
 
+    pub fn set_exception_origin(
+        &self,
+        span: Span,
+        frames: Vec<StackFrame>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let Some(HeapData::Exception { origin, trace, .. }) = self.heap_data() else {
+            return Err(RuntimeErrorKind::TypeError(
+                "origin requires a throwable".to_owned(),
+            ));
+        };
+        let size = |frames: &Vec<StackFrame>| {
+            frames.capacity() * mem::size_of::<StackFrame>()
+                + frames
+                    .iter()
+                    .map(|frame| {
+                        frame.function.capacity() + frame.class.as_ref().map_or(0, String::capacity)
+                    })
+                    .sum::<usize>()
+        };
+        let old_size = size(&trace.borrow());
+        let new_size = size(&frames);
+        self.charge_growth(new_size.saturating_sub(old_size))?;
+        *trace.borrow_mut() = frames;
+        origin.set(Some(span));
+        self.release_growth(old_size.saturating_sub(new_size));
+        Ok(())
+    }
+
+    pub fn exception_origin(&self) -> Result<Option<Span>, RuntimeErrorKind> {
+        match self.heap_data() {
+            Some(HeapData::Exception { origin, .. }) => Ok(origin.get()),
+            _ => Err(RuntimeErrorKind::TypeError(
+                "origin requires a throwable".to_owned(),
+            )),
+        }
+    }
+
+    pub fn exception_trace(&self) -> Result<Vec<StackFrame>, RuntimeErrorKind> {
+        match self.heap_data() {
+            Some(HeapData::Exception { trace, .. }) => Ok(trace.borrow().clone()),
+            _ => Err(RuntimeErrorKind::TypeError(
+                "trace requires a throwable".to_owned(),
+            )),
+        }
+    }
+
     /// Attaches a cleanup failure to a primary native exception.
     ///
     /// # Errors
@@ -2470,6 +2524,8 @@ enum HeapData {
         target: Option<Vec<u8>>,
         system_code: i64,
         suppressed: RefCell<Vec<Value>>,
+        origin: Cell<Option<Span>>,
+        trace: RefCell<Vec<StackFrame>>,
     },
 }
 
@@ -2493,12 +2549,22 @@ impl HeapData {
                 message,
                 target,
                 suppressed,
+                trace,
                 ..
             } => {
                 properties.borrow().capacity() * mem::size_of::<Option<Value>>()
                     + message.borrow().capacity()
                     + target.as_ref().map_or(0, Vec::capacity)
                     + suppressed.borrow().capacity() * mem::size_of::<Value>()
+                    + trace.borrow().capacity() * mem::size_of::<StackFrame>()
+                    + trace
+                        .borrow()
+                        .iter()
+                        .map(|frame| {
+                            frame.function.capacity()
+                                + frame.class.as_ref().map_or(0, String::capacity)
+                        })
+                        .sum::<usize>()
             }
             Self::Reflection { .. } => 0,
         }
@@ -2811,6 +2877,8 @@ impl fmt::Display for RuntimeErrorKind {
 pub struct StackFrame {
     pub function: String,
     pub span: Span,
+    pub class: Option<String>,
+    pub static_method: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2833,6 +2901,8 @@ impl RuntimeError {
         self.trace.push(StackFrame {
             function: function.into(),
             span,
+            class: None,
+            static_method: false,
         });
     }
 }

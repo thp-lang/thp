@@ -249,6 +249,19 @@ pub enum Builtin {
     ExceptionGetTarget,
     ExceptionGetSystemCode,
     ExceptionGetSuppressed,
+    OptionSome,
+    OptionNone,
+    OptionIsSome,
+    OptionIsNone,
+    OptionGet,
+    Serialize,
+    Unserialize,
+    TraceLineConstruct,
+    ExceptionGetFile,
+    ExceptionGetLine,
+    ExceptionGetTrace,
+    ExceptionGetTraceAsString,
+    ExceptionToString,
     Reflection(ReflectionBuiltin),
     IsString,
     IsInt,
@@ -1970,6 +1983,19 @@ impl TypeChecker {
             } else {
                 canonical_interfaces.insert(interface_name.to_owned(), interface_type);
             }
+        }
+        if current.kind == NominalKind::Class
+            && methods.get("__toString").is_some_and(|method| {
+                !method.static_method
+                    && method.visibility == Visibility::Public
+                    && method.signature.parameters.is_empty()
+                    && method.signature.return_type == Type::String
+            })
+        {
+            canonical_interfaces.insert(
+                "Stringable".to_owned(),
+                Type::Object("Stringable".to_owned()),
+            );
         }
         if current.kind == NominalKind::Class && !current.abstract_class {
             let has_traversable = canonical_interfaces.contains_key("Traversable");
@@ -3808,6 +3834,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             | "EmptyIterator"
                             | "IteratorIterator"
                             | "CallbackFilterIterator"
+                            | "TraceLine"
                     )
                 {
                     self.diagnostics.push(Diagnostic::error(
@@ -4015,6 +4042,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 {
                     return self.lower_native_static(class_name, name, arguments, expression.span);
                 }
+                let mut inferred_option_arguments = None;
                 let (class_name, called_class, late_static, call_type) = match target {
                     ScopeTarget::Named {
                         name: class_name,
@@ -4043,16 +4071,56 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             }
                             Type::Object(class.name.clone())
                         } else if type_arguments.is_empty() {
-                            self.diagnostics.push(Diagnostic::error(
-                                "typing",
-                                "T1002",
-                                *class_span,
-                                format!(
-                                    "generic class `{class_name}` requires {} explicit arguments for named static access",
-                                    class.type_parameters.len()
-                                ),
-                            ));
-                            declaration_type(class)
+                            if class_name == "Option" && matches!(name.as_str(), "some" | "none") {
+                                let inferred = expected.and_then(|ty| match ty {
+                                    Type::Nominal { name, arguments } if name == "Option" => {
+                                        arguments.first().cloned()
+                                    }
+                                    _ => None,
+                                });
+                                let inferred = if inferred.is_none() && name == "some" {
+                                    let bound = self.bind_arguments(
+                                        name,
+                                        arguments,
+                                        &[native_parameter(
+                                            "value",
+                                            Type::Mixed,
+                                            None,
+                                            expression.span,
+                                        )],
+                                        expression.span,
+                                    );
+                                    let value = bound.explicit.first()?;
+                                    let ty = value.value.ty.clone();
+                                    inferred_option_arguments = Some(bound);
+                                    Some(ty)
+                                } else {
+                                    inferred
+                                };
+                                if let Some(value) = inferred {
+                                    Type::Nominal {
+                                        name: "Option".to_owned(),
+                                        arguments: vec![value],
+                                    }
+                                } else {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        "typing", "T1002", *class_span,
+                                        "`Option::none()` requires an expected Option<T> type or explicit type arguments",
+                                    ));
+                                    declaration_type(class)
+                                }
+                            } else {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "typing",
+                                    "T1002",
+                                    *class_span,
+                                    format!(
+                                        "generic class `{class_name}` requires {} explicit arguments for named static access",
+                                        class.type_parameters.len()
+                                    ),
+                                ));
+                                declaration_type(class)
+                            }
                         } else {
                             resolve_type(
                                 &TypeSyntax {
@@ -4160,12 +4228,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     "method",
                     name,
                 );
-                let arguments = self.bind_arguments(
-                    name,
-                    arguments,
-                    &method.signature.parameters,
-                    expression.span,
-                );
+                let arguments = inferred_option_arguments.unwrap_or_else(|| {
+                    self.bind_arguments(
+                        name,
+                        arguments,
+                        &method.signature.parameters,
+                        expression.span,
+                    )
+                });
                 let receiver = if method.static_method {
                     None
                 } else {
@@ -4726,6 +4796,34 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         span: Span,
         expected: Option<&Type>,
     ) -> Option<TypedExpr> {
+        if matches!(name, "serialize" | "unserialize") {
+            let parameter_type = if name == "serialize" {
+                Type::Mixed
+            } else {
+                Type::String
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(if name == "serialize" {
+                        Builtin::Serialize
+                    } else {
+                        Builtin::Unserialize
+                    }),
+                    arguments: self.bind_arguments(
+                        name,
+                        arguments,
+                        &[native_parameter("value", parameter_type, None, span)],
+                        span,
+                    ),
+                },
+                ty: if name == "serialize" {
+                    Type::String
+                } else {
+                    Type::Mixed
+                },
+                span,
+            });
+        }
         if matches!(
             name,
             "vector_map"
@@ -4800,7 +4898,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 if !matches!(
                     argument.value.ty,
                     Type::String | Type::Vector(_) | Type::Map(_, _)
-                ) {
+                ) && !type_is_subtype_of(&argument.value.ty, "Countable", self.classes)
+                {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0302",
@@ -6918,7 +7017,19 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Some("Closeable"),
             &[],
         ),
-        ("Throwable", NominalKind::Interface, true, false, None, &[]),
+        (
+            "Throwable",
+            NominalKind::Interface,
+            true,
+            false,
+            None,
+            &["Stringable"],
+        ),
+        ("Option", NominalKind::Class, false, true, None, &[]),
+        ("TraceLine", NominalKind::Class, false, true, None, &[]),
+        ("Countable", NominalKind::Interface, true, false, None, &[]),
+        ("Stringable", NominalKind::Interface, true, false, None, &[]),
+        ("MapAccess", NominalKind::Interface, true, false, None, &[]),
         (
             "MemoryStream",
             NominalKind::Class,
@@ -7041,6 +7152,110 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             false,
             false,
             Some("Exception"),
+            &[],
+        ),
+        (
+            "LogicException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Exception"),
+            &[],
+        ),
+        (
+            "BadFunctionCallException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "BadMethodCallException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("BadFunctionCallException"),
+            &[],
+        ),
+        (
+            "DomainException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "InvalidArgumentException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "LengthException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "OutOfRangeException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "RuntimeException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Exception"),
+            &[],
+        ),
+        (
+            "OutOfBoundsException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "OverflowException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "RangeException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "UnderflowException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "UnexpectedValueException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
             &[],
         ),
         ("ReflectionType", NominalKind::Class, true, false, None, &[]),
@@ -7170,11 +7385,13 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "IteratorIterator",
         "FilterIterator",
         "CallbackFilterIterator",
+        "Option",
+        "MapAccess",
     ] {
         let class = classes
             .get_mut(name)
             .expect("iterator prelude nominal exists");
-        let parameters: &[&str] = if name == "VectorIterator" {
+        let parameters: &[&str] = if matches!(name, "VectorIterator" | "Option") {
             &["T"]
         } else {
             &["K", "V"]
@@ -7315,6 +7532,214 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
     let nullable_throwable =
         normalize_union(vec![Type::Object("Throwable".to_owned()), Type::Null]);
     let throwable_vector = Type::Vector(Box::new(Type::Object("Throwable".to_owned())));
+    let trace_vector = Type::Vector(Box::new(Type::Object("TraceLine".to_owned())));
+    for (name, ty) in [
+        ("function", Type::String),
+        ("line", Type::Int),
+        ("file", Type::String),
+        ("class", Type::String),
+        ("object", Type::Mixed),
+        ("type", Type::String),
+        ("args", Type::Mixed),
+    ] {
+        let class = classes
+            .get_mut("TraceLine")
+            .expect("native TraceLine exists");
+        class.declared_properties.push(Property {
+            id: PropertyId(u32::try_from(class.declared_properties.len()).unwrap()),
+            name: name.to_owned(),
+            ty,
+            visibility: Visibility::Public,
+            declaring_class: class.id,
+            default: None,
+            origin_trait: None,
+            span: Span::empty(0),
+        });
+        class.declared_property_initializers.push(None);
+    }
+    add_native_method(
+        &mut classes,
+        "TraceLine",
+        "__construct",
+        Some(Builtin::TraceLineConstruct),
+        false,
+        vec![
+            native_parameter("function", Type::String, None, Span::empty(0)),
+            native_parameter("line", Type::Int, None, Span::empty(0)),
+            native_parameter("file", Type::String, None, Span::empty(0)),
+            native_parameter("class", Type::String, None, Span::empty(0)),
+            native_parameter("object", Type::Mixed, None, Span::empty(0)),
+            native_parameter("type", Type::String, None, Span::empty(0)),
+            native_parameter("args", Type::Mixed, None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    let option_parameter = &classes["Option"].type_parameters[0];
+    let option_value = Type::Parameter {
+        id: option_parameter.id,
+        name: "T".to_owned(),
+    };
+    let option_type = Type::Nominal {
+        name: "Option".to_owned(),
+        arguments: vec![option_value.clone()],
+    };
+    for (name, ty) in [("__present", Type::Bool), ("__value", option_value.clone())] {
+        let class = classes.get_mut("Option").expect("native Option exists");
+        class.declared_properties.push(Property {
+            id: PropertyId(u32::try_from(class.declared_properties.len()).unwrap()),
+            name: name.to_owned(),
+            ty,
+            visibility: Visibility::Private,
+            declaring_class: class.id,
+            default: None,
+            origin_trait: None,
+            span: Span::empty(0),
+        });
+        class.declared_property_initializers.push(None);
+    }
+    add_native_method(
+        &mut classes,
+        "Option",
+        "some",
+        Some(Builtin::OptionSome),
+        true,
+        vec![native_parameter(
+            "value",
+            option_value.clone(),
+            None,
+            Span::empty(0),
+        )],
+        option_type.clone(),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "none",
+        Some(Builtin::OptionNone),
+        true,
+        vec![],
+        option_type,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "isSome",
+        Some(Builtin::OptionIsSome),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "isNone",
+        Some(Builtin::OptionIsNone),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "get",
+        Some(Builtin::OptionGet),
+        false,
+        vec![],
+        option_value,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Countable",
+        "count",
+        None,
+        false,
+        vec![],
+        Type::Int,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Stringable",
+        "__toString",
+        None,
+        false,
+        vec![],
+        Type::String,
+        true,
+    );
+    let map_access_params = classes["MapAccess"].type_parameters.clone();
+    let map_key = Type::Parameter {
+        id: map_access_params[0].id,
+        name: "K".to_owned(),
+    };
+    let map_value = Type::Parameter {
+        id: map_access_params[1].id,
+        name: "V".to_owned(),
+    };
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetExists",
+        None,
+        false,
+        vec![native_parameter(
+            "offset",
+            map_key.clone(),
+            None,
+            Span::empty(0),
+        )],
+        Type::Bool,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetGet",
+        None,
+        false,
+        vec![native_parameter(
+            "offset",
+            map_key.clone(),
+            None,
+            Span::empty(0),
+        )],
+        map_value.clone(),
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetSet",
+        None,
+        false,
+        vec![
+            native_parameter(
+                "offset",
+                normalize_union(vec![map_key.clone(), Type::Null]),
+                None,
+                Span::empty(0),
+            ),
+            native_parameter("value", map_value, None, Span::empty(0)),
+        ],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetUnset",
+        None,
+        false,
+        vec![native_parameter("offset", map_key, None, Span::empty(0))],
+        Type::Void,
+        true,
+    );
     add_native_method(
         &mut classes,
         "Iterator",
@@ -7679,6 +8104,24 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         throwable_vector.clone(),
         true,
     );
+    for (name, result) in [
+        ("getFile", Type::String),
+        ("getLine", Type::Int),
+        ("getTrace", trace_vector.clone()),
+        ("getTraceAsString", Type::String),
+        ("__toString", Type::String),
+    ] {
+        add_native_method(
+            &mut classes,
+            "Throwable",
+            name,
+            None,
+            false,
+            vec![],
+            result,
+            true,
+        );
+    }
     add_native_method(
         &mut classes,
         "Closeable",
@@ -7845,6 +8288,28 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             throwable_vector.clone(),
             false,
         );
+        for (name, builtin, result) in [
+            ("getFile", Builtin::ExceptionGetFile, Type::String),
+            ("getLine", Builtin::ExceptionGetLine, Type::Int),
+            ("getTrace", Builtin::ExceptionGetTrace, trace_vector.clone()),
+            (
+                "getTraceAsString",
+                Builtin::ExceptionGetTraceAsString,
+                Type::String,
+            ),
+            ("__toString", Builtin::ExceptionToString, Type::String),
+        ] {
+            add_native_method(
+                &mut classes,
+                class,
+                name,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
     }
     add_native_method(
         &mut classes,
@@ -9222,6 +9687,39 @@ class ChildType extends ParentType {
         assert!(codes.contains(&"T0029"));
         assert!(codes.contains(&"T0030"));
         assert!(codes.contains(&"T0031"));
+    }
+
+    #[test]
+    fn foundational_contracts_reject_missing_or_wrong_methods_and_untyped_none() {
+        let codes = diagnostic_codes(
+            r#"<?thp
+class InvalidCount implements Countable {
+    public function count(): string { return "wrong"; }
+}
+class InvalidString implements Stringable {
+    public function __toString(): int { return 1; }
+}
+class MissingMap implements MapAccess<string, int> {}
+$none = Option::none();
+"#,
+        );
+        assert!(
+            codes.iter().filter(|code| **code == "T0022").count() >= 2,
+            "{codes:?}"
+        );
+        assert!(codes.contains(&"T0024"), "{codes:?}");
+        assert!(codes.contains(&"T1002"), "{codes:?}");
+    }
+
+    #[test]
+    fn option_some_lowers_its_argument_once() {
+        assert_eq!(
+            diagnostic_codes("<?thp\nOption::some($missing);"),
+            vec!["N0101"]
+        );
+        let output = typecheck("<?thp\nOption::some(fn(int $value): int => $value);");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(output.module.functions.len(), 2);
     }
 
     #[test]

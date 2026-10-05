@@ -2,10 +2,52 @@
 kind: home
 id: docs.home
 title: THP Documentation
-summary: THP is an experimental, statically typed, PHP-shaped language for greenfield command-line programs.
+summary: Write familiar PHP-shaped code with generic collections, checked types, and a standalone runtime. THP is experimental and built for command-line programs today.
 status: experimental
 availability: implemented
 ---
+
+## Generics you can use today
+
+Declare the types your collections hold. THP checks keys and values before the
+program runs, while keeping familiar indexing and `foreach` syntax:
+
+```thp
+<?thp
+$scores: map<string, int> = {"Ada" => 10, "Grace" => 9};
+$names: vector<string> = ["Ada", "Grace"];
+
+foreach ($names as $name) {
+    echo $name . ": " . $scores[$name] . "\n";
+}
+```
+
+Generic classes carry the same type through properties, constructors, and
+methods:
+
+```thp
+<?thp
+class Box<T> {
+    public T $value;
+
+    public function __construct(T $value) {
+        $this->value = $value;
+    }
+
+    public function value(): T {
+        return $this->value;
+    }
+}
+
+$answer = new Box<int>(42);
+echo $answer->value();
+```
+
+Explore [collection types](thp:guide.languageTypes) and
+[generic classes](thp:guide.languageClassesAndObjects) in the language guide.
+Generic functions and methods are still proposals; see the
+[implementation status](thp:guide.implementationStatus) for the precise
+executable surface.
 
 ## When to choose THP over PHP
 
@@ -53,23 +95,29 @@ authority for accepted syntax and executable behavior.
 
 ## Try it locally
 
-Download an archive from
-[GitHub Releases](https://github.com/thp-lang/thp/releases), add its `bin`
-directory to `PATH`, and run the example above:
+Install THP on Linux or macOS:
+
+```sh
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/thp-lang/thp/main/install.sh | bash'
+```
+
+Follow the printed `PATH` instruction if needed. Save the collection example as
+`collections.thp`, then run:
 
 ```sh
 thp --version
-thp check hello.thp
-thp run hello.thp
+thp check collections.thp
+thp run collections.thp
 ```
 
-The [getting-started guide](thp:guide.gettingStarted) also covers building from
-source, inspecting compiler stages, selecting the VM or JIT, and enabling the
-persistent cache.
+On Windows, use `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/thp-lang/thp/main/install.ps1 -ErrorAction Stop)))`
+in PowerShell. The [getting-started guide](thp:guide.gettingStarted) covers
+supported platforms, manual archive installation, building from source,
+compiler stages, the VM or JIT, and the persistent cache.
 
 ## Clear experimental boundaries
 
-> THP 0.2 is for command-line experiments. It is not production-ready, is not
+> THP is for command-line experiments. It is not production-ready, is not
 > a PHP-compatible replacement, does not execute through the PHP engine, and is
 > not yet a web backend.
 

@@ -14,13 +14,15 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This THP contract is proposed and is not yet implemented in this repository.
+availability: implemented
+notice: The compiler and reference VM implement this experimental contract.
 version: "0.1"
 ---
 
 `MapAccess<K, V>` lets an object define how map-style reads, writes, existence
 checks, and removals behave.
+Calls use these methods directly. Bracket syntax for `MapAccess` objects is
+not yet implemented; brackets remain native vector and map operations.
 
 ## Contract
 
