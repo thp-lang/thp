@@ -19,10 +19,12 @@ use thp_hir::{
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_runtime::{
-    HeapStats, ReflectionCallable, ReflectionValue, RequestHeap, RequestInput, RuntimeError,
-    RuntimeErrorKind, StackFrame, Value,
+    GeneratorFrame, GeneratorState, GeneratorStatus, HeapStats, ReflectionCallable,
+    ReflectionValue, RequestHeap, RequestInput, RuntimeError, RuntimeErrorKind, StackFrame, Value,
 };
 use thp_syntax::{BinaryOp, UnaryOp, Visibility};
+
+const GENERATOR_EXIT_CODE: i64 = i64::MIN;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Limits {
@@ -396,6 +398,33 @@ struct Frame {
     called_class: Option<ClassId>,
 }
 
+enum FrameOutcome {
+    Return(Value),
+    Yield(Option<Value>, Value),
+}
+
+impl Frame {
+    fn into_generator(self) -> GeneratorFrame {
+        GeneratorFrame {
+            locals: self.locals,
+            registers: self.registers,
+            current: self.current.0,
+            previous: self.previous.map(|id| id.0),
+            called_class: self.called_class,
+        }
+    }
+
+    fn from_generator(frame: GeneratorFrame) -> Self {
+        Self {
+            locals: frame.locals,
+            registers: frame.registers,
+            current: BlockId(frame.current),
+            previous: frame.previous.map(BlockId),
+            called_class: frame.called_class,
+        }
+    }
+}
+
 impl ExecutionState<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     fn dynamic_new(
@@ -635,17 +664,22 @@ impl ExecutionState<'_, '_> {
         depth: usize,
         called_class: Option<ClassId>,
     ) -> Result<Value, VmError> {
-        if self
-            .limits
-            .max_stack_depth
-            .is_some_and(|limit| depth > limit)
-        {
-            return Err(VmError::StackDepthLimit {
-                limit: self.limits.max_stack_depth.expect("limit exists"),
-                span: self.program.functions[id.0 as usize].span,
-            });
+        let mut frame = self.new_frame(id, arguments, called_class);
+        match self.run_frame(id, &mut frame, depth, false)? {
+            FrameOutcome::Return(value) => Ok(value),
+            FrameOutcome::Yield(_, _) => Err(runtime(
+                RuntimeErrorKind::Unreachable,
+                self.program.functions[id.0 as usize].span,
+            )),
         }
-        self.maximum_call_depth = self.maximum_call_depth.max(depth);
+    }
+
+    fn new_frame(
+        &self,
+        id: FunctionId,
+        arguments: Vec<Value>,
+        called_class: Option<ClassId>,
+    ) -> Frame {
         let function = &self.program.functions[id.0 as usize];
         let mut frame = Frame {
             locals: std::iter::repeat_with(|| None)
@@ -661,22 +695,36 @@ impl ExecutionState<'_, '_> {
         for (parameter, argument) in function.parameters.iter().zip(arguments) {
             frame.locals[parameter.0 as usize] = Some(argument);
         }
+        frame
+    }
 
+    fn run_frame(
+        &mut self,
+        id: FunctionId,
+        frame: &mut Frame,
+        depth: usize,
+        closing: bool,
+    ) -> Result<FrameOutcome, VmError> {
+        if self
+            .limits
+            .max_stack_depth
+            .is_some_and(|limit| depth > limit)
+        {
+            return Err(VmError::StackDepthLimit {
+                limit: self.limits.max_stack_depth.expect("limit exists"),
+                span: self.program.functions[id.0 as usize].span,
+            });
+        }
+        self.maximum_call_depth = self.maximum_call_depth.max(depth);
+        let function = &self.program.functions[id.0 as usize];
         'execution: loop {
             let block = &function.blocks[frame.current.0 as usize];
             for instruction in &block.instructions {
                 self.tick(instruction.span)?;
-                let value = match self.execute_instruction(function, &mut frame, instruction, depth)
-                {
+                let value = match self.execute_instruction(function, frame, instruction, depth) {
                     Ok(value) => value,
                     Err(VmError::Thrown { value, span, trace }) => {
-                        if catch_exception(
-                            self.program,
-                            function,
-                            &mut frame,
-                            block.id,
-                            value.clone(),
-                        ) {
+                        if catch_exception(self.program, function, frame, block.id, value.clone()) {
                             continue 'execution;
                         }
                         return Err(VmError::Thrown { value, span, trace });
@@ -699,7 +747,7 @@ impl ExecutionState<'_, '_> {
                     then_block,
                     else_block,
                 } => {
-                    let condition = get_register(&frame, condition, function.span)?;
+                    let condition = get_register(frame, condition, function.span)?;
                     let Some(condition) = condition.as_bool() else {
                         return Err(runtime(
                             RuntimeErrorKind::TypeError(
@@ -712,14 +760,45 @@ impl ExecutionState<'_, '_> {
                     frame.current = if condition { then_block } else { else_block };
                 }
                 Terminator::Return(value) => {
-                    return value.map_or(Ok(Value::NULL), |register| {
-                        get_register(&frame, register, function.span)
-                    });
+                    return Ok(FrameOutcome::Return(
+                        value.map_or(Ok(Value::NULL), |register| {
+                            get_register(frame, register, function.span)
+                        })?,
+                    ));
+                }
+                Terminator::Yield { key, value, resume } => {
+                    if closing {
+                        let error = self.native_exception(
+                            "Error",
+                            b"generator yielded during close".to_vec(),
+                            None,
+                            0,
+                            function.span,
+                        );
+                        if let VmError::Thrown { value, .. } = &error
+                            && catch_exception(
+                                self.program,
+                                function,
+                                frame,
+                                block.id,
+                                value.clone(),
+                            )
+                        {
+                            continue 'execution;
+                        }
+                        return Err(error);
+                    }
+                    let key = key
+                        .map(|register| get_register(frame, register, function.span))
+                        .transpose()?;
+                    let value = get_register(frame, value, function.span)?;
+                    frame.previous = Some(previous);
+                    frame.current = resume;
+                    return Ok(FrameOutcome::Yield(key, value));
                 }
                 Terminator::Throw(value) => {
-                    let value = get_register(&frame, value, function.span)?;
-                    if catch_exception(self.program, function, &mut frame, block.id, value.clone())
-                    {
+                    let value = get_register(frame, value, function.span)?;
+                    if catch_exception(self.program, function, frame, block.id, value.clone()) {
                         continue 'execution;
                     }
                     return Err(VmError::Thrown {
@@ -1140,6 +1219,53 @@ impl ExecutionState<'_, '_> {
     ) -> Result<Value, VmError> {
         match callable {
             Callee::Function(target) => {
+                if self.program.functions[target.0 as usize].generator {
+                    let function = &self.program.functions[target.0 as usize];
+                    let receiver_arguments = function
+                        .owner
+                        .filter(|_| !function.static_method)
+                        .and_then(|_| function.parameters.first())
+                        .and_then(|_| arguments.first())
+                        .and_then(Value::type_arguments)
+                        .unwrap_or_default();
+                    let type_arguments = match &function.return_type {
+                        Type::Nominal { arguments, .. } => arguments
+                            .iter()
+                            .map(|argument| {
+                                function.owner.map_or_else(
+                                    || argument.clone(),
+                                    |owner| {
+                                        substitute_type_arguments(
+                                            argument,
+                                            owner,
+                                            receiver_arguments,
+                                        )
+                                    },
+                                )
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let class = self.classes_by_name["Generator"];
+                    let frame = self
+                        .new_frame(target, arguments, called_class)
+                        .into_generator();
+                    return Value::try_generator(
+                        class,
+                        type_arguments,
+                        GeneratorState {
+                            function: target,
+                            frame,
+                            key: None,
+                            value: None,
+                            return_value: None,
+                            next_key: Some(0),
+                            advanced: false,
+                            status: GeneratorStatus::Fresh,
+                        },
+                    )
+                    .map_err(|kind| runtime(kind, instruction.span));
+                }
                 match self.execute_function(target, arguments, depth + 1, called_class) {
                     Ok(value) => Ok(value),
                     Err(VmError::Runtime(mut error)) => {
@@ -1237,6 +1363,221 @@ impl ExecutionState<'_, '_> {
         )
     }
 
+    fn resume_generator(
+        &mut self,
+        state: &mut GeneratorState,
+        depth: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let mut frame = Frame::from_generator(std::mem::take(&mut state.frame));
+        loop {
+            match self.run_frame(state.function, &mut frame, depth + 1, false) {
+                Ok(FrameOutcome::Yield(key, value)) => {
+                    let key = if let Some(key) = key {
+                        if let Some(number) = key.as_int()
+                            && state.next_key.is_some_and(|next| number >= next)
+                        {
+                            state.next_key = number.checked_add(1);
+                        }
+                        key
+                    } else {
+                        let Some(next) = state.next_key else {
+                            let error = self.native_exception(
+                                "ValueError",
+                                b"generator automatic key overflow".to_vec(),
+                                None,
+                                0,
+                                span,
+                            );
+                            let throwing_block =
+                                frame.previous.expect("yield has a preceding block");
+                            if let VmError::Thrown { value, .. } = &error
+                                && catch_exception(
+                                    self.program,
+                                    &self.program.functions[state.function.0 as usize],
+                                    &mut frame,
+                                    throwing_block,
+                                    value.clone(),
+                                )
+                            {
+                                continue;
+                            }
+                            state.key = None;
+                            state.value = None;
+                            state.status = GeneratorStatus::Exhausted;
+                            return Err(error);
+                        };
+                        state.next_key = next.checked_add(1);
+                        Value::integer(next)
+                    };
+                    state.frame = frame.into_generator();
+                    state.key = Some(key);
+                    state.value = Some(value);
+                    state.status = GeneratorStatus::Suspended;
+                    return Ok(());
+                }
+                Ok(FrameOutcome::Return(value)) => {
+                    state.return_value = Some(value);
+                    state.key = None;
+                    state.value = None;
+                    state.status = GeneratorStatus::Exhausted;
+                    return Ok(());
+                }
+                Err(error) => {
+                    state.key = None;
+                    state.value = None;
+                    state.status = GeneratorStatus::Exhausted;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn close_generator(
+        &mut self,
+        state: &mut GeneratorState,
+        depth: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        if matches!(
+            state.status,
+            GeneratorStatus::Exhausted | GeneratorStatus::Closed
+        ) {
+            return Ok(());
+        }
+        if state.status != GeneratorStatus::Suspended {
+            state.status = GeneratorStatus::Closed;
+            state.frame = GeneratorFrame::default();
+            state.key = None;
+            state.value = None;
+            return Ok(());
+        }
+        let function = &self.program.functions[state.function.0 as usize];
+        let marker =
+            match self.native_exception("Error", Vec::new(), None, GENERATOR_EXIT_CODE, span) {
+                VmError::Thrown { value, .. } => value,
+                error => return Err(error),
+            };
+        let mut frame = Frame::from_generator(std::mem::take(&mut state.frame));
+        let current = frame.current;
+        let handled = catch_exception(self.program, function, &mut frame, current, marker.clone());
+        let result = if handled {
+            self.run_frame(state.function, &mut frame, depth + 1, true)
+        } else {
+            Ok(FrameOutcome::Return(Value::NULL))
+        };
+        state.status = GeneratorStatus::Closed;
+        state.key = None;
+        state.value = None;
+        state.return_value = None;
+        match result {
+            Ok(FrameOutcome::Return(_)) => Ok(()),
+            Ok(FrameOutcome::Yield(_, _)) => Err(runtime(RuntimeErrorKind::Unreachable, span)),
+            Err(VmError::Thrown { value, .. })
+                if value.exception_system_code() == Ok(GENERATOR_EXIT_CODE) =>
+            {
+                let mut failures = marker
+                    .exception_suppressed()
+                    .map_err(|kind| runtime(kind, span))?
+                    .into_iter();
+                if let Some(primary) = failures.next() {
+                    for failure in failures {
+                        primary
+                            .add_suppressed(failure)
+                            .map_err(|kind| runtime(kind, span))?;
+                    }
+                    Err(VmError::Thrown {
+                        value: primary,
+                        span,
+                        trace: Vec::new(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn native_generator_method(
+        &mut self,
+        builtin: Builtin,
+        iterator: &Value,
+        depth: usize,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        let mut state = iterator.take_generator_state().ok_or_else(|| {
+            self.native_exception(
+                "Error",
+                b"generator is already running".to_vec(),
+                None,
+                0,
+                span,
+            )
+        })?;
+        let result = match builtin {
+            Builtin::IteratorRewind => match state.status {
+                GeneratorStatus::Fresh => self
+                    .resume_generator(&mut state, depth, span)
+                    .map(|()| Value::NULL),
+                GeneratorStatus::Suspended if !state.advanced => Ok(Value::NULL),
+                _ => Err(self.native_exception(
+                    "Error",
+                    b"generator cannot be rewound".to_vec(),
+                    None,
+                    0,
+                    span,
+                )),
+            },
+            Builtin::IteratorValid => Ok(Value::bool(state.status == GeneratorStatus::Suspended)),
+            Builtin::IteratorKey | Builtin::IteratorValue => {
+                if state.status == GeneratorStatus::Suspended {
+                    Ok(if builtin == Builtin::IteratorKey {
+                        state.key.clone()
+                    } else {
+                        state.value.clone()
+                    }
+                    .expect("suspended generator has a pair"))
+                } else {
+                    Err(runtime(
+                        RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                        span,
+                    ))
+                }
+            }
+            Builtin::IteratorAdvance => {
+                if state.status == GeneratorStatus::Suspended {
+                    state.advanced = true;
+                    self.resume_generator(&mut state, depth, span)
+                        .map(|()| Value::NULL)
+                } else {
+                    Ok(Value::NULL)
+                }
+            }
+            Builtin::GeneratorGetReturn => {
+                if state.status == GeneratorStatus::Exhausted
+                    && let Some(value) = &state.return_value
+                {
+                    Ok(value.clone())
+                } else {
+                    Err(self.native_exception(
+                        "Error",
+                        b"generator has no return value".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ))
+                }
+            }
+            Builtin::GeneratorClose => self
+                .close_generator(&mut state, depth, span)
+                .map(|()| Value::NULL),
+            _ => Err(runtime(RuntimeErrorKind::Unreachable, span)),
+        };
+        iterator.put_generator_state(state);
+        result
+    }
+
     fn native_iterator_method(
         &mut self,
         builtin: Builtin,
@@ -1250,6 +1591,9 @@ impl ExecutionState<'_, '_> {
             .class_id()
             .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
         let name = self.program.classes[class.0 as usize].name.as_str();
+        if name == "Generator" {
+            return self.native_generator_method(builtin, iterator, depth, span);
+        }
         if builtin == Builtin::IteratorGetInner {
             return iterator
                 .property(thp_hir::PropertyId(0))
@@ -1824,6 +2168,9 @@ impl ExecutionState<'_, '_> {
                 calling_function,
                 instruction,
             ),
+            Builtin::GeneratorGetReturn | Builtin::GeneratorClose => {
+                self.native_generator_method(builtin, &arguments[0], depth, instruction.span)
+            }
             Builtin::IteratorCount | Builtin::IteratorToVector | Builtin::IteratorToMap => {
                 self.consume_iterator(builtin, &arguments[0], depth, calling_function, instruction)
             }
@@ -3828,6 +4175,12 @@ fn catch_exception(
         .filter(|handler| handler.protected_blocks.contains(&throwing_block))
         .find_map(|handler| {
             handler.catches.iter().find(|clause| {
+                if program.classes[class.0 as usize].name == "Error"
+                    && value.exception_system_code() == Ok(GENERATOR_EXIT_CODE)
+                    && clause.class.is_some()
+                {
+                    return false;
+                }
                 clause
                     .class
                     .is_none_or(|caught| is_instance_of(program, class, caught))

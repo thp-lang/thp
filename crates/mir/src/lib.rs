@@ -43,6 +43,7 @@ pub struct Function {
     pub parameter_metadata: Vec<thp_hir::ParameterMetadata>,
     pub local_types: Vec<Type>,
     pub return_type: Type,
+    pub generator: bool,
     pub owner: Option<ClassId>,
     pub static_method: bool,
     pub blocks: Vec<BasicBlock>,
@@ -211,6 +212,11 @@ pub enum Terminator {
         else_block: BlockId,
     },
     Return(Option<Register>),
+    Yield {
+        key: Option<Register>,
+        value: Register,
+        resume: BlockId,
+    },
     Throw(Register),
     Unreachable,
 }
@@ -240,6 +246,7 @@ struct FunctionBuilder<'hir> {
     register_types: Vec<Type>,
     exception_handlers: Vec<ExceptionHandler>,
     cleanups: Vec<Cleanup>,
+    cleanup_exclusions: Vec<Vec<BlockId>>,
     loops: Vec<LoopTargets>,
 }
 
@@ -251,6 +258,7 @@ enum Cleanup {
         span: Span,
     },
     Finally {
+        id: usize,
         body: Vec<Statement>,
     },
 }
@@ -275,6 +283,7 @@ impl<'hir> FunctionBuilder<'hir> {
             register_types: Vec::new(),
             exception_handlers: Vec::new(),
             cleanups: Vec::new(),
+            cleanup_exclusions: Vec::new(),
             loops: Vec::new(),
         }
     }
@@ -282,11 +291,13 @@ impl<'hir> FunctionBuilder<'hir> {
     fn lower(mut self) -> Function {
         self.lower_statements(&self.hir.body);
         if !self.terminated() {
-            self.terminate(if self.hir.return_type == Type::Void {
-                Terminator::Return(None)
-            } else {
-                Terminator::Unreachable
-            });
+            self.terminate(
+                if self.hir.return_type == Type::Void || self.hir.generator {
+                    Terminator::Return(None)
+                } else {
+                    Terminator::Unreachable
+                },
+            );
         }
         let blocks = self
             .blocks
@@ -306,6 +317,7 @@ impl<'hir> FunctionBuilder<'hir> {
             parameter_metadata: self.hir.parameter_metadata.clone(),
             local_types: self.local_types,
             return_type: self.hir.return_type.clone(),
+            generator: self.hir.generator,
             owner: self.hir.owner,
             static_method: self.hir.static_method,
             blocks,
@@ -350,6 +362,13 @@ impl<'hir> FunctionBuilder<'hir> {
                 if !self.terminated() {
                     self.terminate(Terminator::Return(value));
                 }
+            }
+            StatementKind::Yield { key, value } => {
+                let key = key.as_ref().map(|key| self.lower_expression(key));
+                let value = self.lower_expression(value);
+                let resume = self.new_block();
+                self.terminate(Terminator::Yield { key, value, resume });
+                self.switch_to(resume);
             }
             StatementKind::If {
                 branches,
@@ -502,7 +521,10 @@ impl<'hir> FunctionBuilder<'hir> {
         finally: &[Statement],
         span: Span,
     ) {
+        let id = self.cleanup_exclusions.len();
+        self.cleanup_exclusions.push(Vec::new());
         let cleanup = Cleanup::Finally {
+            id,
             body: finally.to_vec(),
         };
         self.cleanups.push(cleanup);
@@ -516,7 +538,7 @@ impl<'hir> FunctionBuilder<'hir> {
         if !self.terminated() {
             self.terminate(Terminator::Jump(normal_finally));
         }
-        let body_protected = (body_block.0..normal_finally.0)
+        let mut body_protected = (body_block.0..normal_finally.0)
             .map(BlockId)
             .collect::<Vec<_>>();
         let mut final_protected = body_protected.clone();
@@ -538,6 +560,9 @@ impl<'hir> FunctionBuilder<'hir> {
                 u32::try_from(self.blocks.len()).expect("block count is limited to u32::MAX");
             final_protected.extend((catch_start..catch_end).map(BlockId));
         }
+        let excluded = std::mem::take(&mut self.cleanup_exclusions[id]);
+        body_protected.retain(|block| !excluded.contains(block));
+        final_protected.retain(|block| !excluded.contains(block));
         if !handlers.is_empty() {
             self.exception_handlers.push(ExceptionHandler {
                 protected_blocks: body_protected,
@@ -713,9 +738,28 @@ impl<'hir> FunctionBuilder<'hir> {
 
     fn emit_cleanups_to(&mut self, depth: usize) {
         let cleanups = self.cleanups.clone();
+        let mut exited_finally = Vec::new();
         for index in (depth..cleanups.len()).rev() {
             self.cleanups.truncate(index);
-            self.emit_cleanup(&cleanups[index]);
+            let current_finally = match &cleanups[index] {
+                Cleanup::Finally { id, .. } => Some(*id),
+                Cleanup::Using { .. } => None,
+            };
+            if current_finally.is_some() || !exited_finally.is_empty() {
+                let start = self.new_block();
+                self.terminate(Terminator::Jump(start));
+                self.switch_to(start);
+                self.emit_cleanup(&cleanups[index]);
+                let end = u32::try_from(self.blocks.len()).expect("block count fits u32");
+                for id in exited_finally.iter().copied().chain(current_finally) {
+                    self.cleanup_exclusions[id].extend((start.0..end).map(BlockId));
+                }
+            } else {
+                self.emit_cleanup(&cleanups[index]);
+            }
+            if let Some(id) = current_finally {
+                exited_finally.push(id);
+            }
             if self.terminated() {
                 break;
             }
@@ -738,7 +782,7 @@ impl<'hir> FunctionBuilder<'hir> {
                     *span,
                 );
             }
-            Cleanup::Finally { body } => self.lower_statements(body),
+            Cleanup::Finally { body, .. } => self.lower_statements(body),
         }
     }
 
@@ -1762,6 +1806,7 @@ pub fn eliminate_unreachable(function: &mut Function) {
         reachable[index] = true;
         match function.blocks[index].terminator {
             Terminator::Jump(target) => queue.push_back(target),
+            Terminator::Yield { resume, .. } => queue.push_back(resume),
             Terminator::Branch {
                 then_block,
                 else_block,
@@ -1798,6 +1843,7 @@ pub fn eliminate_unreachable(function: &mut Function) {
         }
         match &mut block.terminator {
             Terminator::Jump(target) => *target = remap[target.0 as usize],
+            Terminator::Yield { resume, .. } => *resume = remap[resume.0 as usize],
             Terminator::Branch {
                 then_block,
                 else_block,

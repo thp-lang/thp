@@ -43,6 +43,9 @@ All iterators expose typed keys and values through
 protocol does not construct an option or entry object during ordinary
 `foreach` traversal.
 
+[`Generator<K, V>`](thp:std.spl.Generator) is a lazy, one-shot implementation
+created by a function containing `yield`. It uses the same cursor protocol.
+
 The executable object protocol evaluates the source once, calls `getIterator()`
 once per aggregate layer, then calls `rewind()` on the direct iterator. Each
 iteration is `valid() → value() → optional key() → body → advance()`.

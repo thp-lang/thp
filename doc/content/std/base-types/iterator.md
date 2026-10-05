@@ -57,6 +57,10 @@ fail when `rewind()` is called after it has advanced; consequently a second
 `foreach` over the same consumed one-shot iterator may fail. An aggregate
 avoids that reuse by returning a fresh iterator for each traversal.
 
+[`Generator<K, V>`](thp:std.spl.Generator) is a one-shot implementation. Its
+first `rewind()` starts the function body; `advance()` resumes it. It adds
+`getReturn()` and `close()` on its concrete type.
+
 For direct iterator traversal, `foreach` calls `rewind()` and then repeats
 `valid() → value() → optional key() → body → advance()`. It calls `key()` only
 for a keyed loop. `continue` still reaches `advance()`; `break`, `return`, and a

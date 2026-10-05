@@ -7,6 +7,14 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-03
+
+### Added
+
+- lang: Added lazy, one-shot `Generator<K, V>` functions with automatic and explicit keys, final return values, and typed `Iterator<K, V>` traversal.
+- runtime: Added suspension-aware `finally` and `using` cleanup on resume and explicit close, with exceptions propagating from the resume that executes them.
+- runtime: Advanced the bytecode schema to version 6 for generator frames and yield terminators.
+
 ## [0.6.0] - 2026-10-03
 
 ### Added
