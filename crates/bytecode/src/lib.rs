@@ -17,7 +17,7 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 5;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 6;
 
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -102,6 +102,7 @@ pub struct Function {
     pub parameter_metadata: Vec<ParameterMetadata>,
     pub local_types: Vec<Type>,
     pub return_type: Type,
+    pub generator: bool,
     pub owner: Option<ClassId>,
     pub static_method: bool,
     pub register_types: Vec<Type>,
@@ -261,6 +262,11 @@ pub enum Terminator {
         else_block: BlockId,
     },
     Return(Option<Register>),
+    Yield {
+        key: Option<Register>,
+        value: Register,
+        resume: BlockId,
+    },
     Throw(Register),
     Unreachable,
 }
@@ -331,6 +337,7 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                 parameter_metadata: function.parameter_metadata.clone(),
                 local_types: function.local_types.clone(),
                 return_type: function.return_type.clone(),
+                generator: function.generator,
                 owner: function.owner,
                 static_method: function.static_method,
                 register_types: function.register_types.clone(),
@@ -593,6 +600,11 @@ fn lower_terminator(terminator: &thp_mir::Terminator) -> Terminator {
             else_block: *else_block,
         },
         thp_mir::Terminator::Return(value) => Terminator::Return(*value),
+        thp_mir::Terminator::Yield { key, value, resume } => Terminator::Yield {
+            key: *key,
+            value: *value,
+            resume: *resume,
+        },
         thp_mir::Terminator::Throw(value) => Terminator::Throw(*value),
         thp_mir::Terminator::Unreachable => Terminator::Unreachable,
     }
@@ -1747,6 +1759,29 @@ fn verify_function(program: &Program, function: &Function) -> Result<(), Verific
     }
     if function.entry.0 as usize >= function.blocks.len() {
         return Err(function_error(function.id, "entry block is out of bounds"));
+    }
+    if function.generator {
+        if class_by_name(program, "Generator").is_none() {
+            return Err(function_error(function.id, "Generator metadata is missing"));
+        }
+        if !matches!(&function.return_type, Type::Nominal { name, .. } if name == "Iterator" || name == "Generator")
+        {
+            return Err(function_error(
+                function.id,
+                "generator return type must be Iterator<K, V> or Generator<K, V>",
+            ));
+        }
+        let Some(iterator) = class_by_name(program, "Iterator") else {
+            return Err(function_error(function.id, "Iterator metadata is missing"));
+        };
+        if instantiation_for_class(program, &function.return_type, iterator.id)
+            .is_none_or(|ty| ty.arguments.len() != 2)
+        {
+            return Err(function_error(
+                function.id,
+                "generator return type is not Iterator<K, V>",
+            ));
+        }
     }
     for parameter in &function.parameters {
         if parameter.0 as usize >= function.local_types.len() {
@@ -3020,7 +3055,11 @@ fn verify_builtin_call(
                 || (!filter
                     && !matches!(
                         name,
-                        "VectorIterator" | "MapIterator" | "EmptyIterator" | "IteratorIterator"
+                        "VectorIterator"
+                            | "MapIterator"
+                            | "EmptyIterator"
+                            | "IteratorIterator"
+                            | "Generator"
                     ))
             {
                 return Err("invalid iterator cursor call".to_owned());
@@ -3052,6 +3091,22 @@ fn verify_builtin_call(
             (result == Some(&expected))
                 .then_some(())
                 .ok_or_else(|| "invalid iterator cursor result".to_owned())
+        }
+        Builtin::GeneratorGetReturn | Builtin::GeneratorClose => {
+            if arguments.len() != 1
+                || encoded_nominal_parts(argument_type(0)).map(|(name, _)| name)
+                    != Some("Generator")
+            {
+                return Err("generator method requires a Generator receiver".to_owned());
+            }
+            let expected = if builtin == Builtin::GeneratorClose {
+                Type::Void
+            } else {
+                Type::Mixed
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid generator method result".to_owned())
         }
         Builtin::IteratorCount | Builtin::IteratorToVector | Builtin::IteratorToMap => {
             if arguments.len() != 1 {
@@ -3347,11 +3402,13 @@ fn verify_terminator(
         Terminator::Return(value) => match value {
             Some(value) => {
                 check_register(function, value, block.id, None)?;
-                if !type_accepts(
-                    program,
-                    &function.return_type,
-                    &function.register_types[value.0 as usize],
-                ) {
+                if !function.generator
+                    && !type_accepts(
+                        program,
+                        &function.return_type,
+                        &function.register_types[value.0 as usize],
+                    )
+                {
                     return Err(block_error(
                         function.id,
                         block.id,
@@ -3360,7 +3417,7 @@ fn verify_terminator(
                 }
                 Ok(())
             }
-            None if function.return_type == Type::Void => Ok(()),
+            None if function.return_type == Type::Void || function.generator => Ok(()),
             None => Err(block_error(
                 function.id,
                 block.id,
@@ -3383,6 +3440,55 @@ fn verify_terminator(
             Ok(())
         }
         Terminator::Unreachable => Ok(()),
+        Terminator::Yield { key, value, resume } => {
+            if !function.generator {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "yield in a non-generator function",
+                ));
+            }
+            let iterator = class_by_name(program, "Iterator").ok_or_else(|| {
+                block_error(function.id, block.id, "Iterator metadata is missing")
+            })?;
+            let instantiation =
+                instantiation_for_class(program, &function.return_type, iterator.id).ok_or_else(
+                    || block_error(function.id, block.id, "invalid generator result"),
+                )?;
+            let [key_type, value_type] = instantiation.arguments.as_slice() else {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "invalid generator type arguments",
+                ));
+            };
+            let actual_key = if let Some(key) = key {
+                check_register(function, key, block.id, None)?;
+                &function.register_types[key.0 as usize]
+            } else {
+                &Type::Int
+            };
+            if !type_accepts(program, key_type, actual_key) {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "yielded key type is invalid",
+                ));
+            }
+            check_register(function, value, block.id, None)?;
+            if !type_accepts(
+                program,
+                value_type,
+                &function.register_types[value.0 as usize],
+            ) {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "yielded value type is invalid",
+                ));
+            }
+            check_block(function, resume, block.id, None)
+        }
     }
 }
 
@@ -3715,6 +3821,28 @@ mod tests {
         let program = compile("<?thp\n$value: int = 2 + 3; echo $value;");
         assert_eq!(program.schema_version, BYTECODE_SCHEMA_VERSION);
         verify(&program).unwrap();
+    }
+
+    #[test]
+    fn generator_yields_round_trip_and_reject_forged_types() {
+        let mut program = compile("<?thp\nfunction values(): Generator<int, int> { yield 1; }");
+        verify(&program).unwrap();
+        verify(&decode(&encode(&program)).unwrap()).unwrap();
+        let function = program
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "values")
+            .unwrap();
+        function.return_type = thp_hir::Type::Nominal {
+            name: "Generator".to_owned(),
+            arguments: vec![thp_hir::Type::Int, thp_hir::Type::String],
+        };
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .message
+                .contains("yielded value type is invalid")
+        );
     }
 
     #[test]

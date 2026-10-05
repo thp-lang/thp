@@ -79,6 +79,10 @@ pub enum StmtKind {
     },
     Echo(Expr),
     Return(Option<Expr>),
+    Yield {
+        key: Option<Expr>,
+        value: Expr,
+    },
     If {
         branches: Vec<(Expr, Block)>,
         otherwise: Option<Block>,

@@ -53,6 +53,35 @@ pub enum ReflectionValue {
     },
 }
 
+#[derive(Debug, Default)]
+pub struct GeneratorFrame {
+    pub locals: Vec<Option<Value>>,
+    pub registers: Vec<Option<Value>>,
+    pub current: u32,
+    pub previous: Option<u32>,
+    pub called_class: Option<ClassId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratorStatus {
+    Fresh,
+    Suspended,
+    Exhausted,
+    Closed,
+}
+
+#[derive(Debug)]
+pub struct GeneratorState {
+    pub function: FunctionId,
+    pub frame: GeneratorFrame,
+    pub key: Option<Value>,
+    pub value: Option<Value>,
+    pub return_value: Option<Value>,
+    pub next_key: Option<i64>,
+    pub advanced: bool,
+    pub status: GeneratorStatus,
+}
+
 const TAG_NULL: u64 = 0;
 const TAG_INT: u64 = 1;
 const TAG_FLOAT: u64 = 2;
@@ -918,6 +947,48 @@ impl Value {
         })
     }
 
+    pub fn try_generator(
+        class: ClassId,
+        type_arguments: Vec<Type>,
+        state: GeneratorState,
+    ) -> Result<Self, RuntimeErrorKind> {
+        let frame_bytes = (state.frame.locals.capacity() + state.frame.registers.capacity())
+            * mem::size_of::<Option<Value>>();
+        Self::try_allocate(HeapData::Generator {
+            class,
+            type_arguments,
+            state: RefCell::new(Some(state)),
+            frame_bytes: Cell::new(frame_bytes),
+        })
+    }
+
+    pub fn take_generator_state(&self) -> Option<GeneratorState> {
+        match self.heap_data()? {
+            HeapData::Generator { state, .. } => state.borrow_mut().take(),
+            _ => None,
+        }
+    }
+
+    pub fn put_generator_state(&self, value: GeneratorState) {
+        let Some(HeapData::Generator {
+            state, frame_bytes, ..
+        }) = self.heap_data()
+        else {
+            unreachable!("generator state requires a generator value")
+        };
+        let next = (value.frame.locals.capacity() + value.frame.registers.capacity())
+            * mem::size_of::<Option<Value>>();
+        debug_assert!(
+            next <= frame_bytes.get(),
+            "generator frames do not grow after allocation"
+        );
+        if next < frame_bytes.get() {
+            self.release_growth(frame_bytes.get() - next);
+            frame_bytes.set(next);
+        }
+        *state.borrow_mut() = Some(value);
+    }
+
     pub fn try_reflection(
         class: ClassId,
         value: ReflectionValue,
@@ -1219,6 +1290,7 @@ impl Value {
             HeapData::Vector { .. }
             | HeapData::Map { .. }
             | HeapData::Closure { .. }
+            | HeapData::Generator { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
             | HeapData::Exception { .. }
@@ -1232,6 +1304,7 @@ impl Value {
             HeapData::Bytes(_)
             | HeapData::Map { .. }
             | HeapData::Closure { .. }
+            | HeapData::Generator { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
             | HeapData::Exception { .. }
@@ -1245,6 +1318,7 @@ impl Value {
             HeapData::Bytes(_)
             | HeapData::Vector { .. }
             | HeapData::Closure { .. }
+            | HeapData::Generator { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
             | HeapData::Exception { .. }
@@ -1280,7 +1354,8 @@ impl Value {
 
     pub fn type_arguments(&self) -> Option<&[Type]> {
         match self.heap_data()? {
-            HeapData::Object { type_arguments, .. } => Some(type_arguments),
+            HeapData::Object { type_arguments, .. }
+            | HeapData::Generator { type_arguments, .. } => Some(type_arguments),
             _ => None,
         }
     }
@@ -1328,6 +1403,7 @@ impl Value {
                 HeapData::Vector { .. } => "vector",
                 HeapData::Map { .. } => "map",
                 HeapData::Closure { .. } => "callable",
+                HeapData::Generator { .. } => "object",
                 HeapData::Object { .. } => "object",
                 HeapData::Stream { .. } => "stream",
                 HeapData::Exception { .. } => "exception",
@@ -1343,6 +1419,7 @@ impl Value {
             HeapData::Vector { values, .. } => Some(values.len()),
             HeapData::Map { entries, .. } => Some(entries.len()),
             HeapData::Closure { .. } => None,
+            HeapData::Generator { .. } => None,
             HeapData::Object { .. } => None,
             HeapData::Stream { .. } => None,
             HeapData::Exception { .. } => None,
@@ -1427,6 +1504,7 @@ impl Value {
     pub fn class_id(&self) -> Option<ClassId> {
         match self.heap_data()? {
             HeapData::Object { class, .. }
+            | HeapData::Generator { class, .. }
             | HeapData::Stream { class, .. }
             | HeapData::Exception { class, .. }
             | HeapData::Reflection { class, .. } => Some(*class),
@@ -1932,6 +2010,7 @@ impl Value {
             }
             Some(
                 HeapData::Object { .. }
+                | HeapData::Generator { .. }
                 | HeapData::Closure { .. }
                 | HeapData::Stream { .. }
                 | HeapData::Exception { .. }
@@ -2027,6 +2106,7 @@ impl Value {
                 HeapData::Vector { .. }
                 | HeapData::Map { .. }
                 | HeapData::Closure { .. }
+                | HeapData::Generator { .. }
                 | HeapData::Object { .. }
                 | HeapData::Stream { .. }
                 | HeapData::Exception { .. }
@@ -2062,6 +2142,9 @@ impl Value {
                 }
                 HeapData::Map { entries, .. } => format!("map({})\n", entries.len()).into_bytes(),
                 HeapData::Closure { .. } => b"callable(closure)\n".to_vec(),
+                HeapData::Generator { class, .. } => {
+                    format!("object(class#{})\n", class.0).into_bytes()
+                }
                 HeapData::Object { class, .. } => {
                     format!("object(class#{})\n", class.0).into_bytes()
                 }
@@ -2359,6 +2442,12 @@ enum HeapData {
         function: FunctionId,
         captures: Vec<Value>,
     },
+    Generator {
+        class: ClassId,
+        type_arguments: Vec<Type>,
+        state: RefCell<Option<GeneratorState>>,
+        frame_bytes: Cell<usize>,
+    },
     Object {
         class: ClassId,
         type_arguments: Vec<Type>,
@@ -2391,6 +2480,7 @@ impl HeapData {
             Self::Vector { values, .. } => values.capacity() * mem::size_of::<Value>(),
             Self::Map { entries, .. } => entries.capacity() * mem::size_of::<(Value, Value)>(),
             Self::Closure { captures, .. } => captures.capacity() * mem::size_of::<Value>(),
+            Self::Generator { frame_bytes, .. } => frame_bytes.get(),
             Self::Object { properties, .. } => {
                 properties.borrow().capacity() * mem::size_of::<Option<Value>>()
             }
@@ -2420,6 +2510,7 @@ impl HeapData {
             Self::Vector { .. }
                 | Self::Map { .. }
                 | Self::Closure { .. }
+                | Self::Generator { .. }
                 | Self::Object { .. }
                 | Self::Exception { .. }
         )
@@ -2446,6 +2537,25 @@ impl HeapData {
             Self::Closure { captures, .. } => {
                 for value in captures {
                     visit_value(value);
+                }
+            }
+            Self::Generator { state, .. } => {
+                if let Some(state) = state.borrow().as_ref() {
+                    for value in state
+                        .frame
+                        .locals
+                        .iter()
+                        .chain(&state.frame.registers)
+                        .flatten()
+                    {
+                        visit_value(value);
+                    }
+                    for value in [&state.key, &state.value, &state.return_value]
+                        .into_iter()
+                        .flatten()
+                    {
+                        visit_value(value);
+                    }
                 }
             }
             Self::Object { properties, .. } => {
@@ -2478,6 +2588,9 @@ impl HeapData {
             Self::Vector { values, .. } => values.clear(),
             Self::Map { entries, .. } => entries.clear(),
             Self::Closure { captures, .. } => captures.clear(),
+            Self::Generator { state, .. } => {
+                state.get_mut().take();
+            }
             Self::Object { properties, .. } => properties.get_mut().clear(),
             Self::Exception {
                 properties,

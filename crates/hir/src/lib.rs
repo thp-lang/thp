@@ -213,6 +213,8 @@ pub enum Builtin {
     IteratorValue,
     IteratorAdvance,
     IteratorGetInner,
+    GeneratorGetReturn,
+    GeneratorClose,
     IteratorCount,
     IteratorToVector,
     IteratorToMap,
@@ -552,6 +554,7 @@ pub struct Function {
     pub parameter_metadata: Vec<ParameterMetadata>,
     pub locals: Vec<Local>,
     pub return_type: Type,
+    pub generator: bool,
     pub owner: Option<ClassId>,
     pub static_method: bool,
     pub body: Vec<Statement>,
@@ -594,6 +597,10 @@ pub enum StatementKind {
     },
     Echo(TypedExpr),
     Return(Option<TypedExpr>),
+    Yield {
+        key: Option<TypedExpr>,
+        value: TypedExpr,
+    },
     If {
         branches: Vec<(TypedExpr, Vec<Statement>)>,
         otherwise: Vec<Statement>,
@@ -1000,6 +1007,7 @@ impl TypeChecker {
                 Rc::clone(&self.closures),
             );
             checker.declare_parameters(declaration, &signature.parameters);
+            checker.generator = block_has_yield(&declaration.body);
             let body = checker.lower_block(&declaration.body);
             let index = signature.id.0 as usize;
             self.functions[index] = Some(checker.finish(body));
@@ -1033,6 +1041,7 @@ impl TypeChecker {
             }
             checker
                 .declare_parameters(&pending.declaration.function, &pending.signature.parameters);
+            checker.generator = block_has_yield(&pending.declaration.function.body);
             let body = checker.lower_block(&pending.declaration.function.body);
             self.functions[pending.id.0 as usize] = Some(checker.finish(body));
         }
@@ -1053,6 +1062,7 @@ impl TypeChecker {
                     parameter_metadata: Vec::new(),
                     locals: Vec::new(),
                     return_type: Type::Never,
+                    generator: false,
                     owner: None,
                     static_method: false,
                     body: Vec::new(),
@@ -2397,6 +2407,7 @@ struct FunctionChecker<'signatures, 'diagnostics> {
     name: String,
     module_name: String,
     return_type: Type,
+    generator: bool,
     span: Span,
     locals: Vec<Local>,
     names: HashMap<String, LocalId>,
@@ -2440,6 +2451,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             name: name.to_owned(),
             module_name: module_name.to_owned(),
             return_type,
+            generator: false,
             span,
             locals: Vec::new(),
             names: HashMap::new(),
@@ -2597,7 +2609,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 StatementKind::Echo(value)
             }
             StmtKind::Return(expression) => {
-                let return_type = self.return_type.clone();
+                let return_type = if self.generator {
+                    Type::Mixed
+                } else {
+                    self.return_type.clone()
+                };
                 let value = expression
                     .as_ref()
                     .and_then(|expression| self.lower_expression(expression, Some(&return_type)));
@@ -2610,6 +2626,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     )),
                     (expected, Some(value)) => self.expect_type(expected, &value.ty, value.span),
                     (Type::Void, None) => {}
+                    (_, None) if self.generator => {}
                     (expected, None) => self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0004",
@@ -2618,6 +2635,39 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     )),
                 }
                 StatementKind::Return(value)
+            }
+            StmtKind::Yield { key, value } => {
+                if !self.generator {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0700",
+                        statement.span,
+                        "`yield` is only valid inside a generator function",
+                    ));
+                    return None;
+                }
+                let Some((key_type, value_type)) =
+                    generator_target_args(&self.return_type).map(|(k, v)| (k.clone(), v.clone()))
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0701",
+                        statement.span,
+                        "a generator function must declare `Iterator<K, V>` or `Generator<K, V>`",
+                    ));
+                    return None;
+                };
+                let key = key
+                    .as_ref()
+                    .and_then(|key| self.lower_expression(key, Some(&key_type)));
+                if let Some(key) = &key {
+                    self.expect_type(&key_type, &key.ty, key.span);
+                } else {
+                    self.expect_type(&key_type, &Type::Int, statement.span);
+                }
+                let value = self.lower_expression(value, Some(&value_type))?;
+                self.expect_type(&value_type, &value.ty, value.span);
+                StatementKind::Yield { key, value }
             }
             StmtKind::If {
                 branches,
@@ -3323,6 +3373,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 variadic: false,
             });
         }
+        checker.generator = block_has_yield(body);
         let lowered = checker.lower_block(body);
         let function = checker.finish(lowered);
         self.closures.borrow_mut()[(id.0 - self.closure_base) as usize] = Some(function);
@@ -5419,7 +5470,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
     }
 
     fn finish(self, body: Vec<Statement>) -> Function {
-        if self.return_type != Type::Void && !block_guarantees_exit(&body) {
+        if !self.generator && self.return_type != Type::Void && !block_guarantees_exit(&body) {
             self.diagnostics.push(Diagnostic::error(
                 "typing",
                 "T0009",
@@ -5438,12 +5489,41 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             parameter_metadata: self.parameter_metadata,
             locals: self.locals,
             return_type: self.return_type,
+            generator: self.generator,
             owner: self.owner,
             static_method: self.static_method,
             body,
             span: self.span,
         }
     }
+}
+
+fn block_has_yield(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match &statement.kind {
+        StmtKind::Yield { .. } => true,
+        StmtKind::If {
+            branches,
+            otherwise,
+        } => {
+            branches.iter().any(|(_, body)| block_has_yield(body))
+                || otherwise.as_ref().is_some_and(|body| block_has_yield(body))
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. }
+        | StmtKind::Using { body, .. }
+        | StmtKind::Block(body) => block_has_yield(body),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            block_has_yield(body)
+                || catches.iter().any(|clause| block_has_yield(&clause.body))
+                || finally.as_ref().is_some_and(|body| block_has_yield(body))
+        }
+        _ => false,
+    })
 }
 
 fn block_guarantees_exit(statements: &[Statement]) -> bool {
@@ -5476,6 +5556,7 @@ fn block_guarantees_exit(statements: &[Statement]) -> bool {
                             .all(|catch| block_guarantees_exit(&catch.body)))
             }
             StatementKind::Assign { .. }
+            | StatementKind::Yield { .. }
             | StatementKind::Echo(_)
             | StatementKind::While { .. }
             | StatementKind::For { .. }
@@ -5897,7 +5978,7 @@ fn coerce_collection_iterator(
 fn iterator_target_args(ty: &Type) -> Option<(&Type, &Type)> {
     match ty {
         Type::Nominal { name, arguments }
-            if matches!(name.as_str(), "Iterator" | "Traversable") =>
+            if matches!(name.as_str(), "Iterator" | "Traversable" | "Generator") =>
         {
             Some((arguments.first()?, arguments.get(1)?))
         }
@@ -5905,6 +5986,15 @@ fn iterator_target_args(ty: &Type) -> Option<(&Type, &Type)> {
             let mut targets = members.iter().filter_map(iterator_target_args);
             let target = targets.next()?;
             targets.next().is_none().then_some(target)
+        }
+        _ => None,
+    }
+}
+
+fn generator_target_args(ty: &Type) -> Option<(&Type, &Type)> {
+    match ty {
+        Type::Nominal { name, .. } if matches!(name.as_str(), "Iterator" | "Generator") => {
+            iterator_target_args(ty)
         }
         _ => None,
     }
@@ -6756,6 +6846,14 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             &["Iterator"],
         ),
         (
+            "Generator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
             "MapIterator",
             NominalKind::Class,
             false,
@@ -7066,6 +7164,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "IteratorAggregate",
         "OuterIterator",
         "VectorIterator",
+        "Generator",
         "MapIterator",
         "EmptyIterator",
         "IteratorIterator",
@@ -7119,6 +7218,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
 
     for name in [
         "VectorIterator",
+        "Generator",
         "MapIterator",
         "EmptyIterator",
         "IteratorIterator",
@@ -7387,6 +7487,43 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             add_native_method(
                 &mut classes,
                 name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    {
+        let params = classes["Generator"].type_parameters.clone();
+        for (method, builtin, result) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            (
+                "key",
+                Builtin::IteratorKey,
+                Type::Parameter {
+                    id: params[0].id,
+                    name: "K".to_owned(),
+                },
+            ),
+            (
+                "value",
+                Builtin::IteratorValue,
+                Type::Parameter {
+                    id: params[1].id,
+                    name: "V".to_owned(),
+                },
+            ),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+            ("getReturn", Builtin::GeneratorGetReturn, Type::Mixed),
+            ("close", Builtin::GeneratorClose, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                "Generator",
                 method,
                 Some(builtin),
                 false,
@@ -8427,6 +8564,9 @@ fn count_expressions(statements: &[Statement]) -> usize {
             | StatementKind::Echo(value)
             | StatementKind::Throw(value) => count_expression(value),
             StatementKind::Return(value) => value.as_ref().map_or(0, count_expression),
+            StatementKind::Yield { key, value } => {
+                key.as_ref().map_or(0, count_expression) + count_expression(value)
+            }
             StatementKind::If {
                 branches,
                 otherwise,

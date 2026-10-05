@@ -370,6 +370,7 @@ impl Encoder {
             self.ty(ty);
         }
         self.ty(&function.return_type);
+        self.u8(u8::from(function.generator));
         self.u32(function.owner.map_or(NONE, |owner| owner.0));
         self.u8(u8::from(function.static_method));
         self.len(function.register_types.len());
@@ -770,6 +771,8 @@ impl Encoder {
             Callee::Builtin(Builtin::IteratorApply) => self.u8(49),
             Callee::Builtin(Builtin::CallbackFilterAccept) => self.u8(50),
             Callee::Builtin(Builtin::CallbackFilterConstruct) => self.u8(51),
+            Callee::Builtin(Builtin::GeneratorGetReturn) => self.u8(52),
+            Callee::Builtin(Builtin::GeneratorClose) => self.u8(53),
         }
     }
 
@@ -815,6 +818,12 @@ impl Encoder {
             Terminator::Throw(value) => {
                 self.u8(4);
                 self.u32(value.0);
+            }
+            Terminator::Yield { key, value, resume } => {
+                self.u8(5);
+                self.u32(key.map_or(NONE, |register| register.0));
+                self.u32(value.0);
+                self.u32(resume.0);
             }
         }
     }
@@ -1107,6 +1116,7 @@ impl Decoder<'_> {
         let parameter_metadata = self.vector(Self::parameter_metadata)?;
         let local_types = self.vector(|decoder| decoder.ty(0))?;
         let return_type = self.ty(0)?;
+        let generator = self.boolean()?;
         let owner = match self.u32()? {
             NONE => None,
             owner => Some(ClassId(owner)),
@@ -1125,6 +1135,7 @@ impl Decoder<'_> {
             parameter_metadata,
             local_types,
             return_type,
+            generator,
             owner,
             static_method,
             register_types,
@@ -1422,6 +1433,8 @@ impl Decoder<'_> {
             49 => Ok(Callee::Builtin(Builtin::IteratorApply)),
             50 => Ok(Callee::Builtin(Builtin::CallbackFilterAccept)),
             51 => Ok(Callee::Builtin(Builtin::CallbackFilterConstruct)),
+            52 => Ok(Callee::Builtin(Builtin::GeneratorGetReturn)),
+            53 => Ok(Callee::Builtin(Builtin::GeneratorClose)),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }
@@ -1465,6 +1478,14 @@ impl Decoder<'_> {
             })),
             3 => Ok(Terminator::Unreachable),
             4 => Ok(Terminator::Throw(Register(self.u32()?))),
+            5 => Ok(Terminator::Yield {
+                key: match self.u32()? {
+                    NONE => None,
+                    register => Some(Register(register)),
+                },
+                value: Register(self.u32()?),
+                resume: BlockId(self.u32()?),
+            }),
             tag => Err(self.error(format!("unknown terminator tag {tag}"))),
         }
     }

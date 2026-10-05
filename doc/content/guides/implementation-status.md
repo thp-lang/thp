@@ -41,6 +41,7 @@ compiler if used as though it were available.
 | `vector<T>`, `map<K, V>`                                                                    | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                                                                                |
 | Variables and functions                                                                     | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                                                                         |
 | Typed callables and closures                                                                | implemented  | Fixed `callable<P..., R>` signatures, named function values, value captures, arrow and block closures, and positional invocation                                        |
+| `yield`, generator functions, and `Generator<K, V>`                                         | implemented  | Lazy one-shot iterator cursors, explicit and automatic keys, final return values, explicit close, and suspension-aware cleanup; no send operation                       |
 | `if`, `match`, `while`, `for`, `return`, `echo`                                             | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                                                                         |
 | `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Direct collection lowering; the source is evaluated once and traversal uses its captured COW snapshot                                                                   |
 | `break`, `continue`                                                                         | partial      | Level one only; numeric levels are rejected                                                                                                                             |
@@ -64,6 +65,7 @@ compiler if used as though it were available.
 | `count(string\|vector<T>\|map<K, V>): int`                             | implemented  | Reads the value's byte or collection length; it does not consume, move, or create traversal state                                |
 | `Traversable<K, V>`                                                    | implemented  | Executable invariant marker interface; `K` has no additional constraint                                                          |
 | `Iterator<K, V>`                                                       | implemented  | Executable cursor interface extending `Traversable<K, V>`                                                                        |
+| `Generator<K, V>`                                                      | implemented  | One-shot cursor with `getReturn()` and `close()`; uses the existing `Iterator<K, V>` protocol                                    |
 | `IteratorAggregate<K, V>`                                              | implemented  | Executable aggregate interface; `getIterator()` returns `Traversable<K, V>`                                                      |
 | `foreach (Traversable<K, V>)`                                          | implemented  | Resolves aggregate layers, rewinds the direct iterator, and dispatches `valid`, `value`, optional `key`, and `advance` virtually |
 | `VectorIterator<T>`, `MapIterator<K, V>`                               | implemented  | Rewindable cursors over COW collection snapshots; typed iterator targets create fresh cursors                                    |
@@ -156,7 +158,7 @@ PHP behavior. Pending work includes:
   anonymous classes, enums, reflection attributes/source inspection, and flow
   narrowing after `instanceof`;
 - global constants, general dynamic calls and member names, runtime
-  includes/autoload callbacks, attributes, generators, and cooperative
+  includes/autoload callbacks, attributes, and cooperative
   async;
 - the broader standard library, extension registration/dispatch, concrete
   FastCGI and web-server SAPI adapters, relocatable module code generation,

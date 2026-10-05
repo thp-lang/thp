@@ -601,6 +601,14 @@ impl Server {
                         .find(|declaration| declaration.id.as_str() == id)
                 })
                 .or_else(|| {
+                    if receiver_before(document.source.text(), span.start as usize).is_some_and(
+                        |receiver| {
+                            document.variable_type(&receiver, offset).as_deref()
+                                == Some("Generator")
+                        },
+                    ) {
+                        return None;
+                    }
                     let matches = self
                         .declarations(document.project())
                         .filter(|declaration| declaration.name.rsplit('\\').next() == Some(&name))
@@ -621,7 +629,16 @@ impl Server {
                         .text()
                         .get(..span.start as usize)?
                         .trim_end();
-                    if prefix.ends_with("->") || prefix.ends_with("::") {
+                    if prefix.ends_with("->") {
+                        let receiver =
+                            receiver_before(document.source.text(), span.start as usize)?;
+                        return (document.variable_type(&receiver, offset).as_deref()
+                            == Some("Generator"))
+                        .then(|| native_generator_method(&name))
+                        .flatten()
+                        .map(|method| method.markdown());
+                    }
+                    if prefix.ends_with("::") {
                         return None;
                     }
                     if !document
@@ -651,7 +668,8 @@ impl Server {
         let mut items: Vec<CompletionItem> = if let Some(variable) = receiver {
             let ty = document.variable_type(&variable, offset)?;
             let ancestors = self.owner_ancestors(&ty, document.project());
-            self.declarations(document.project())
+            let mut items: Vec<_> = self
+                .declarations(document.project())
                 .filter(|declaration| {
                     declaration
                         .owner
@@ -659,7 +677,13 @@ impl Server {
                         .is_some_and(|owner| owner == ty || ancestors.contains(owner))
                 })
                 .map(Declaration::completion)
-                .collect()
+                .collect();
+            if ty == "Generator" {
+                items.extend(GENERATOR_METHODS.iter().filter_map(|(name, _)| {
+                    native_generator_method(name).map(|method| method.completion())
+                }));
+            }
+            items
         } else {
             let mut items: Vec<_> = self
                 .declarations(document.project())
@@ -715,8 +739,13 @@ impl Server {
                 .function_candidates(&call.name)
                 .iter()
                 .any(|candidate| candidate == call.name.trim_start_matches('\\'));
-        let declaration = if let Some(receiver) = call.receiver {
-            let ty = document.variable_type(&receiver, offset)?;
+        let native_method = call.receiver.as_ref().and_then(|receiver| {
+            (document.variable_type(receiver, offset).as_deref() == Some("Generator"))
+                .then(|| native_generator_method(&call.name))
+                .flatten()
+        });
+        let declaration = if let Some(receiver) = &call.receiver {
+            let ty = document.variable_type(receiver, offset)?;
             let ancestors = self.owner_ancestors(&ty, document.project());
             let matches = self
                 .declarations(document.project())
@@ -751,6 +780,7 @@ impl Server {
         };
         declaration
             .map(|declaration| declaration.signature_help(call.argument))
+            .or_else(|| native_method.map(|method| method.signature_help(call.argument)))
             .or_else(|| {
                 global
                     .then(|| native_collection_declaration(&call.name))
@@ -1445,6 +1475,26 @@ const NATIVE_COLLECTIONS: &[NativeCollectionSpec] = &[
         "int",
     ),
 ];
+
+const GENERATOR_METHODS: &[(&str, &str)] = &[
+    ("rewind", "void"),
+    ("valid", "bool"),
+    ("key", "K"),
+    ("value", "V"),
+    ("advance", "void"),
+    ("getReturn", "mixed"),
+    ("close", "void"),
+];
+
+fn native_generator_method(name: &str) -> Option<Declaration> {
+    let (_, result) = GENERATOR_METHODS
+        .iter()
+        .find(|(candidate, _)| *candidate == name)?;
+    let mut method = callable_declaration(name, Vec::new(), result);
+    method.kind = DeclarationKind::Method;
+    method.owner = Some("Generator".to_owned());
+    Some(method)
+}
 
 fn callable_declaration(
     name: &str,
@@ -3241,6 +3291,7 @@ fn validate_type_arity(program: &Program, ty: &TypeSyntax) -> Result<(), String>
         ("map".to_owned(), 2),
         ("Traversable".to_owned(), 2),
         ("Iterator".to_owned(), 2),
+        ("Generator".to_owned(), 2),
         ("IteratorAggregate".to_owned(), 2),
         ("OuterIterator".to_owned(), 2),
         ("VectorIterator".to_owned(), 1),
@@ -3641,6 +3692,7 @@ fn semantic_kind(document: &DocumentState, token: &Token) -> (u32, u32) {
         | TokenKind::Finally
         | TokenKind::Using
         | TokenKind::Return
+        | TokenKind::Yield
         | TokenKind::If
         | TokenKind::ElseIf
         | TokenKind::Else
@@ -3993,6 +4045,70 @@ mod tests {
             assert!(help.signatures[0].label.contains(label));
             assert_eq!(help.active_parameter, Some(active));
         }
+    }
+
+    #[test]
+    fn generator_features_have_editor_support() {
+        let source = "<?thp\n/** @return Generator<int, string> */\nfunction entries(): Generator<int, string> { yield \"one\"; }\nfunction close(): int { return 1; }\n$generator = entries();\n$generator->close();\n";
+        let (server, uri) = server_with_source(source);
+        let document = &server.documents[&uri];
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let yield_token = document
+            .tokens
+            .iter()
+            .find(|token| &source[token.span.range()] == "yield")
+            .unwrap();
+        assert_eq!(super::semantic_kind(document, yield_token).0, 8);
+
+        let offset = source.find("$generator->close").unwrap() + "$generator->".len();
+        let completion = server
+            .completion(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": position(source, offset)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let lsp_types::CompletionResponse::Array(items) = completion else {
+            panic!("expected completion array");
+        };
+        for (name, _) in super::GENERATOR_METHODS {
+            assert!(items.iter().any(|item| item.label == *name), "{name}");
+        }
+        let hover = server
+            .hover(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": position(source, offset + 2)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(format!("{:?}", hover.contents).contains("close(): void"));
+        let help = server
+            .signature_help(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": position(source, source.rfind("close()").unwrap() + "close(".len())
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(help.signatures[0].label, "close(): void");
+        assert_eq!(
+            renamed_source(
+                &server,
+                &uri,
+                source.find("$generator").unwrap() + 1,
+                "cursor"
+            ),
+            source.replace("$generator", "$cursor")
+        );
     }
 
     #[test]

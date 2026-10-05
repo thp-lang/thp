@@ -874,6 +874,12 @@ fn collect_body_statement(statement: &Stmt, output: &mut Vec<(bool, String)>) {
                 collect_body_expr(value, output);
             }
         }
+        StmtKind::Yield { key, value } => {
+            if let Some(key) = key {
+                collect_body_expr(key, output);
+            }
+            collect_body_expr(value, output);
+        }
         StmtKind::If {
             branches,
             otherwise,
@@ -1194,6 +1200,12 @@ fn resolve_statement(
             if let Some(value) = value {
                 resolve_expr(value, namespace, type_aliases, function_aliases, index);
             }
+        }
+        StmtKind::Yield { key, value } => {
+            if let Some(key) = key {
+                resolve_expr(key, namespace, type_aliases, function_aliases, index);
+            }
+            resolve_expr(value, namespace, type_aliases, function_aliases, index);
         }
         StmtKind::If {
             branches,

@@ -276,6 +276,7 @@ impl Parser<'_, '_> {
             TokenKind::Trait => self.parse_trait(),
             TokenKind::Echo => self.parse_echo(),
             TokenKind::Return => self.parse_return(),
+            TokenKind::Yield => self.parse_yield(),
             TokenKind::Throw => self.parse_throw(),
             TokenKind::Try => self.parse_try(),
             TokenKind::Using => self.parse_using(),
@@ -869,6 +870,21 @@ impl Parser<'_, '_> {
         let end = self.expect(TokenKind::Semicolon, "P0401", "expected `;` after return")?;
         Some(Stmt {
             kind: StmtKind::Return(value),
+            span: start.join(end.span),
+        })
+    }
+
+    fn parse_yield(&mut self) -> Option<Stmt> {
+        let start = self.advance().span;
+        let first = self.parse_expression(0)?;
+        let (key, value) = if self.consume(TokenKind::FatArrow) {
+            (Some(first), self.parse_expression(0)?)
+        } else {
+            (None, first)
+        };
+        let end = self.expect(TokenKind::Semicolon, "P0402", "expected `;` after yield")?;
+        Some(Stmt {
+            kind: StmtKind::Yield { key, value },
             span: start.join(end.span),
         })
     }

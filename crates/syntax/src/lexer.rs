@@ -195,6 +195,7 @@ impl Lexer<'_, '_> {
                 "finally" => TokenKind::Finally,
                 "using" => TokenKind::Using,
                 "return" => TokenKind::Return,
+                "yield" => TokenKind::Yield,
                 "if" => TokenKind::If,
                 "elseif" => TokenKind::ElseIf,
                 "else" => TokenKind::Else,
