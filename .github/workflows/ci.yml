@@ -10,6 +10,8 @@ on:
       - "tests/**"
       - "examples/**"
       - "release/**"
+      - "install.sh"
+      - "install.ps1"
       - "deny.toml"
       - ".github/workflows/ci.yml"
   pull_request:
@@ -20,6 +22,8 @@ on:
       - "tests/**"
       - "examples/**"
       - "release/**"
+      - "install.sh"
+      - "install.ps1"
       - "deny.toml"
       - ".github/workflows/ci.yml"
   schedule:
@@ -58,6 +62,20 @@ jobs:
         with:
           toolchain: 1.88.0
       - run: cargo test --locked -p thp-cli --test public_examples
+      - name: Check shell installer
+        if: runner.os == 'Linux'
+        run: bash tests/install.sh
+      - name: Parse PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile('install.ps1', [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { throw ($errors | Out-String) }
+      - name: Check PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/install.ps1
 
   dependency-policy:
     runs-on: ubuntu-latest

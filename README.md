@@ -14,12 +14,24 @@ defined behavior.
 
 ## Quick start
 
-Download the archive for your platform from
-[Releases](https://github.com/thp-lang/thp/releases), extract it, and
-place its `bin` directory on `PATH`. Each archive includes installation notes,
-official-binary terms, the Apache source notice, and third-party notices. The
-release publishes checksums and a Sigstore signature bundle alongside the
-archives.
+On Linux x86-64 (glibc) or macOS, install the latest THP release with:
+
+```sh
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/thp-lang/thp/main/install.sh | bash'
+```
+
+On Windows x86-64, run this in PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/thp-lang/thp/main/install.ps1 -ErrorAction Stop)))
+```
+
+The installers check the archive against the published SHA-256 manifest and
+install into a user-owned directory. On Linux and macOS, add `~/.local/bin` to
+`PATH` if the installer prompts you. On Windows, open a new terminal after
+installation. For a manually verified installation, download an archive from
+[Releases](https://github.com/thp-lang/thp/releases) and follow its
+[`INSTALL.md`](release/INSTALL.md), including the Sigstore signature check.
 
 Create `hello.thp`:
 

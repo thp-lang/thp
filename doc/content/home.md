@@ -95,9 +95,14 @@ authority for accepted syntax and executable behavior.
 
 ## Try it locally
 
-Download an archive from
-[GitHub Releases](https://github.com/thp-lang/thp/releases), add its `bin`
-directory to `PATH`, save the collection example as `collections.thp`, and run:
+Install THP on Linux or macOS:
+
+```sh
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/thp-lang/thp/main/install.sh | bash'
+```
+
+Follow the printed `PATH` instruction if needed. Save the collection example as
+`collections.thp`, then run:
 
 ```sh
 thp --version
@@ -105,9 +110,10 @@ thp check collections.thp
 thp run collections.thp
 ```
 
-The [getting-started guide](thp:guide.gettingStarted) also covers building from
-source, inspecting compiler stages, selecting the VM or JIT, and enabling the
-persistent cache.
+On Windows, use `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/thp-lang/thp/main/install.ps1 -ErrorAction Stop)))`
+in PowerShell. The [getting-started guide](thp:guide.gettingStarted) covers
+supported platforms, manual archive installation, building from source,
+compiler stages, the VM or JIT, and the persistent cache.
 
 ## Clear experimental boundaries
 

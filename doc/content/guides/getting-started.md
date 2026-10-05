@@ -14,7 +14,27 @@ This guide takes you from an installed `thp` command to a checked and running
 program. THP 0.7.0 is intended for command-line experiments. It does not run
 through PHP, install into a PHP server, or provide a production web stack.
 
-## Install a release archive
+## Install a release
+
+On Linux x86-64 with glibc or macOS, run:
+
+```sh
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/thp-lang/thp/main/install.sh | bash'
+```
+
+On Windows x86-64, run this in PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/thp-lang/thp/main/install.ps1 -ErrorAction Stop)))
+```
+
+The installers select the latest main THP release, verify the archive's SHA-256
+checksum, and install into a user-owned directory. If prompted on Linux or
+macOS, add `~/.local/bin` to `PATH`; on Windows, open a new terminal. To verify
+the signed checksum manifest yourself, follow the archive's
+[installation notes](https://github.com/thp-lang/thp/blob/main/release/INSTALL.md).
+
+### Install an archive manually
 
 Download the archive for your platform from the project's
 [GitHub Releases](https://github.com/thp-lang/thp/releases) page. Extract it and
