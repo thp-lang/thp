@@ -11,7 +11,7 @@ if (-not $version) {
     if (-not $release) { throw 'No stable THP release found.' }
     $version = $release.tag_name.Substring(1)
 }
-if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'THP_VERSION must be a stable version such as 0.7.0.' }
+if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'THP_VERSION must be a stable version such as 0.8.0.' }
 
 $archive = "thp-$version-windows-x86_64.zip"
 $base = "https://github.com/thp-lang/thp/releases/download/v$version"
