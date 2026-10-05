@@ -72,19 +72,22 @@ function articleBody(model: SiteModel, page: ResolvedPage): TrustedHtml {
 
 export function renderHome(model: SiteModel, page: ResolvedPage): string {
   const body =
-    trusted(`<div class="announcement"><span class="status-dot"></span> THP 0.2 is an experimental CLI release. <a href="${withBase(model.basePath, "/learn/implementation-status/")}">See what is implemented.</a></div>
+    trusted(`<div class="announcement"><span class="status-dot"></span> THP 0.8 is an experimental CLI release. <a href="${withBase(model.basePath, "/learn/implementation-status/")}">See what is implemented.</a></div>
   <section class="hero">
-    <div class="hero-grid"><div class="hero-copy"><p class="eyebrow">Static types · Verified bytecode · Standalone runtime</p><h1>A typed language with <span>its own runtime.</span></h1><p class="hero-lead">${escapeHtml(page.source.data.summary)}</p>
+    <div class="hero-grid"><div class="hero-copy"><p class="eyebrow">Generic collections · Static checks · Standalone runtime</p><h1>Familiar syntax. <span>Precise types.</span></h1><p class="hero-lead">${escapeHtml(page.source.data.summary)}</p>
       <div class="hero-actions"><a class="button button-primary" href="${withBase(model.basePath, "/learn/getting-started/")}">Start with THP →</a><a class="button" href="${withBase(model.basePath, "/learn/implementation-status/")}">See what works today</a></div>
-    </div><div class="code-window"><div class="code-window-bar"><span>hello.thp</span><span>THP</span></div>
+    </div><div class="code-window"><div class="code-window-bar"><span>collections.thp</span><span>THP</span></div>
       <pre><code><span class="comment">&lt;?thp</span>
 
-<span class="kw">function</span> greet(<span class="type">string</span> <span class="var">$name</span>): <span class="type">string</span> {
-  <span class="kw">return</span> <span class="string">"Hello, "</span> . <span class="var">$name</span> . <span class="string">"!\\n"</span>;
-}
+<span class="var">$names</span>: <span class="type">vector&lt;string&gt;</span> = [<span class="string">"Ada"</span>, <span class="string">"Grace"</span>];
+<span class="var">$scores</span>: <span class="type">map&lt;string, int&gt;</span> = {
+  <span class="string">"Ada"</span> =&gt; 10,
+  <span class="string">"Grace"</span> =&gt; 9
+};
 
-<span class="kw">echo</span> greet(<span class="string">"world"</span>);</code></pre>
-      <div class="code-window-command"><code><span>$ thp run hello.thp</span><strong>Hello, world!</strong></code></div>
+<span class="kw">echo</span> <span class="var">$names</span>[0] . <span class="string">": "</span>;
+<span class="kw">echo</span> <span class="var">$scores</span>[<span class="var">$names</span>[0]] . <span class="string">"\\n"</span>;</code></pre>
+      <div class="code-window-command"><code><span>$ thp run collections.thp</span><strong>Ada: 10</strong></code></div>
     </div></div>
   </section>
   <section class="section prose home-prose" data-pagefind-body>${articleBody(model, page)}</section>`);
