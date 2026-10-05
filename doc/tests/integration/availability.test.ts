@@ -134,10 +134,10 @@ describe("0.2.0 contract availability", () => {
     expect(html).toContain('<div class="table-scroll"><table>');
 
     expect(status.source.body).toContain(
-      "`count(string\\|vector<T>\\|map<K, V>): int`",
+      "`count(string\\|vector<T>\\|map<K, V>\\|Countable): int`",
     );
     expect(status.source.body).toContain(
-      "Reads the value's byte or collection length; it does not consume, move, or create traversal state",
+      "Reads native length or dispatches `Countable::count()` and rejects negative results",
     );
     expect(status.source.body).toContain(
       "`iterator_count<K, V>(Iterator<K, V>): int`",

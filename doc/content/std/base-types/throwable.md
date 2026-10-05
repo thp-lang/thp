@@ -6,15 +6,13 @@ summary: Defines the common information exposed by objects that can be thrown.
 name: Throwable
 module: base-types
 typeParameters: []
-interfaces: []
+interfaces:
+  - id: std.baseTypes.Stringable
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice: >-
-  The executable object model implements the message, code, previous, and
-  suppressed-failure slice. Origin and trace inspection and string conversion
-  remain proposed.
+availability: implemented
+notice: The compiler and reference VM implement this experimental contract.
 version: "0.1"
 ---
 
@@ -24,8 +22,10 @@ produced by error handling.
 ## Contract
 
 The executable interface provides an error message, code, optional previous
-throwable, and suppressed cleanup failures. The broader reference contract also
-reserves origin, stack trace, and string representation. Ordinary classes
+throwable, suppressed cleanup failures, creation file and line, a structured
+stack trace, and string representations. Trace frames are captured at
+construction, ordered from the current call toward its callers. Receiver
+objects and arguments are omitted from captured frames. Ordinary classes
 cannot implement `Throwable` directly; throwable types derive from the
 language's exception hierarchy.
 

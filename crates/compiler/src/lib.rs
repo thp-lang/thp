@@ -556,7 +556,11 @@ pub fn compile_project_with_provider(
         });
     }
     let mir = metrics.measure(Stage::Mir, || lower_mir(&hir));
-    let bytecode = metrics.measure(Stage::Linking, || lower_bytecode(&mir));
+    let mut bytecode = metrics.measure(Stage::Linking, || lower_bytecode(&mir));
+    bytecode.sources = sources
+        .iter()
+        .map(|(_, source)| source_info(source))
+        .collect();
     if let Err(error) = metrics.measure(Stage::Verification, || verify(&bytecode)) {
         diagnostics.push(ProjectDiagnostic {
             source: entry.source_id,
@@ -1054,7 +1058,8 @@ fn compile_source_with_metrics(source: SourceFile, mut metrics: Metrics) -> Comp
     if let Some(measurement) = metrics.last_mut() {
         measurement.set_output(mir.instruction_count(), std::mem::size_of_val(&mir));
     }
-    let bytecode = metrics.measure(Stage::Bytecode, || lower_bytecode(&mir));
+    let mut bytecode = metrics.measure(Stage::Bytecode, || lower_bytecode(&mir));
+    bytecode.sources.push(source_info(&source));
     if let Some(measurement) = metrics.last_mut() {
         measurement.set_output(
             bytecode.instruction_count(),
@@ -1083,6 +1088,19 @@ fn compile_source_with_metrics(source: SourceFile, mut metrics: Metrics) -> Comp
         bytecode: diagnostics.is_empty().then_some(bytecode),
         diagnostics,
         metrics,
+    }
+}
+
+fn source_info(source: &SourceFile) -> thp_bytecode::SourceInfo {
+    let mut line_starts = vec![0];
+    for (index, byte) in source.text().bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(u32::try_from(index + 1).expect("source offsets fit u32"));
+        }
+    }
+    thp_bytecode::SourceInfo {
+        path: source.path().to_string_lossy().into_owned(),
+        line_starts,
     }
 }
 

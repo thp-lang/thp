@@ -36,6 +36,9 @@ a directly guarded local inside a positive `if` or `elseif` branch.
 | [`ArgumentCountError`](thp:std.baseTypes.ArgumentCountError)   | Reports a dynamic argument count mismatch.      |
 | [`UnhandledMatchError`](thp:std.baseTypes.UnhandledMatchError) | Reports a `match` with no selected arm.         |
 | [`Option`](thp:std.baseTypes.Option)                           | Represents either one value or no value.        |
+| [`Countable`](thp:std.baseTypes.Countable)                     | Supplies a non-negative count.                  |
+| [`Stringable`](thp:std.baseTypes.Stringable)                   | Supplies a string representation.               |
+| [`MapAccess`](thp:std.baseTypes.MapAccess)                     | Supplies explicit offset methods.               |
 | [`TraceLine`](thp:std.baseTypes.TraceLine)                     | Represents one frame in a captured stack trace. |
 | [`Iterator`](thp:std.baseTypes.Iterator)                       | Traverses typed keys and values with a cursor.  |
 | [`IteratorAggregate`](thp:std.baseTypes.IteratorAggregate)     | Produces the next traversable layer.            |
@@ -75,8 +78,8 @@ have no callback exception path, but still report allocation failure. An empty
 result retains its statically determined generic types. An untyped empty
 literal with no expected type is a compile error.
 
-`count(string|vector<T>|map<K, V>): int` reads the collection length
-without consuming, moving, or creating traversal state. Implemented
+`count(string|vector<T>|map<K, V>|Countable): int` reads the native length or
+dispatches `Countable::count()` without consuming traversal state. Implemented
 [`iterator_count()`](thp:std.spl.iterator_count) instead accepts an
 `Iterator<K, V>`, counts from its current cursor through exhaustion, advances
 it, and does not rewind; the two names are neither aliases nor overloads.
@@ -88,6 +91,11 @@ Native collection storage is intended to let the compiler and VM lower
 construction, indexing, mutation, and iteration directly instead of wrapping
 storage in ordinary generic objects. Physical storage remains an implementation
 detail.
+
+[`serialize()`](thp:std.baseTypes.serialize) and
+[`unserialize()`](thp:std.baseTypes.unserialize) implement the bounded
+[THP serialization format](thp:guide.serializationFormat) for scalar and native
+collection values. Object serialization hooks remain proposed.
 
 Typed collection errors can be caught with `try`/`catch`; uncaught runtime
 failures are deterministic.

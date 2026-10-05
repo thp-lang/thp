@@ -14,7 +14,7 @@ status: experimental
 availability: partial
 notice: >-
   The compiler and reference VM implement Error as a native throwable root.
-  Its wider set of diagnostic accessors and constructor metadata remain
+  Its origin, trace, and string accessors execute. Cloning rules remain
   experimental.
 version: "0.1"
 ---

@@ -2,15 +2,12 @@
 kind: module
 id: std.exceptions
 title: Exceptions
-summary: PHP-inspired exception categories proposed for THP.
+summary: PHP-inspired exception categories in THP.
 module: exceptions
 order: 30
 status: experimental
-availability: proposed
-notice:
-  This hierarchy is proposed for PHP migration analysis and is not implemented.
-  THP APIs must not name these classes as concrete failures until the hierarchy is
-  accepted.
+availability: implemented
+notice: These exception classes are constructible and catchable in the reference VM.
 ---
 
 | Class                                                              | Parent                     |

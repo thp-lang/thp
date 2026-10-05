@@ -1425,11 +1425,15 @@ impl Parser<'_, '_> {
                     break;
                 }
                 self.advance();
-                let name = self.expect(
-                    TokenKind::Identifier,
-                    "P1002",
-                    "expected a property or method name after `->`",
-                )?;
+                let name = if self.at(TokenKind::Function) || self.at(TokenKind::Class) {
+                    self.advance()
+                } else {
+                    self.expect(
+                        TokenKind::Identifier,
+                        "P1002",
+                        "expected a property or method name after `->`",
+                    )?
+                };
                 let name_text = self.text(name.span).to_owned();
                 if self.consume(TokenKind::LParen) {
                     let (arguments, end) = self.parse_arguments_after_open()?;

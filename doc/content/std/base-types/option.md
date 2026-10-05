@@ -12,8 +12,8 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This THP-native value type is proposed and is not yet implemented in this repository.
+availability: implemented
+notice: The compiler and reference VM implement this experimental contract.
 version: "0.1"
 ---
 
@@ -27,6 +27,10 @@ value. This distinguishes an absent value from a present nullable value when
 
 `Option` instances are created through its static factory methods. Its direct
 constructor is not public.
+`Option::some($value)` infers `T` from `$value`; `Option::none()` takes `T` from
+an expected `Option<T>` type. Either factory also accepts explicit class type
+arguments such as `Option<int>::none()`. Without an expected or explicit type,
+`none()` is a compile error.
 
 ### `some()`
 
@@ -50,6 +54,7 @@ Returns an option representing absence.
 The class retains its presence state separately from the contained value, so
 absence cannot be mistaken for an ordinary value. `Option` is a class rather
 than a PHP enum because PHP enum cases cannot carry an associated value.
+`get()` returns the present value and throws `OutOfBoundsException` for `none()`.
 
 ## Example
 

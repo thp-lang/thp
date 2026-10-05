@@ -2,9 +2,7 @@
 kind: method
 id: std.baseTypes.TraceLine::__construct
 title: TraceLine::__construct
-summary:
-  vector preserves argument order and permits values of any type. A map would
-  incorrectly imply that trace arguments are primarily accessed by key.
+summary: Initializes an immutable trace frame from its seven fields.
 name: __construct
 order: 1
 typeParameters: []
@@ -22,41 +20,36 @@ parameters:
     type: string
     description: Declaring class for a method frame.
   - name: object
-    type: ?object
-    description: Receiver recorded for an instance-method frame.
+    type: mixed
+    description: An object or null receiver; other values throw InvalidArgumentException.
   - name: type
     type: string
     description: 'Call operator: "->", "::", or "".'
   - name: args
-    type: ?vector<mixed>
-    description: Ordered arguments when argument capture is enabled.
+    type: mixed
+    description: A vector or null; other values throw InvalidArgumentException.
 returns:
   type: void
   description: This callable does not return a value.
 errors:
-  - description:
-      Construction fails when an argument violates the documented contract or an
-      underlying resource cannot be created. Concrete THP error classes remain
-      experimental unless named above.
+  - description: InvalidArgumentException when line, receiver, call operator, or arguments are invalid.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method executes in the reference VM.
 version: "0.1"
 owner: std.baseTypes.TraceLine
 visibility: public
 modifiers: []
 ---
 
-[`TraceLine`](thp:std.baseTypes.TraceLine)`::__construct()` vector preserves argument order and permits values of any type. A map would incorrectly imply that trace arguments are primarily accessed by key.
+[`TraceLine`](thp:std.baseTypes.TraceLine)`::__construct()` initializes a trace frame.
 
 ## Behavior
 
-vector preserves argument order and permits values of any type. A map would incorrectly imply that trace arguments are primarily accessed by key.
-
-This operation does not change receiver state unless the description explicitly states otherwise.
+The line must be non-negative. The receiver must be an object or `null`; the
+arguments must be a vector or `null`. The call operator is `"->"`, `"::"`, or
+`""`. The seven fields are read-only after construction.
 
 ## Example
 

@@ -17,11 +17,18 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 6;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 7;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceInfo {
+    pub path: String,
+    pub line_starts: Vec<u32>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Program {
     pub schema_version: u16,
+    pub sources: Vec<SourceInfo>,
     pub functions: Vec<Function>,
     pub classes: Vec<Class>,
     pub entry: FunctionId,
@@ -274,6 +281,7 @@ pub enum Terminator {
 pub fn lower(module: &thp_mir::Module) -> Program {
     Program {
         schema_version: BYTECODE_SCHEMA_VERSION,
+        sources: Vec::new(),
         entry: module.entry,
         classes: module
             .classes
@@ -651,6 +659,27 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
     }
     if program.entry.0 as usize >= program.functions.len() {
         return Err(global_error("entry function is out of bounds"));
+    }
+    if program.sources.iter().any(|source| {
+        source.line_starts.first() != Some(&0)
+            || source.line_starts.windows(2).any(|pair| pair[0] >= pair[1])
+    }) {
+        return Err(global_error("invalid source line table"));
+    }
+    if program.functions.iter().any(|function| {
+        std::iter::once(function.span)
+            .chain(function.blocks.iter().flat_map(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .map(|instruction| instruction.span)
+            }))
+            .any(|span| {
+                span.source
+                    .is_some_and(|source| source.0 as usize >= program.sources.len())
+            })
+    }) {
+        return Err(global_error("source span references a missing source"));
     }
     for (index, class) in program.classes.iter().enumerate() {
         if program.classes[..index]
@@ -1474,12 +1503,15 @@ fn substitute_descriptor_type(
                     .collect(),
                 Box::new(apply(result, substitutions)),
             ),
-            Type::Union(members) => Type::Union(
-                members
+            Type::Union(members) => {
+                let mut members = members
                     .iter()
                     .map(|member| apply(member, substitutions))
-                    .collect(),
-            ),
+                    .collect::<Vec<_>>();
+                members.sort_by_key(ToString::to_string);
+                members.dedup();
+                Type::Union(members)
+            }
             Type::Nominal { name, arguments } => Type::Nominal {
                 name: name.clone(),
                 arguments: arguments
@@ -1669,15 +1701,15 @@ fn infer_descriptor_instantiation(
         }
     }
     let mut inferred = std::collections::BTreeMap::new();
+    if let Some(result) = result {
+        unify(&method.return_type, result, &mut inferred);
+    }
     for (pattern, argument) in method.parameter_types.iter().zip(arguments) {
         unify(
             pattern,
             &caller.register_types[argument.0 as usize],
             &mut inferred,
         );
-    }
-    if let Some(result) = result {
-        unify(&method.return_type, result, &mut inferred);
     }
     let arguments = declaration
         .type_parameters
@@ -2376,6 +2408,7 @@ fn verify_instruction(
                             | "EmptyIterator"
                             | "IteratorIterator"
                             | "CallbackFilterIterator"
+                            | "TraceLine"
                     ))
             {
                 return Err(error("only a concrete class can be allocated"));
@@ -3343,6 +3376,98 @@ fn verify_builtin_call(
             }
             Ok(())
         }
+        Builtin::OptionSome | Builtin::OptionNone => {
+            let Some(Type::Nominal {
+                name,
+                arguments: type_arguments,
+            }) = result
+            else {
+                return Err("option factory must return Option<T>".to_owned());
+            };
+            if name != "Option"
+                || type_arguments.len() != 1
+                || arguments.len() != usize::from(builtin == Builtin::OptionSome)
+                || (builtin == Builtin::OptionSome
+                    && !type_accepts(program, &type_arguments[0], argument_type(0)))
+            {
+                return Err("invalid option factory signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::OptionIsSome | Builtin::OptionIsNone | Builtin::OptionGet => {
+            object_receiver("Option")?;
+            if arguments.len() != 1 {
+                return Err("option method requires one receiver".to_owned());
+            }
+            let Type::Nominal {
+                name,
+                arguments: type_arguments,
+            } = argument_type(0)
+            else {
+                return Err("option receiver must retain its type argument".to_owned());
+            };
+            if name != "Option"
+                || type_arguments.len() != 1
+                || result
+                    != Some(if builtin == Builtin::OptionGet {
+                        &type_arguments[0]
+                    } else {
+                        &Type::Bool
+                    })
+            {
+                return Err("invalid option method signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Serialize => {
+            if arguments.len() != 1 || result != Some(&Type::String) {
+                return Err("invalid serialize signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Unserialize => check(&[Type::String], &Type::Mixed),
+        Builtin::TraceLineConstruct => {
+            object_receiver("TraceLine")?;
+            if arguments.len() != 8
+                || result != Some(&Type::Void)
+                || argument_type(1) != &Type::String
+                || argument_type(2) != &Type::Int
+                || argument_type(3) != &Type::String
+                || argument_type(4) != &Type::String
+                || argument_type(6) != &Type::String
+            {
+                return Err("invalid TraceLine constructor signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::ExceptionGetFile
+        | Builtin::ExceptionGetTraceAsString
+        | Builtin::ExceptionToString => {
+            object_receiver("Throwable")?;
+            if arguments.len() != 1 || result != Some(&Type::String) {
+                return Err("invalid throwable string method signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::ExceptionGetLine => {
+            object_receiver("Throwable")?;
+            if arguments.len() != 1 || result != Some(&Type::Int) {
+                return Err("invalid throwable line method signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::ExceptionGetTrace => {
+            object_receiver("Throwable")?;
+            if arguments.len() != 1
+                || result
+                    != Some(&Type::Vector(Box::new(Type::Object(
+                        "TraceLine".to_owned(),
+                    ))))
+            {
+                return Err("invalid throwable trace method signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::Reflection(operation) => {
             let Some((class, method)) = program.classes.iter().find_map(|class| {
                 class
@@ -3955,6 +4080,33 @@ mod tests {
         verify(&decoded).unwrap();
         assert_eq!(decoded.instruction_count(), program.instruction_count());
         assert_eq!(decoded.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn source_locations_round_trip_and_reject_missing_sources() {
+        let mut program = compile("<?thp\necho 1;");
+        program.sources.push(super::SourceInfo {
+            path: "example.thp".to_owned(),
+            line_starts: vec![0, 6],
+        });
+        let instruction =
+            &mut program.functions[program.entry.0 as usize].blocks[0].instructions[0];
+        instruction.span.source = Some(thp_diagnostics::SourceId(0));
+        let decoded = decode(&encode(&program)).unwrap();
+        assert_eq!(decoded.sources[0].path, "example.thp");
+        assert_eq!(
+            decoded.functions[decoded.entry.0 as usize].blocks[0].instructions[0]
+                .span
+                .source,
+            Some(thp_diagnostics::SourceId(0))
+        );
+        program.sources.clear();
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .message
+                .contains("missing source")
+        );
     }
 
     #[test]
