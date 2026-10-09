@@ -213,6 +213,75 @@ pub enum Builtin {
     IteratorValue,
     IteratorAdvance,
     IteratorGetInner,
+    LimitSeek,
+    LimitGetPosition,
+    AppendAdd,
+    AppendGetIndex,
+    AppendGetIterator,
+    CachingHasNext,
+    CachingCount,
+    CachingGetCache,
+    CachingGetFlags,
+    CachingSetFlags,
+    CachingOffsetExists,
+    CachingOffsetGet,
+    CachingOffsetSet,
+    CachingOffsetUnset,
+    CachingToString,
+    RecursiveEntryConstruct,
+    RecursiveEntryValue,
+    RecursiveEntryChildren,
+    RecursiveWalkConstruct,
+    RecursiveWalkSetMaxDepth,
+    RecursiveWalkGetMaxDepth,
+    RecursiveWalkGetDepth,
+    RecursiveWalkGetSubIterator,
+    RecursiveWalkGetRecursiveIterator,
+    RecursiveWalkHook,
+    FixedConstruct,
+    FixedSetSize,
+    FixedGetSize,
+    FixedOffsetExists,
+    FixedOffsetGet,
+    FixedOffsetSet,
+    FixedOffsetUnset,
+    FixedGetIterator,
+    ListConstruct,
+    ListPush,
+    ListPop,
+    ListUnshift,
+    ListShift,
+    ListTop,
+    ListBottom,
+    ListCount,
+    ListIsEmpty,
+    ListGetIterator,
+    ListToVector,
+    HeapConstruct,
+    HeapInsert,
+    HeapTop,
+    HeapExtract,
+    HeapCount,
+    HeapIsEmpty,
+    HeapGetIterator,
+    TypedMapConstruct,
+    TypedMapSet,
+    TypedMapGet,
+    TypedMapContains,
+    TypedMapRemove,
+    TypedMapCount,
+    TypedMapToMap,
+    TypedMapGetIterator,
+    ObjectStorageConstruct,
+    ObjectStorageAttach,
+    ObjectStorageGet,
+    ObjectStorageContains,
+    ObjectStorageDetach,
+    ObjectStorageCount,
+    ObjectStorageGetIterator,
+    ParentAccept,
+    RecursiveCallbackConstruct,
+    RecursiveCallbackAccept,
     GeneratorGetReturn,
     GeneratorClose,
     IteratorCount,
@@ -2399,7 +2468,10 @@ impl TypeChecker {
             );
         }
         if !(method_contract_equal(replacement, parent)
-            || class_name == "CallbackFilterIterator" && method_name == "__construct")
+            || matches!(
+                class_name,
+                "CallbackFilterIterator" | "RecursiveCallbackFilterIterator"
+            ) && method_name == "__construct")
         {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -3833,6 +3905,24 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             | "MapIterator"
                             | "EmptyIterator"
                             | "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "AppendIterator"
+                            | "CachingIterator"
+                            | "RecursiveEntry"
+                            | "RecursiveIteratorIterator"
+                            | "RecursiveCachingIterator"
+                            | "FixedSequence"
+                            | "LinkedList"
+                            | "Queue"
+                            | "Stack"
+                            | "MaxHeap"
+                            | "MinHeap"
+                            | "PriorityQueue"
+                            | "TypedMap"
+                            | "ObjectStorage"
+                            | "ParentIterator"
+                            | "RecursiveCallbackFilterIterator"
                             | "CallbackFilterIterator"
                             | "TraceLine"
                     )
@@ -4310,9 +4400,21 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 name_span,
             } => {
                 let value = match (class_name.as_str(), name.as_str()) {
-                    ("OpenMode", "Read") | ("SeekFrom", "Start") => 0,
-                    ("OpenMode", "Write") | ("SeekFrom", "Current") => 1,
-                    ("OpenMode", "ReadWrite") | ("SeekFrom", "End") => 2,
+                    ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_KEY") => 4,
+                    ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_CURRENT") => 8,
+                    ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_INNER") => 16,
+                    ("CachingIterator" | "RecursiveCachingIterator", "FULL_CACHE") => 256,
+                    ("OpenMode", "Read")
+                    | ("SeekFrom", "Start")
+                    | ("RecursiveIteratorIterator", "LEAVES_ONLY") => 0,
+                    ("OpenMode", "Write")
+                    | ("SeekFrom", "Current")
+                    | ("CachingIterator" | "RecursiveCachingIterator", "CALL_TOSTRING")
+                    | ("RecursiveIteratorIterator", "SELF_FIRST") => 1,
+                    ("OpenMode", "ReadWrite")
+                    | ("SeekFrom", "End")
+                    | ("CachingIterator" | "RecursiveCachingIterator", "CATCH_GET_CHILD")
+                    | ("RecursiveIteratorIterator", "CHILD_FIRST") => 2,
                     _ => {
                         self.diagnostics.push(Diagnostic::error(
                             "name_resolution",
@@ -4323,7 +4425,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         return None;
                     }
                 };
-                if !matches!(class_name.as_str(), "OpenMode" | "SeekFrom") {
+                if !matches!(
+                    class_name.as_str(),
+                    "OpenMode"
+                        | "SeekFrom"
+                        | "CachingIterator"
+                        | "RecursiveCachingIterator"
+                        | "RecursiveIteratorIterator"
+                ) {
                     self.diagnostics.push(Diagnostic::error(
                         "name_resolution",
                         "N0104",
@@ -5303,7 +5412,22 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             };
             let actual = if matches!(
                 class.name.as_str(),
-                "IteratorIterator" | "FilterIterator" | "CallbackFilterIterator"
+                "RecursiveIteratorIterator" | "RecursiveCallbackFilterIterator"
+            ) && target == ArgumentTarget::Parameter(0)
+            {
+                instantiated_ancestor(&value.ty, "RecursiveIterator", self.classes)
+                    .unwrap_or(value.ty)
+            } else if class.name == "InfiniteIterator" && target == ArgumentTarget::Parameter(0) {
+                instantiated_ancestor(&value.ty, "IteratorAggregate", self.classes)
+                    .unwrap_or(value.ty)
+            } else if matches!(
+                class.name.as_str(),
+                "IteratorIterator"
+                    | "LimitIterator"
+                    | "InfiniteIterator"
+                    | "CachingIterator"
+                    | "FilterIterator"
+                    | "CallbackFilterIterator"
             ) && target == ArgumentTarget::Parameter(0)
             {
                 iterator_types(&value.ty, self.classes)
@@ -6929,6 +7053,14 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             &[],
         ),
         (
+            "SeekableIterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Iterator"),
+            &[],
+        ),
+        (
             "OuterIterator",
             NominalKind::Interface,
             true,
@@ -6977,6 +7109,135 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             &["OuterIterator"],
         ),
         (
+            "LimitIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["OuterIterator", "SeekableIterator"],
+        ),
+        (
+            "InfiniteIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["OuterIterator"],
+        ),
+        (
+            "AppendIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "CachingIterator",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["OuterIterator", "MapAccess", "Countable", "Stringable"],
+        ),
+        (
+            "RecursiveIterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Iterator"),
+            &[],
+        ),
+        ("RecursiveEntry", NominalKind::Class, false, true, None, &[]),
+        (
+            "RecursiveIteratorIterator",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "RecursiveCachingIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("CachingIterator"),
+            &["RecursiveIterator"],
+        ),
+        (
+            "FixedSequence",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "MapAccess", "Countable"],
+        ),
+        (
+            "LinkedList",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "Queue",
+            NominalKind::Class,
+            false,
+            true,
+            Some("LinkedList"),
+            &[],
+        ),
+        (
+            "Stack",
+            NominalKind::Class,
+            false,
+            true,
+            Some("LinkedList"),
+            &[],
+        ),
+        (
+            "MaxHeap",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "MinHeap",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "PriorityQueue",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "TypedMap",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "ObjectStorage",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
             "FilterIterator",
             NominalKind::Class,
             true,
@@ -6990,6 +7251,30 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             false,
             true,
             Some("FilterIterator"),
+            &[],
+        ),
+        (
+            "RecursiveFilterIterator",
+            NominalKind::Class,
+            true,
+            false,
+            Some("FilterIterator"),
+            &["RecursiveIterator"],
+        ),
+        (
+            "ParentIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RecursiveFilterIterator"),
+            &[],
+        ),
+        (
+            "RecursiveCallbackFilterIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RecursiveFilterIterator"),
             &[],
         ),
         ("Closeable", NominalKind::Interface, true, false, None, &[]),
@@ -7377,22 +7662,67 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "Traversable",
         "Iterator",
         "IteratorAggregate",
+        "SeekableIterator",
         "OuterIterator",
+        "RecursiveIterator",
         "VectorIterator",
         "Generator",
         "MapIterator",
         "EmptyIterator",
         "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "AppendIterator",
+        "CachingIterator",
+        "RecursiveIterator",
+        "RecursiveEntry",
+        "RecursiveIteratorIterator",
+        "RecursiveCachingIterator",
         "FilterIterator",
         "CallbackFilterIterator",
+        "RecursiveFilterIterator",
+        "ParentIterator",
+        "RecursiveCallbackFilterIterator",
         "Option",
+        "FixedSequence",
+        "LinkedList",
+        "Queue",
+        "Stack",
+        "MaxHeap",
+        "MinHeap",
+        "PriorityQueue",
+        "TypedMap",
+        "ObjectStorage",
         "MapAccess",
     ] {
         let class = classes
             .get_mut(name)
             .expect("iterator prelude nominal exists");
-        let parameters: &[&str] = if matches!(name, "VectorIterator" | "Option") {
+        let parameters: &[&str] = if matches!(
+            name,
+            "VectorIterator"
+                | "Option"
+                | "FixedSequence"
+                | "LinkedList"
+                | "Queue"
+                | "Stack"
+                | "MaxHeap"
+                | "MinHeap"
+                | "PriorityQueue"
+                | "ObjectStorage"
+        ) {
             &["T"]
+        } else if matches!(
+            name,
+            "RecursiveIterator"
+                | "RecursiveEntry"
+                | "RecursiveIteratorIterator"
+                | "RecursiveCachingIterator"
+                | "RecursiveFilterIterator"
+                | "ParentIterator"
+                | "RecursiveCallbackFilterIterator"
+        ) {
+            &["K", "T"]
         } else {
             &["K", "V"]
         };
@@ -7411,25 +7741,45 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             })
             .collect();
     }
-    for name in ["Iterator", "IteratorAggregate", "OuterIterator"] {
+    for name in [
+        "Iterator",
+        "IteratorAggregate",
+        "SeekableIterator",
+        "OuterIterator",
+        "RecursiveIterator",
+    ] {
         let class = classes
             .get_mut(name)
             .expect("iterator prelude nominal exists");
+        let arguments = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
         class.parent_type = Some(Type::Nominal {
-            name: if name == "OuterIterator" {
+            name: if matches!(
+                name,
+                "OuterIterator" | "SeekableIterator" | "RecursiveIterator"
+            ) {
                 "Iterator"
             } else {
                 "Traversable"
             }
             .to_owned(),
-            arguments: class
-                .type_parameters
-                .iter()
-                .map(|parameter| Type::Parameter {
-                    id: parameter.id,
-                    name: parameter.name.clone(),
-                })
-                .collect(),
+            arguments: if name == "RecursiveIterator" {
+                vec![
+                    arguments[0].clone(),
+                    Type::Nominal {
+                        name: "RecursiveEntry".to_owned(),
+                        arguments: arguments.clone(),
+                    },
+                ]
+            } else {
+                arguments
+            },
         });
     }
 
@@ -7439,6 +7789,11 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "MapIterator",
         "EmptyIterator",
         "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "AppendIterator",
+        "CachingIterator",
+        "RecursiveIteratorIterator",
         "FilterIterator",
     ] {
         let class = classes.get_mut(name).expect("native iterator exists");
@@ -7456,13 +7811,166 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             parameters
         };
         class.interface_types = vec![Type::Nominal {
-            name: if matches!(name, "IteratorIterator" | "FilterIterator") {
+            name: if matches!(
+                name,
+                "IteratorIterator"
+                    | "LimitIterator"
+                    | "InfiniteIterator"
+                    | "CachingIterator"
+                    | "FilterIterator"
+            ) {
                 "OuterIterator"
             } else {
                 "Iterator"
             }
             .to_owned(),
             arguments,
+        }];
+        if name == "LimitIterator" {
+            class.interface_types.push(Type::Nominal {
+                name: "SeekableIterator".to_owned(),
+                arguments: class
+                    .type_parameters
+                    .iter()
+                    .map(|p| Type::Parameter {
+                        id: p.id,
+                        name: p.name.clone(),
+                    })
+                    .collect(),
+            });
+        }
+        if name == "CachingIterator" {
+            class.interface_types.extend([
+                Type::Nominal {
+                    name: "MapAccess".to_owned(),
+                    arguments: class
+                        .type_parameters
+                        .iter()
+                        .map(|p| Type::Parameter {
+                            id: p.id,
+                            name: p.name.clone(),
+                        })
+                        .collect(),
+                },
+                Type::Object("Countable".to_owned()),
+                Type::Object("Stringable".to_owned()),
+            ]);
+        }
+    }
+    {
+        let class = classes
+            .get_mut("FixedSequence")
+            .expect("fixed sequence exists");
+        let element = Type::Parameter {
+            id: class.type_parameters[0].id,
+            name: class.type_parameters[0].name.clone(),
+        };
+        let slot = normalize_union(vec![element, Type::Null]);
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, slot.clone()],
+            },
+            Type::Nominal {
+                name: "MapAccess".to_owned(),
+                arguments: vec![Type::Int, slot],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes.get_mut("LinkedList").expect("linked list exists");
+        let element = Type::Parameter {
+            id: class.type_parameters[0].id,
+            name: class.type_parameters[0].name.clone(),
+        };
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, element],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    for name in ["Queue", "Stack"] {
+        let class = classes.get_mut(name).expect("list adapter exists");
+        class.parent_type = Some(Type::Nominal {
+            name: "LinkedList".to_owned(),
+            arguments: vec![Type::Parameter {
+                id: class.type_parameters[0].id,
+                name: class.type_parameters[0].name.clone(),
+            }],
+        });
+    }
+    for name in ["MaxHeap", "MinHeap", "PriorityQueue"] {
+        let class = classes.get_mut(name).expect("native heap exists");
+        let element = Type::Parameter {
+            id: class.type_parameters[0].id,
+            name: class.type_parameters[0].name.clone(),
+        };
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, element],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes.get_mut("TypedMap").expect("typed map exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: params,
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes
+            .get_mut("ObjectStorage")
+            .expect("object storage exists");
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, Type::Mixed],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes
+            .get_mut("RecursiveCachingIterator")
+            .expect("recursive caching iterator exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.parent_type = Some(Type::Nominal {
+            name: "CachingIterator".to_owned(),
+            arguments: vec![
+                params[0].clone(),
+                Type::Nominal {
+                    name: "RecursiveEntry".to_owned(),
+                    arguments: params.clone(),
+                },
+            ],
+        });
+        class.interface_types = vec![Type::Nominal {
+            name: "RecursiveIterator".to_owned(),
+            arguments: params,
         }];
     }
     {
@@ -7471,6 +7979,49 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             .expect("callback iterator exists");
         class.parent_type = Some(Type::Nominal {
             name: "FilterIterator".to_owned(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|p| Type::Parameter {
+                    id: p.id,
+                    name: p.name.clone(),
+                })
+                .collect(),
+        });
+    }
+    {
+        let class = classes
+            .get_mut("RecursiveFilterIterator")
+            .expect("recursive filter exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.parent_type = Some(Type::Nominal {
+            name: "FilterIterator".to_owned(),
+            arguments: vec![
+                params[0].clone(),
+                Type::Nominal {
+                    name: "RecursiveEntry".to_owned(),
+                    arguments: params.clone(),
+                },
+            ],
+        });
+        class.interface_types = vec![Type::Nominal {
+            name: "RecursiveIterator".to_owned(),
+            arguments: params,
+        }];
+    }
+    for name in ["ParentIterator", "RecursiveCallbackFilterIterator"] {
+        let class = classes
+            .get_mut(name)
+            .expect("recursive filter adapter exists");
+        class.parent_type = Some(Type::Nominal {
+            name: "RecursiveFilterIterator".to_owned(),
             arguments: class
                 .type_parameters
                 .iter()
@@ -7519,6 +8070,26 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                 ),
                 name: property_name.to_owned(),
                 ty,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
+    }
+    for (name, slots) in [
+        ("CachingIterator", 10),
+        ("LinkedList", 1),
+        ("RecursiveIteratorIterator", 10),
+    ] {
+        let class = classes.get_mut(name).expect("native class exists");
+        for slot in 0..slots {
+            class.declared_properties.push(Property {
+                id: PropertyId(slot),
+                name: format!("__native_slot_{slot}"),
+                ty: Type::Mixed,
                 visibility: Visibility::Private,
                 declaring_class: class.id,
                 default: None,
@@ -7843,6 +8414,10 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "MapIterator",
         "EmptyIterator",
         "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "AppendIterator",
+        "CachingIterator",
     ] {
         let parameters = classes[name].type_parameters.clone();
         let params = parameters
@@ -7874,6 +8449,55 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                 None,
                 Span::empty(0),
             )],
+            "LimitIterator" => vec![
+                native_parameter(
+                    "iterator",
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: params.clone(),
+                    },
+                    None,
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "offset",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "limit",
+                    Type::Int,
+                    Some(ExprKind::Integer(-1)),
+                    Span::empty(0),
+                ),
+            ],
+            "InfiniteIterator" => vec![native_parameter(
+                "source",
+                Type::Nominal {
+                    name: "IteratorAggregate".to_owned(),
+                    arguments: params.clone(),
+                },
+                None,
+                Span::empty(0),
+            )],
+            "CachingIterator" => vec![
+                native_parameter(
+                    "iterator",
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: params.clone(),
+                    },
+                    None,
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(1)),
+                    Span::empty(0),
+                ),
+            ],
             _ => vec![],
         };
         add_native_method(
@@ -7958,23 +8582,859 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             );
         }
     }
-    let params = classes["IteratorIterator"].type_parameters.clone();
+    for name in [
+        "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "CachingIterator",
+    ] {
+        let params = classes[name]
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        add_native_method(
+            &mut classes,
+            name,
+            "getInnerIterator",
+            Some(Builtin::IteratorGetInner),
+            false,
+            vec![],
+            Type::Nominal {
+                name: "Iterator".to_owned(),
+                arguments: params,
+            },
+            false,
+        );
+    }
+    for name in ["ParentIterator", "RecursiveCallbackFilterIterator"] {
+        let params = classes[name]
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let entry = Type::Nominal {
+            name: "RecursiveEntry".to_owned(),
+            arguments: params.clone(),
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "accept",
+            Some(if name == "ParentIterator" {
+                Builtin::ParentAccept
+            } else {
+                Builtin::RecursiveCallbackAccept
+            }),
+            false,
+            vec![
+                native_parameter("value", entry.clone(), None, Span::empty(0)),
+                native_parameter("key", params[0].clone(), None, Span::empty(0)),
+            ],
+            Type::Bool,
+            false,
+        );
+        if name == "RecursiveCallbackFilterIterator" {
+            add_native_method(
+                &mut classes,
+                name,
+                "__construct",
+                Some(Builtin::RecursiveCallbackConstruct),
+                false,
+                vec![
+                    native_parameter(
+                        "iterator",
+                        Type::Nominal {
+                            name: "RecursiveIterator".to_owned(),
+                            arguments: params.clone(),
+                        },
+                        None,
+                        Span::empty(0),
+                    ),
+                    native_parameter(
+                        "callback",
+                        Type::Callable(vec![entry, params[0].clone()], Box::new(Type::Bool)),
+                        None,
+                        Span::empty(0),
+                    ),
+                ],
+                Type::Void,
+                false,
+            );
+        }
+    }
     add_native_method(
         &mut classes,
-        "IteratorIterator",
-        "getInnerIterator",
-        Some(Builtin::IteratorGetInner),
+        "LimitIterator",
+        "seek",
+        Some(Builtin::LimitSeek),
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "SeekableIterator",
+        "seek",
+        None,
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "LimitIterator",
+        "getPosition",
+        Some(Builtin::LimitGetPosition),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+    let append_params = classes["AppendIterator"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let append_inner = Type::Nominal {
+        name: "Iterator".to_owned(),
+        arguments: append_params.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "AppendIterator",
+        "append",
+        Some(Builtin::AppendAdd),
+        false,
+        vec![native_parameter(
+            "iterator",
+            append_inner.clone(),
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    let cache_params = classes["CachingIterator"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let cache_key = cache_params[0].clone();
+    let cache_value = cache_params[1].clone();
+    for (name, builtin, result) in [
+        ("hasNext", Builtin::CachingHasNext, Type::Bool),
+        ("count", Builtin::CachingCount, Type::Int),
+        (
+            "getCache",
+            Builtin::CachingGetCache,
+            Type::Map(Box::new(cache_key.clone()), Box::new(cache_value.clone())),
+        ),
+        ("getFlags", Builtin::CachingGetFlags, Type::Int),
+        ("__toString", Builtin::CachingToString, Type::String),
+    ] {
+        add_native_method(
+            &mut classes,
+            "CachingIterator",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "CachingIterator",
+        "setFlags",
+        Some(Builtin::CachingSetFlags),
+        false,
+        vec![native_parameter("flags", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        ("offsetExists", Builtin::CachingOffsetExists, Type::Bool),
+        ("offsetGet", Builtin::CachingOffsetGet, cache_value.clone()),
+        ("offsetUnset", Builtin::CachingOffsetUnset, Type::Void),
+    ] {
+        add_native_method(
+            &mut classes,
+            "CachingIterator",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "offset",
+                cache_key.clone(),
+                None,
+                Span::empty(0),
+            )],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "CachingIterator",
+        "offsetSet",
+        Some(Builtin::CachingOffsetSet),
+        false,
+        vec![
+            native_parameter(
+                "offset",
+                normalize_union(vec![cache_key, Type::Null]),
+                None,
+                Span::empty(0),
+            ),
+            native_parameter("value", cache_value, None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    let fixed_param = &classes["FixedSequence"].type_parameters[0];
+    let fixed_element = normalize_union(vec![
+        Type::Parameter {
+            id: fixed_param.id,
+            name: fixed_param.name.clone(),
+        },
+        Type::Null,
+    ]);
+    add_native_method(
+        &mut classes,
+        "FixedSequence",
+        "__construct",
+        Some(Builtin::FixedConstruct),
+        false,
+        vec![native_parameter(
+            "size",
+            Type::Int,
+            Some(ExprKind::Integer(0)),
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        ("getSize", Builtin::FixedGetSize, Type::Int),
+        ("count", Builtin::FixedGetSize, Type::Int),
+        (
+            "getIterator",
+            Builtin::FixedGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: vec![Type::Int, fixed_element.clone()],
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "FixedSequence",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "FixedSequence",
+        "setSize",
+        Some(Builtin::FixedSetSize),
+        false,
+        vec![native_parameter("size", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        ("offsetExists", Builtin::FixedOffsetExists, Type::Bool),
+        ("offsetGet", Builtin::FixedOffsetGet, fixed_element.clone()),
+        ("offsetUnset", Builtin::FixedOffsetUnset, Type::Void),
+    ] {
+        add_native_method(
+            &mut classes,
+            "FixedSequence",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "FixedSequence",
+        "offsetSet",
+        Some(Builtin::FixedOffsetSet),
+        false,
+        vec![
+            native_parameter(
+                "offset",
+                normalize_union(vec![Type::Int, Type::Null]),
+                None,
+                Span::empty(0),
+            ),
+            native_parameter("value", fixed_element, None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    let list_param = &classes["LinkedList"].type_parameters[0];
+    let list_element = Type::Parameter {
+        id: list_param.id,
+        name: list_param.name.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "LinkedList",
+        "__construct",
+        Some(Builtin::ListConstruct),
+        false,
+        vec![],
+        Type::Void,
+        false,
+    );
+    for (name, builtin) in [
+        ("push", Builtin::ListPush),
+        ("unshift", Builtin::ListUnshift),
+    ] {
+        add_native_method(
+            &mut classes,
+            "LinkedList",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "value",
+                list_element.clone(),
+                None,
+                Span::empty(0),
+            )],
+            Type::Void,
+            false,
+        );
+    }
+    for (name, builtin) in [
+        ("pop", Builtin::ListPop),
+        ("shift", Builtin::ListShift),
+        ("top", Builtin::ListTop),
+        ("bottom", Builtin::ListBottom),
+    ] {
+        add_native_method(
+            &mut classes,
+            "LinkedList",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            list_element.clone(),
+            false,
+        );
+    }
+    for (name, builtin, result) in [
+        ("count", Builtin::ListCount, Type::Int),
+        ("isEmpty", Builtin::ListIsEmpty, Type::Bool),
+        (
+            "toVector",
+            Builtin::ListToVector,
+            Type::Vector(Box::new(list_element.clone())),
+        ),
+        (
+            "getIterator",
+            Builtin::ListGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: vec![Type::Int, list_element.clone()],
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "LinkedList",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    let queue_param = &classes["Queue"].type_parameters[0];
+    let queue_element = Type::Parameter {
+        id: queue_param.id,
+        name: queue_param.name.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "Queue",
+        "enqueue",
+        Some(Builtin::ListPush),
+        false,
+        vec![native_parameter(
+            "value",
+            queue_element.clone(),
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Queue",
+        "dequeue",
+        Some(Builtin::ListShift),
+        false,
+        vec![],
+        queue_element,
+        false,
+    );
+    for name in ["MaxHeap", "MinHeap", "PriorityQueue"] {
+        let param = &classes[name].type_parameters[0];
+        let element = Type::Parameter {
+            id: param.id,
+            name: param.name.clone(),
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(Builtin::HeapConstruct),
+            false,
+            vec![],
+            Type::Void,
+            false,
+        );
+        let mut insert_params = vec![native_parameter(
+            "value",
+            element.clone(),
+            None,
+            Span::empty(0),
+        )];
+        if name == "PriorityQueue" {
+            insert_params.push(native_parameter(
+                "priority",
+                Type::Int,
+                None,
+                Span::empty(0),
+            ));
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "insert",
+            Some(Builtin::HeapInsert),
+            false,
+            insert_params,
+            Type::Void,
+            false,
+        );
+        for (method, builtin, result) in [
+            ("top", Builtin::HeapTop, element.clone()),
+            ("extract", Builtin::HeapExtract, element.clone()),
+            ("count", Builtin::HeapCount, Type::Int),
+            ("isEmpty", Builtin::HeapIsEmpty, Type::Bool),
+            (
+                "getIterator",
+                Builtin::HeapGetIterator,
+                Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, element.clone()],
+                },
+            ),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    let map_params = classes["TypedMap"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    add_native_method(
+        &mut classes,
+        "TypedMap",
+        "__construct",
+        Some(Builtin::TypedMapConstruct),
+        false,
+        vec![],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "TypedMap",
+        "set",
+        Some(Builtin::TypedMapSet),
+        false,
+        vec![
+            native_parameter("key", map_params[0].clone(), None, Span::empty(0)),
+            native_parameter("value", map_params[1].clone(), None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        (
+            "get",
+            Builtin::TypedMapGet,
+            normalize_union(vec![map_params[1].clone(), Type::Null]),
+        ),
+        ("contains", Builtin::TypedMapContains, Type::Bool),
+        ("remove", Builtin::TypedMapRemove, Type::Bool),
+    ] {
+        add_native_method(
+            &mut classes,
+            "TypedMap",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "key",
+                map_params[0].clone(),
+                None,
+                Span::empty(0),
+            )],
+            result,
+            false,
+        );
+    }
+    for (name, builtin, result) in [
+        ("count", Builtin::TypedMapCount, Type::Int),
+        (
+            "toMap",
+            Builtin::TypedMapToMap,
+            Type::Map(
+                Box::new(map_params[0].clone()),
+                Box::new(map_params[1].clone()),
+            ),
+        ),
+        (
+            "getIterator",
+            Builtin::TypedMapGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: map_params.clone(),
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "TypedMap",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    let storage_param = &classes["ObjectStorage"].type_parameters[0];
+    let storage_value = Type::Parameter {
+        id: storage_param.id,
+        name: storage_param.name.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "ObjectStorage",
+        "__construct",
+        Some(Builtin::ObjectStorageConstruct),
+        false,
+        vec![],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "ObjectStorage",
+        "attach",
+        Some(Builtin::ObjectStorageAttach),
+        false,
+        vec![
+            native_parameter("object", Type::Mixed, None, Span::empty(0)),
+            native_parameter("data", storage_value.clone(), None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        (
+            "get",
+            Builtin::ObjectStorageGet,
+            normalize_union(vec![storage_value, Type::Null]),
+        ),
+        ("contains", Builtin::ObjectStorageContains, Type::Bool),
+        ("detach", Builtin::ObjectStorageDetach, Type::Bool),
+    ] {
+        add_native_method(
+            &mut classes,
+            "ObjectStorage",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "object",
+                Type::Mixed,
+                None,
+                Span::empty(0),
+            )],
+            result,
+            false,
+        );
+    }
+    for (name, builtin, result) in [
+        ("count", Builtin::ObjectStorageCount, Type::Int),
+        (
+            "getIterator",
+            Builtin::ObjectStorageGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: vec![Type::Int, Type::Mixed],
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "ObjectStorage",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    let key_param = &classes["RecursiveEntry"].type_parameters[0];
+    let entry_key = Type::Parameter {
+        id: key_param.id,
+        name: key_param.name.clone(),
+    };
+    let entry_param = &classes["RecursiveEntry"].type_parameters[1];
+    let entry_value = Type::Parameter {
+        id: entry_param.id,
+        name: entry_param.name.clone(),
+    };
+    let entry_children = normalize_union(vec![
+        Type::Nominal {
+            name: "RecursiveIterator".to_owned(),
+            arguments: vec![entry_key, entry_value.clone()],
+        },
+        Type::Null,
+    ]);
+    add_native_method(
+        &mut classes,
+        "RecursiveEntry",
+        "__construct",
+        Some(Builtin::RecursiveEntryConstruct),
+        false,
+        vec![
+            native_parameter("value", entry_value.clone(), None, Span::empty(0)),
+            native_parameter(
+                "children",
+                entry_children.clone(),
+                Some(ExprKind::Null),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveEntry",
+        "value",
+        Some(Builtin::RecursiveEntryValue),
+        false,
+        vec![],
+        entry_value,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveEntry",
+        "children",
+        Some(Builtin::RecursiveEntryChildren),
+        false,
+        vec![],
+        entry_children,
+        false,
+    );
+    let walk_params = classes["RecursiveIteratorIterator"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let recursive_source = Type::Nominal {
+        name: "RecursiveIterator".to_owned(),
+        arguments: walk_params.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "__construct",
+        Some(Builtin::RecursiveWalkConstruct),
+        false,
+        vec![
+            native_parameter("iterator", recursive_source.clone(), None, Span::empty(0)),
+            native_parameter(
+                "mode",
+                Type::Int,
+                Some(ExprKind::Integer(0)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    for (method, builtin, result) in [
+        ("rewind", Builtin::IteratorRewind, Type::Void),
+        ("valid", Builtin::IteratorValid, Type::Bool),
+        ("key", Builtin::IteratorKey, walk_params[0].clone()),
+        ("value", Builtin::IteratorValue, walk_params[1].clone()),
+        ("advance", Builtin::IteratorAdvance, Type::Void),
+    ] {
+        add_native_method(
+            &mut classes,
+            "RecursiveIteratorIterator",
+            method,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "setMaxDepth",
+        Some(Builtin::RecursiveWalkSetMaxDepth),
+        false,
+        vec![native_parameter(
+            "max_depth",
+            Type::Int,
+            Some(ExprKind::Integer(-1)),
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getMaxDepth",
+        Some(Builtin::RecursiveWalkGetMaxDepth),
+        false,
+        vec![],
+        normalize_union(vec![Type::Int, Type::Bool]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getDepth",
+        Some(Builtin::RecursiveWalkGetDepth),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getSubIterator",
+        Some(Builtin::RecursiveWalkGetSubIterator),
+        false,
+        vec![native_parameter(
+            "level",
+            normalize_union(vec![Type::Int, Type::Null]),
+            Some(ExprKind::Null),
+            Span::empty(0),
+        )],
+        normalize_union(vec![recursive_source.clone(), Type::Null]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getRecursiveIterator",
+        Some(Builtin::RecursiveWalkGetRecursiveIterator),
+        false,
+        vec![],
+        recursive_source,
+        false,
+    );
+    for name in [
+        "beginIteration",
+        "beginChildren",
+        "endChildren",
+        "endIteration",
+        "nextElement",
+    ] {
+        add_native_method(
+            &mut classes,
+            "RecursiveIteratorIterator",
+            name,
+            Some(Builtin::RecursiveWalkHook),
+            false,
+            vec![],
+            Type::Void,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "AppendIterator",
+        "getIteratorIndex",
+        Some(Builtin::AppendGetIndex),
+        false,
+        vec![],
+        normalize_union(vec![Type::Int, Type::Null]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "AppendIterator",
+        "getArrayIterator",
+        Some(Builtin::AppendGetIterator),
         false,
         vec![],
         Type::Nominal {
-            name: "Iterator".to_owned(),
-            arguments: params
-                .iter()
-                .map(|p| Type::Parameter {
-                    id: p.id,
-                    name: p.name.clone(),
-                })
-                .collect(),
+            name: "VectorIterator".to_owned(),
+            arguments: vec![append_inner],
         },
         false,
     );

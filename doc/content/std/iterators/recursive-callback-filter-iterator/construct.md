@@ -11,7 +11,7 @@ parameters:
     type: RecursiveIterator<K, T>
     description: Iterator wrapped or consumed by this operation.
   - name: callback
-    type: callable
+    type: callable<RecursiveEntry<K, T>, K, bool>
     description: Callable invoked by this operation.
 returns:
   type: void
@@ -23,10 +23,8 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This experimental recursive filtering member is implemented.
 version: "0.1"
 owner: std.spl.RecursiveCallbackFilterIterator
 visibility: public

@@ -7,6 +7,22 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-07
+
+### Added
+
+- std: Added `SeekableIterator`, `LimitIterator`, `InfiniteIterator`, `AppendIterator`, and `CachingIterator` with native cursor behavior.
+- std: Added `RecursiveIterator<K, T>`, `RecursiveEntry<K, T>`, depth-first `RecursiveIteratorIterator`, and `RecursiveCachingIterator`.
+- std: Added recursive filter, parent, and callback adapters with child policy propagation.
+- std: Added `FixedSequence<T>` with checked nullable slots and iterator snapshots.
+- std: Added `LinkedList<T>`, `Queue<T>`, and `Stack<T>` with checked removals and aggregate iterator snapshots.
+- std: Added `MaxHeap<T>`, `MinHeap<T>`, and `PriorityQueue<T>` with ordered extraction and snapshot traversal.
+- std: Added `ObjectStorage<T>` and `TypedMap<K, V>` with identity and insertion-order semantics.
+
+### Changed
+
+- runtime: Advanced the bytecode schema to version 8 for iterator adapters and recursive traversal.
+
 ## [0.8.0] - 2026-10-05
 
 ### Added

@@ -8,7 +8,7 @@ order: 2
 typeParameters: []
 parameters: []
 returns:
-  type: ?RecursiveIterator<mixed, T>
+  type: ?RecursiveIterator<K, T>
   description: Returns a cursor iterator for the entry's children, or null when it is a leaf.
 errors:
   - description:
@@ -16,10 +16,8 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.RecursiveEntry
 visibility: public

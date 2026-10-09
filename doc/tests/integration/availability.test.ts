@@ -78,7 +78,7 @@ describe("0.2.0 contract availability", () => {
     );
   });
 
-  it("implements iterator protocols while keeping traversal adapters proposed", async () => {
+  it("marks implemented recursive adapters and leaves future adapters proposed", async () => {
     const model = await createModel({ root });
     const protocolPages = model.pages.filter(
       (page) =>
@@ -104,6 +104,23 @@ describe("0.2.0 contract availability", () => {
         (page) => page.source.data.availability === "implemented",
       ),
     ).toBe(true);
+    for (const name of [
+      "RecursiveIteratorIterator",
+      "RecursiveCachingIterator",
+      "RecursiveFilterIterator",
+      "ParentIterator",
+      "RecursiveCallbackFilterIterator",
+    ]) {
+      expect(
+        model.pages.find((page) => page.source.data.id === `std.spl.${name}`)
+          ?.source.data.availability,
+      ).toBe("implemented");
+    }
+    expect(
+      model.pages.find(
+        (page) => page.source.data.id === "std.spl.RecursiveTreeIterator",
+      )?.source.data.availability,
+    ).toBe("proposed");
 
     const status = model.pages.find(
       (page) => page.source.data.id === "guide.implementationStatus",

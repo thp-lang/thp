@@ -22,10 +22,8 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.InfiniteIterator
 visibility: public

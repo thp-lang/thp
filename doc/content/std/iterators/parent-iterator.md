@@ -19,10 +19,8 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: This experimental recursive filter is implemented for entries with children.
 version: "0.1"
 ---
 

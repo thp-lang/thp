@@ -38,7 +38,7 @@ followed unless enabled because link cycles can make traversal unbounded.
 
 PHP uses `FilesystemIterator` flags and separate child-inspection methods.
 THP uses explicit booleans and carries an optional child iterator directly in
-each `RecursiveEntry<SplFileInfo>`; full pathnames are exposed as cursor keys.
+each `RecursiveEntry<string, SplFileInfo>`; full pathnames are exposed as cursor keys.
 
 ## Errors
 

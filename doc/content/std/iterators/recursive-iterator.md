@@ -14,14 +14,12 @@ interfaces:
   - id: std.baseTypes.Iterator
     arguments:
       - K
-      - RecursiveEntry<T>
+      - RecursiveEntry<K, T>
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired interface contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: Implementations are checked through the inherited Iterator cursor methods.
 version: "0.1"
 ---
 
@@ -30,7 +28,7 @@ version: "0.1"
 ## Contract
 
 While `valid()` is true, `key()` returns `K` directly and `value()` returns a
-`RecursiveEntry<T>`. That entry exposes the logical value and its optional
+`RecursiveEntry<K, T>`. That entry exposes the logical value and its optional
 child iterator. Child iterators have independent cursor state and are
 unaffected by later advancement of the parent.
 
@@ -42,11 +40,7 @@ if ($iterator->valid()) {
     $entry = $iterator->value();
     echo $entry->value();
 
-    if ($entry->children() !== null) {
-        foreach ($entry->children() as $child) {
-            echo $child->value();
-        }
-    }
+    echo $entry->children() !== null;
 }
 ```
 

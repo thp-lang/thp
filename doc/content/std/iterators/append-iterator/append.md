@@ -15,14 +15,12 @@ returns:
   description: This method does not return a value.
 errors:
   - description:
-      No additional runtime failure beyond parameter validation and failures
-      propagated by delegated operations is specified.
+      Throws LogicException if traversal has started. Allocation failure while
+      growing the iterator list also propagates.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.AppendIterator
 visibility: public

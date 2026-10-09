@@ -15,14 +15,12 @@ returns:
   description: This method does not return a value.
 errors:
   - description:
-      The operation fails when the requested position is invalid or the
-      underlying source cannot seek.
+      Throws OutOfBoundsException for a negative or unavailable view position.
+      Rewinding or advancing the inner iterator may also fail.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.LimitIterator
 visibility: public
