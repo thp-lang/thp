@@ -8,9 +8,13 @@ order: 40
 status: experimental
 availability: partial
 notice:
-  Native collection iterators, EmptyIterator, IteratorIterator, FilterIterator,
-  CallbackFilterIterator, OuterIterator, and four consuming functions are
-  implemented. Other adapters remain proposed.
+  Native collection iterators, EmptyIterator, IteratorIterator, LimitIterator,
+  InfiniteIterator, AppendIterator, CachingIterator, FilterIterator, CallbackFilterIterator,
+  OuterIterator, SeekableIterator, and four consuming functions are implemented.
+  RecursiveIterator, RecursiveEntry, RecursiveIteratorIterator, RecursiveCachingIterator,
+  RecursiveFilterIterator, ParentIterator, and RecursiveCallbackFilterIterator are
+  implemented. Filesystem, regex, tree formatting, and other iterator classes
+  remain proposed.
 ---
 
 | Family                | Classes                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |

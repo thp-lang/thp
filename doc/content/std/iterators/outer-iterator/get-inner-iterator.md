@@ -12,8 +12,8 @@ returns:
   description: Returns the wrapped iterator.
 errors:
   - description:
-      No additional runtime failure beyond parameter validation and failures
-      propagated by delegated operations is specified.
+      Fails if the adapter has no active inner iterator; delegated failures
+      also propagate.
 related: []
 status: experimental
 availability: implemented

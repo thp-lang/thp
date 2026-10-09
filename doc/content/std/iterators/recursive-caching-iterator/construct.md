@@ -10,10 +10,10 @@ parameters:
   - name: iterator
     type: RecursiveIterator<K, T>
     description: Iterator wrapped or consumed by this operation.
-  - name: full_cache
-    type: bool
-    description: Retain every visited entry when true.
-    default: "false"
+  - name: flags
+    type: int
+    description: CachingIterator flags; FULL_CACHE retains visited entries.
+    default: "0"
 returns:
   type: void
   description: This callable does not return a value.
@@ -24,10 +24,8 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This experimental recursive caching member is implemented.
 version: "0.1"
 owner: std.spl.RecursiveCachingIterator
 visibility: public

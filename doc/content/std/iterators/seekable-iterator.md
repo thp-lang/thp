@@ -18,10 +18,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired interface contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: This interface and LimitIterator::seek() are executable.
 version: "0.1"
 ---
 
@@ -32,8 +30,7 @@ zero-based traversal offset.
 
 `seek()` positions the cursor at the requested zero-based traversal offset.
 After a successful call, `valid()` is true and `key()` and `value()` expose the
-selected element. Negative or unavailable positions fail; the concrete THP
-error type is unsettled.
+selected element. Negative or unavailable positions fail; they throw OutOfBoundsException.
 
 ## Example
 

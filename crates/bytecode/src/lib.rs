@@ -17,7 +17,7 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 7;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInfo {
@@ -1332,8 +1332,10 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                     instantiate_descriptor_method(inherited, class.parent_type.as_ref(), parent);
                 if method.slot != inherited.slot
                     || !(method_signature_equal(method, &inherited)
-                        || class.name == "CallbackFilterIterator"
-                            && inherited.name == "__construct")
+                        || matches!(
+                            class.name.as_str(),
+                            "CallbackFilterIterator" | "RecursiveCallbackFilterIterator"
+                        ) && inherited.name == "__construct")
                     || visibility_rank(method.visibility) < visibility_rank(inherited.visibility)
                     || (method.declaring_class == inherited.declaring_class
                         && method.callee != inherited.callee)
@@ -1478,6 +1480,22 @@ fn method_signature_equal(left: &Method, right: &Method) -> bool {
         && left.return_type == right.return_type
 }
 
+fn normalize_union(members: Vec<Type>) -> Type {
+    let mut flat = Vec::new();
+    for member in members {
+        match member {
+            Type::Union(nested) => flat.extend(nested),
+            member => flat.push(member),
+        }
+    }
+    flat.sort_by_key(ToString::to_string);
+    flat.dedup();
+    match flat.as_slice() {
+        [single] => single.clone(),
+        _ => Type::Union(flat),
+    }
+}
+
 fn substitute_descriptor_type(
     ty: &Type,
     instantiated: Option<&NominalType>,
@@ -1503,15 +1521,12 @@ fn substitute_descriptor_type(
                     .collect(),
                 Box::new(apply(result, substitutions)),
             ),
-            Type::Union(members) => {
-                let mut members = members
+            Type::Union(members) => normalize_union(
+                members
                     .iter()
                     .map(|member| apply(member, substitutions))
-                    .collect::<Vec<_>>();
-                members.sort_by_key(ToString::to_string);
-                members.dedup();
-                Type::Union(members)
-            }
+                    .collect(),
+            ),
             Type::Nominal { name, arguments } => Type::Nominal {
                 name: name.clone(),
                 arguments: arguments
@@ -2407,6 +2422,24 @@ fn verify_instruction(
                             | "MapIterator"
                             | "EmptyIterator"
                             | "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "AppendIterator"
+                            | "CachingIterator"
+                            | "RecursiveCachingIterator"
+                            | "FixedSequence"
+                            | "LinkedList"
+                            | "Queue"
+                            | "Stack"
+                            | "MaxHeap"
+                            | "MinHeap"
+                            | "PriorityQueue"
+                            | "TypedMap"
+                            | "ObjectStorage"
+                            | "ParentIterator"
+                            | "RecursiveCallbackFilterIterator"
+                            | "RecursiveEntry"
+                            | "RecursiveIteratorIterator"
                             | "CallbackFilterIterator"
                             | "TraceLine"
                     ))
@@ -3016,45 +3049,71 @@ fn verify_builtin_call(
             else {
                 return Err("invalid iterator constructor receiver".to_owned());
             };
+            let caching =
+                encoded_nominal_ancestor_arguments(program, argument_type(0), "CachingIterator");
             let expected_argument = match (name, type_arguments) {
                 ("VectorIterator", [value]) => Some(Type::Vector(Box::new(value.clone()))),
                 ("MapIterator", [key, value]) => {
                     Some(Type::Map(Box::new(key.clone()), Box::new(value.clone())))
                 }
                 (
-                    "IteratorIterator" | "FilterIterator" | "CallbackFilterIterator",
+                    "IteratorIterator"
+                    | "LimitIterator"
+                    | "CachingIterator"
+                    | "FilterIterator"
+                    | "CallbackFilterIterator",
                     [key, value],
                 ) => Some(Type::Nominal {
                     name: "Iterator".to_owned(),
                     arguments: vec![key.clone(), value.clone()],
                 }),
-                ("EmptyIterator", [_, _]) => None,
+                ("InfiniteIterator", [key, value]) => Some(Type::Nominal {
+                    name: "IteratorAggregate".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                }),
+                ("RecursiveCachingIterator", [key, value]) => Some(Type::Nominal {
+                    name: "RecursiveIterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                }),
+                ("EmptyIterator" | "AppendIterator", [_, _]) => None,
                 _ => {
-                    let Some(filter) = class_by_name(program, "FilterIterator") else {
-                        return Err("FilterIterator metadata is missing".to_owned());
-                    };
-                    let Some(instantiation) =
-                        instantiation_for_class(program, argument_type(0), filter.id)
-                    else {
-                        return Err("invalid iterator constructor receiver".to_owned());
-                    };
-                    let [key, value] = instantiation.arguments.as_slice() else {
-                        return Err("invalid filter iterator type".to_owned());
-                    };
-                    Some(Type::Nominal {
-                        name: "Iterator".to_owned(),
-                        arguments: vec![key.clone(), value.clone()],
-                    })
+                    if let Some([key, value]) = caching.as_deref() {
+                        Some(Type::Nominal {
+                            name: "Iterator".to_owned(),
+                            arguments: vec![key.clone(), value.clone()],
+                        })
+                    } else {
+                        let Some(filter) = class_by_name(program, "FilterIterator") else {
+                            return Err("FilterIterator metadata is missing".to_owned());
+                        };
+                        let Some(instantiation) =
+                            instantiation_for_class(program, argument_type(0), filter.id)
+                        else {
+                            return Err("invalid iterator constructor receiver".to_owned());
+                        };
+                        let [key, value] = instantiation.arguments.as_slice() else {
+                            return Err("invalid filter iterator type".to_owned());
+                        };
+                        Some(Type::Nominal {
+                            name: "Iterator".to_owned(),
+                            arguments: vec![key.clone(), value.clone()],
+                        })
+                    }
                 }
             };
             if (builtin == Builtin::CallbackFilterConstruct) != (name == "CallbackFilterIterator")
                 || arguments.len()
                     != 1 + usize::from(expected_argument.is_some())
                         + usize::from(name == "CallbackFilterIterator")
+                        + usize::from(name == "LimitIterator") * 2
+                        + usize::from(caching.is_some())
                 || result != Some(&Type::Void)
                 || expected_argument
                     .as_ref()
                     .is_some_and(|expected| !type_accepts(program, expected, argument_type(1)))
+                || (name == "LimitIterator"
+                    && (argument_type(2) != &Type::Int || argument_type(3) != &Type::Int))
+                || (caching.is_some() && argument_type(2) != &Type::Int)
                 || (name == "CallbackFilterIterator"
                     && argument_type(2)
                         != &Type::Callable(
@@ -3084,14 +3143,24 @@ fn verify_builtin_call(
                         .map(|base| is_instance_of_id(program, class.id, base.id))
                 })
                 .unwrap_or(false);
+            let caching =
+                encoded_nominal_ancestor_arguments(program, argument_type(0), "CachingIterator")
+                    .is_some();
             if arguments.len() != 1
                 || (!filter
+                    && !caching
                     && !matches!(
                         name,
                         "VectorIterator"
                             | "MapIterator"
                             | "EmptyIterator"
                             | "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "AppendIterator"
+                            | "CachingIterator"
+                            | "RecursiveCachingIterator"
+                            | "RecursiveIteratorIterator"
                             | "Generator"
                     ))
             {
@@ -3113,7 +3182,17 @@ fn verify_builtin_call(
                 Builtin::IteratorValid => Type::Bool,
                 Builtin::IteratorKey => key.clone(),
                 Builtin::IteratorValue => value.clone(),
-                Builtin::IteratorGetInner if name == "IteratorIterator" || filter => {
+                Builtin::IteratorGetInner
+                    if matches!(
+                        name,
+                        "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "CachingIterator"
+                            | "RecursiveCachingIterator"
+                    ) || filter
+                        || caching =>
+                {
                     Type::Nominal {
                         name: "Iterator".to_owned(),
                         arguments: vec![key.clone(), value.clone()],
@@ -3124,6 +3203,461 @@ fn verify_builtin_call(
             (result == Some(&expected))
                 .then_some(())
                 .ok_or_else(|| "invalid iterator cursor result".to_owned())
+        }
+        Builtin::LimitSeek
+        | Builtin::LimitGetPosition
+        | Builtin::AppendAdd
+        | Builtin::AppendGetIndex
+        | Builtin::AppendGetIterator => {
+            let Some((name, type_arguments)) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid adapter receiver".to_owned());
+            };
+            let expected = match (builtin, name, type_arguments) {
+                (Builtin::LimitSeek, "LimitIterator", [_, _])
+                    if arguments.len() == 2 && argument_type(1) == &Type::Int =>
+                {
+                    Type::Void
+                }
+                (Builtin::LimitGetPosition, "LimitIterator", [_, _]) if arguments.len() == 1 => {
+                    Type::Int
+                }
+                (Builtin::AppendAdd, "AppendIterator", [key, value])
+                    if arguments.len() == 2
+                        && type_accepts(
+                            program,
+                            &Type::Nominal {
+                                name: "Iterator".to_owned(),
+                                arguments: vec![key.clone(), value.clone()],
+                            },
+                            argument_type(1),
+                        ) =>
+                {
+                    Type::Void
+                }
+                (Builtin::AppendGetIndex, "AppendIterator", [_, _]) if arguments.len() == 1 => {
+                    Type::Union(vec![Type::Int, Type::Null])
+                }
+                (Builtin::AppendGetIterator, "AppendIterator", [key, value])
+                    if arguments.len() == 1 =>
+                {
+                    Type::Nominal {
+                        name: "VectorIterator".to_owned(),
+                        arguments: vec![Type::Nominal {
+                            name: "Iterator".to_owned(),
+                            arguments: vec![key.clone(), value.clone()],
+                        }],
+                    }
+                }
+                _ => return Err("invalid adapter method".to_owned()),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid adapter result".to_owned())
+        }
+        Builtin::CachingHasNext
+        | Builtin::CachingCount
+        | Builtin::CachingGetCache
+        | Builtin::CachingGetFlags
+        | Builtin::CachingSetFlags
+        | Builtin::CachingOffsetExists
+        | Builtin::CachingOffsetGet
+        | Builtin::CachingOffsetSet
+        | Builtin::CachingOffsetUnset
+        | Builtin::CachingToString => {
+            let Some([key, value]) = arguments
+                .first()
+                .and_then(|_| {
+                    encoded_nominal_ancestor_arguments(program, argument_type(0), "CachingIterator")
+                })
+                .and_then(|args| <[Type; 2]>::try_from(args).ok())
+            else {
+                return Err("invalid caching iterator receiver".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::CachingHasNext | Builtin::CachingOffsetExists => Type::Bool,
+                Builtin::CachingCount | Builtin::CachingGetFlags => Type::Int,
+                Builtin::CachingGetCache => {
+                    Type::Map(Box::new(key.clone()), Box::new(value.clone()))
+                }
+                Builtin::CachingToString => Type::String,
+                Builtin::CachingOffsetGet => value.clone(),
+                Builtin::CachingSetFlags
+                | Builtin::CachingOffsetSet
+                | Builtin::CachingOffsetUnset => Type::Void,
+                _ => unreachable!(),
+            };
+            let valid_arguments = match builtin {
+                Builtin::CachingSetFlags => arguments.len() == 2 && argument_type(1) == &Type::Int,
+                Builtin::CachingOffsetExists
+                | Builtin::CachingOffsetGet
+                | Builtin::CachingOffsetUnset => arguments.len() == 2 && argument_type(1) == &key,
+                Builtin::CachingOffsetSet => {
+                    arguments.len() == 3
+                        && type_accepts(
+                            program,
+                            &Type::Union(vec![key.clone(), Type::Null]),
+                            argument_type(1),
+                        )
+                        && argument_type(2) == &value
+                }
+                _ => arguments.len() == 1,
+            };
+            (valid_arguments && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid caching iterator method".to_owned())
+        }
+        Builtin::RecursiveWalkConstruct
+        | Builtin::RecursiveWalkSetMaxDepth
+        | Builtin::RecursiveWalkGetMaxDepth
+        | Builtin::RecursiveWalkGetDepth
+        | Builtin::RecursiveWalkGetSubIterator
+        | Builtin::RecursiveWalkGetRecursiveIterator
+        | Builtin::RecursiveWalkHook => {
+            let receiver = arguments.first().map(|_| argument_type(0));
+            let Some([key, value]) = receiver
+                .and_then(|ty| {
+                    encoded_nominal_ancestor_arguments(program, ty, "RecursiveIteratorIterator")
+                })
+                .and_then(|args| <[Type; 2]>::try_from(args).ok())
+            else {
+                return Err("invalid recursive walk receiver".to_owned());
+            };
+            let source = Type::Nominal {
+                name: "RecursiveIterator".to_owned(),
+                arguments: vec![key.clone(), value.clone()],
+            };
+            let valid = match builtin {
+                Builtin::RecursiveWalkConstruct => {
+                    arguments.len() == 3
+                        && type_accepts(program, &source, argument_type(1))
+                        && argument_type(2) == &Type::Int
+                        && result == Some(&Type::Void)
+                }
+                Builtin::RecursiveWalkSetMaxDepth => {
+                    arguments.len() == 2
+                        && argument_type(1) == &Type::Int
+                        && result == Some(&Type::Void)
+                }
+                Builtin::RecursiveWalkGetMaxDepth => {
+                    arguments.len() == 1
+                        && result == Some(&Type::Union(vec![Type::Bool, Type::Int]))
+                }
+                Builtin::RecursiveWalkGetDepth => {
+                    arguments.len() == 1 && result == Some(&Type::Int)
+                }
+                Builtin::RecursiveWalkGetSubIterator => {
+                    arguments.len() == 2
+                        && type_accepts(
+                            program,
+                            &Type::Union(vec![Type::Int, Type::Null]),
+                            argument_type(1),
+                        )
+                        && result == Some(&Type::Union(vec![source.clone(), Type::Null]))
+                }
+                Builtin::RecursiveWalkGetRecursiveIterator => {
+                    arguments.len() == 1 && result == Some(&source)
+                }
+                Builtin::RecursiveWalkHook => arguments.len() == 1 && result == Some(&Type::Void),
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid recursive walk method".to_owned())
+        }
+        Builtin::FixedConstruct
+        | Builtin::FixedSetSize
+        | Builtin::FixedGetSize
+        | Builtin::FixedOffsetExists
+        | Builtin::FixedOffsetGet
+        | Builtin::FixedOffsetSet
+        | Builtin::FixedOffsetUnset
+        | Builtin::FixedGetIterator => {
+            let Some(("FixedSequence", [element])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid fixed sequence receiver".to_owned());
+            };
+            let slot = normalize_union(vec![element.clone(), Type::Null]);
+            let valid = match builtin {
+                Builtin::FixedConstruct | Builtin::FixedSetSize => {
+                    arguments.len() == 2
+                        && argument_type(1) == &Type::Int
+                        && result == Some(&Type::Void)
+                }
+                Builtin::FixedGetSize => arguments.len() == 1 && result == Some(&Type::Int),
+                Builtin::FixedOffsetExists
+                | Builtin::FixedOffsetGet
+                | Builtin::FixedOffsetUnset => {
+                    arguments.len() == 2
+                        && argument_type(1) == &Type::Int
+                        && result
+                            == Some(&match builtin {
+                                Builtin::FixedOffsetExists => Type::Bool,
+                                Builtin::FixedOffsetGet => slot.clone(),
+                                _ => Type::Void,
+                            })
+                }
+                Builtin::FixedOffsetSet => {
+                    arguments.len() == 3
+                        && type_accepts(
+                            program,
+                            &Type::Union(vec![Type::Int, Type::Null]),
+                            argument_type(1),
+                        )
+                        && type_accepts(program, &slot, argument_type(2))
+                        && result == Some(&Type::Void)
+                }
+                Builtin::FixedGetIterator => {
+                    arguments.len() == 1
+                        && result
+                            == Some(&Type::Nominal {
+                                name: "Traversable".to_owned(),
+                                arguments: vec![Type::Int, slot],
+                            })
+                }
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid fixed sequence method".to_owned())
+        }
+        Builtin::ListConstruct
+        | Builtin::ListPush
+        | Builtin::ListPop
+        | Builtin::ListUnshift
+        | Builtin::ListShift
+        | Builtin::ListTop
+        | Builtin::ListBottom
+        | Builtin::ListCount
+        | Builtin::ListIsEmpty
+        | Builtin::ListGetIterator
+        | Builtin::ListToVector => {
+            let Some([element]) = arguments
+                .first()
+                .and_then(|_| {
+                    encoded_nominal_ancestor_arguments(program, argument_type(0), "LinkedList")
+                })
+                .and_then(|args| <[Type; 1]>::try_from(args).ok())
+            else {
+                return Err("invalid linked sequence receiver".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::ListConstruct | Builtin::ListPush | Builtin::ListUnshift => Type::Void,
+                Builtin::ListPop | Builtin::ListShift | Builtin::ListTop | Builtin::ListBottom => {
+                    element.clone()
+                }
+                Builtin::ListCount => Type::Int,
+                Builtin::ListIsEmpty => Type::Bool,
+                Builtin::ListGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, element.clone()],
+                },
+                Builtin::ListToVector => Type::Vector(Box::new(element.clone())),
+                _ => unreachable!(),
+            };
+            let valid_args = if matches!(builtin, Builtin::ListPush | Builtin::ListUnshift) {
+                arguments.len() == 2 && type_accepts(program, &element, argument_type(1))
+            } else {
+                arguments.len() == 1
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid linked sequence method".to_owned())
+        }
+        Builtin::HeapConstruct
+        | Builtin::HeapInsert
+        | Builtin::HeapTop
+        | Builtin::HeapExtract
+        | Builtin::HeapCount
+        | Builtin::HeapIsEmpty
+        | Builtin::HeapGetIterator => {
+            let Some((name @ ("MaxHeap" | "MinHeap" | "PriorityQueue"), [element])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid heap receiver".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::HeapConstruct | Builtin::HeapInsert => Type::Void,
+                Builtin::HeapTop | Builtin::HeapExtract => element.clone(),
+                Builtin::HeapCount => Type::Int,
+                Builtin::HeapIsEmpty => Type::Bool,
+                Builtin::HeapGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, element.clone()],
+                },
+                _ => unreachable!(),
+            };
+            let valid_args = if builtin == Builtin::HeapInsert {
+                arguments.len() == if name == "PriorityQueue" { 3 } else { 2 }
+                    && type_accepts(program, element, argument_type(1))
+                    && (name != "PriorityQueue" || argument_type(2) == &Type::Int)
+            } else {
+                arguments.len() == 1
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid heap method".to_owned())
+        }
+        Builtin::TypedMapConstruct
+        | Builtin::TypedMapSet
+        | Builtin::TypedMapGet
+        | Builtin::TypedMapContains
+        | Builtin::TypedMapRemove
+        | Builtin::TypedMapCount
+        | Builtin::TypedMapToMap
+        | Builtin::TypedMapGetIterator => {
+            let Some(("TypedMap", [key, value])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid typed map receiver".to_owned());
+            };
+            let optional = normalize_union(vec![value.clone(), Type::Null]);
+            let expected = match builtin {
+                Builtin::TypedMapConstruct | Builtin::TypedMapSet => Type::Void,
+                Builtin::TypedMapGet => optional,
+                Builtin::TypedMapContains | Builtin::TypedMapRemove => Type::Bool,
+                Builtin::TypedMapCount => Type::Int,
+                Builtin::TypedMapToMap => Type::Map(Box::new(key.clone()), Box::new(value.clone())),
+                Builtin::TypedMapGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                },
+                _ => unreachable!(),
+            };
+            let valid_args = match builtin {
+                Builtin::TypedMapSet => {
+                    arguments.len() == 3
+                        && type_accepts(program, key, argument_type(1))
+                        && type_accepts(program, value, argument_type(2))
+                }
+                Builtin::TypedMapGet | Builtin::TypedMapContains | Builtin::TypedMapRemove => {
+                    arguments.len() == 2 && type_accepts(program, key, argument_type(1))
+                }
+                _ => arguments.len() == 1,
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid typed map method".to_owned())
+        }
+        Builtin::ObjectStorageConstruct
+        | Builtin::ObjectStorageAttach
+        | Builtin::ObjectStorageGet
+        | Builtin::ObjectStorageContains
+        | Builtin::ObjectStorageDetach
+        | Builtin::ObjectStorageCount
+        | Builtin::ObjectStorageGetIterator => {
+            let Some(("ObjectStorage", [value])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid object storage receiver".to_owned());
+            };
+            let optional = normalize_union(vec![value.clone(), Type::Null]);
+            let expected = match builtin {
+                Builtin::ObjectStorageConstruct | Builtin::ObjectStorageAttach => Type::Void,
+                Builtin::ObjectStorageGet => optional,
+                Builtin::ObjectStorageContains | Builtin::ObjectStorageDetach => Type::Bool,
+                Builtin::ObjectStorageCount => Type::Int,
+                Builtin::ObjectStorageGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, Type::Mixed],
+                },
+                _ => unreachable!(),
+            };
+            let valid_args = match builtin {
+                Builtin::ObjectStorageAttach => {
+                    arguments.len() == 3 && type_accepts(program, value, argument_type(2))
+                }
+                Builtin::ObjectStorageGet
+                | Builtin::ObjectStorageContains
+                | Builtin::ObjectStorageDetach => arguments.len() == 2,
+                _ => arguments.len() == 1,
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid object storage method".to_owned())
+        }
+        Builtin::ParentAccept
+        | Builtin::RecursiveCallbackAccept
+        | Builtin::RecursiveCallbackConstruct => {
+            let receiver = arguments.first().map(|_| argument_type(0));
+            let Some([key, value]) = receiver
+                .and_then(|ty| {
+                    encoded_nominal_ancestor_arguments(program, ty, "RecursiveFilterIterator")
+                })
+                .and_then(|args| <[Type; 2]>::try_from(args).ok())
+            else {
+                return Err("invalid recursive filter receiver".to_owned());
+            };
+            let entry = Type::Nominal {
+                name: "RecursiveEntry".to_owned(),
+                arguments: vec![key.clone(), value.clone()],
+            };
+            let valid = match builtin {
+                Builtin::ParentAccept | Builtin::RecursiveCallbackAccept => {
+                    arguments.len() == 3
+                        && type_accepts(program, &entry, argument_type(1))
+                        && type_accepts(program, &key, argument_type(2))
+                        && result == Some(&Type::Bool)
+                }
+                Builtin::RecursiveCallbackConstruct => {
+                    arguments.len() == 3
+                        && type_accepts(
+                            program,
+                            &Type::Nominal {
+                                name: "RecursiveIterator".to_owned(),
+                                arguments: vec![key.clone(), value],
+                            },
+                            argument_type(1),
+                        )
+                        && argument_type(2)
+                            == &Type::Callable(vec![entry, key], Box::new(Type::Bool))
+                        && result == Some(&Type::Void)
+                }
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid recursive filter method".to_owned())
+        }
+        Builtin::RecursiveEntryConstruct
+        | Builtin::RecursiveEntryValue
+        | Builtin::RecursiveEntryChildren => {
+            let Some(("RecursiveEntry", [key, value])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid recursive entry receiver".to_owned());
+            };
+            let children = Type::Union(vec![
+                Type::Nominal {
+                    name: "RecursiveIterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                },
+                Type::Null,
+            ]);
+            let valid = match builtin {
+                Builtin::RecursiveEntryConstruct => {
+                    arguments.len() == 3
+                        && argument_type(1) == value
+                        && type_accepts(program, &children, argument_type(2))
+                        && result == Some(&Type::Void)
+                }
+                Builtin::RecursiveEntryValue => arguments.len() == 1 && result == Some(value),
+                Builtin::RecursiveEntryChildren => {
+                    arguments.len() == 1 && result == Some(&children)
+                }
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid recursive entry method".to_owned())
         }
         Builtin::GeneratorGetReturn | Builtin::GeneratorClose => {
             if arguments.len() != 1
@@ -3747,6 +4281,39 @@ fn encoded_nominal_accepts(program: &Program, expected: &Type, actual: &Type) ->
         })
 }
 
+fn encoded_nominal_ancestor_arguments(
+    program: &Program,
+    actual: &Type,
+    target: &str,
+) -> Option<Vec<Type>> {
+    let (name, arguments) = encoded_nominal_parts(actual)?;
+    if name == target {
+        return Some(arguments.to_vec());
+    }
+    let class = class_by_name(program, name)?;
+    let instantiated = NominalType {
+        class: class.id,
+        arguments: arguments.to_vec(),
+    };
+    class
+        .parent_type
+        .iter()
+        .chain(&class.interface_types)
+        .find_map(|edge| {
+            let edge_class = &program.classes[edge.class.0 as usize];
+            let edge_arguments = edge
+                .arguments
+                .iter()
+                .map(|argument| substitute_descriptor_type(argument, Some(&instantiated), class))
+                .collect::<Vec<_>>();
+            let edge_type = Type::Nominal {
+                name: edge_class.name.clone(),
+                arguments: edge_arguments,
+            };
+            encoded_nominal_ancestor_arguments(program, &edge_type, target)
+        })
+}
+
 fn is_instance_of_name(program: &Program, actual: &str, expected: &str) -> bool {
     let Some(actual) = class_by_name(program, actual) else {
         return false;
@@ -4001,6 +4568,14 @@ mod tests {
                 .to_string()
                 .contains("invalid iterator function result")
         );
+    }
+
+    #[test]
+    fn version_nine_native_builtins_round_trip() {
+        let source = "<?thp\nclass Box {}\n$fixed = new FixedSequence<int>(2);\n$fixed->offsetSet(0, 1);\n$list = new LinkedList<int>();\n$list->push(3);\n$heap = new MaxHeap<int>();\n$heap->insert(4);\n$map = new TypedMap<string, int>();\n$map->set(\"x\", 5);\n$storage = new ObjectStorage<int>();\n$storage->attach(new Box(), 6);";
+        let program = compile(source);
+        verify(&program).unwrap();
+        verify(&decode(&encode(&program)).unwrap()).unwrap();
     }
 
     #[test]

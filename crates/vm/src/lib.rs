@@ -404,6 +404,55 @@ struct Frame {
     called_class: Option<ClassId>,
 }
 
+#[derive(Clone)]
+struct WalkFrame {
+    iterator: Value,
+    phase: i64,
+    entry: Value,
+    child: Value,
+}
+
+impl WalkFrame {
+    fn new(iterator: Value) -> Self {
+        Self {
+            iterator,
+            phase: 0,
+            entry: Value::NULL,
+            child: Value::NULL,
+        }
+    }
+
+    fn decode(value: &Value, span: Span) -> Result<Self, VmError> {
+        let values = value
+            .vector_values()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        let [iterator, phase, entry, child] = values else {
+            return Err(runtime(RuntimeErrorKind::Unreachable, span));
+        };
+        Ok(Self {
+            iterator: iterator.clone(),
+            phase: phase
+                .as_int()
+                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?,
+            entry: entry.clone(),
+            child: child.clone(),
+        })
+    }
+
+    fn encode(self, span: Span) -> Result<Value, VmError> {
+        Value::try_vector(
+            Type::Mixed,
+            vec![
+                self.iterator,
+                Value::integer(self.phase),
+                self.entry,
+                self.child,
+            ],
+        )
+        .map_err(|kind| runtime(kind, span))
+    }
+}
+
 enum FrameOutcome {
     Return(Value),
     Yield(Option<Value>, Value),
@@ -1663,10 +1712,243 @@ impl ExecutionState<'_, '_> {
         if name == "Generator" {
             return self.native_generator_method(builtin, iterator, depth, span);
         }
+        if is_instance_of_name(self.program, class, "RecursiveIteratorIterator") {
+            return self.recursive_walk_cursor(
+                builtin,
+                iterator,
+                depth,
+                calling_function,
+                instruction,
+            );
+        }
         if builtin == Builtin::IteratorGetInner {
+            let property = u32::from(name == "InfiniteIterator");
             return iterator
+                .property(thp_hir::PropertyId(property))
+                .map_err(|kind| runtime(kind, span))
+                .and_then(|value| {
+                    if value.is_null() {
+                        Err(runtime(
+                            RuntimeErrorKind::Bounds(
+                                "iterator has no current inner iterator".to_owned(),
+                            ),
+                            span,
+                        ))
+                    } else {
+                        Ok(value)
+                    }
+                });
+        }
+        if name == "LimitIterator" {
+            let inner = iterator
                 .property(thp_hir::PropertyId(0))
-                .map_err(|kind| runtime(kind, span));
+                .map_err(|kind| runtime(kind, span))?;
+            let position = iterator
+                .property(thp_hir::PropertyId(3))
+                .map_err(|kind| runtime(kind, span))?
+                .as_int()
+                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+            let limit = iterator
+                .property(thp_hir::PropertyId(2))
+                .map_err(|kind| runtime(kind, span))?
+                .as_int()
+                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+            let has_value = limit < 0 || position < limit;
+            return match builtin {
+                Builtin::IteratorRewind => {
+                    self.iterator_call(&inner, "rewind", depth, calling_function, instruction)?;
+                    let offset = iterator
+                        .property(thp_hir::PropertyId(1))
+                        .map_err(|kind| runtime(kind, span))?
+                        .as_int()
+                        .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+                    for _ in 0..offset {
+                        if self
+                            .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                            .as_bool()
+                            != Some(true)
+                        {
+                            break;
+                        }
+                        self.tick(span)?;
+                        self.iterator_call(
+                            &inner,
+                            "advance",
+                            depth,
+                            calling_function,
+                            instruction,
+                        )?;
+                    }
+                    iterator
+                        .set_property(thp_hir::PropertyId(3), Value::integer(0))
+                        .map_err(|kind| runtime(kind, span))?;
+                    Ok(Value::NULL)
+                }
+                Builtin::IteratorValid => Ok(Value::bool(
+                    has_value
+                        && self
+                            .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                            .as_bool()
+                            == Some(true),
+                )),
+                Builtin::IteratorKey | Builtin::IteratorValue => {
+                    if !has_value
+                        || self
+                            .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                            .as_bool()
+                            != Some(true)
+                    {
+                        return Err(runtime(
+                            RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                            span,
+                        ));
+                    }
+                    self.iterator_call(
+                        &inner,
+                        if builtin == Builtin::IteratorKey {
+                            "key"
+                        } else {
+                            "value"
+                        },
+                        depth,
+                        calling_function,
+                        instruction,
+                    )
+                }
+                Builtin::IteratorAdvance => {
+                    if has_value
+                        && self
+                            .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                            .as_bool()
+                            == Some(true)
+                    {
+                        self.iterator_call(
+                            &inner,
+                            "advance",
+                            depth,
+                            calling_function,
+                            instruction,
+                        )?;
+                        iterator
+                            .set_property(
+                                thp_hir::PropertyId(3),
+                                Value::integer(position.saturating_add(1)),
+                            )
+                            .map_err(|kind| runtime(kind, span))?;
+                    }
+                    Ok(Value::NULL)
+                }
+                _ => unreachable!(),
+            };
+        }
+        if name == "InfiniteIterator" {
+            if builtin == Builtin::IteratorRewind {
+                iterator
+                    .set_property(thp_hir::PropertyId(2), Value::bool(false))
+                    .map_err(|kind| runtime(kind, span))?;
+                let inner =
+                    self.infinite_next_iterator(iterator, depth, calling_function, instruction)?;
+                iterator
+                    .set_property(thp_hir::PropertyId(1), inner)
+                    .map_err(|kind| runtime(kind, span))?;
+                return Ok(Value::NULL);
+            }
+            let exhausted = iterator
+                .property(thp_hir::PropertyId(2))
+                .map_err(|kind| runtime(kind, span))?
+                .as_bool()
+                == Some(true);
+            if exhausted {
+                return match builtin {
+                    Builtin::IteratorValid => Ok(Value::bool(false)),
+                    Builtin::IteratorKey | Builtin::IteratorValue => Err(runtime(
+                        RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                        span,
+                    )),
+                    _ => Ok(Value::NULL),
+                };
+            }
+            let inner = iterator
+                .property(thp_hir::PropertyId(1))
+                .map_err(|kind| runtime(kind, span))?;
+            if inner.is_null() {
+                return match builtin {
+                    Builtin::IteratorValid => Ok(Value::bool(false)),
+                    Builtin::IteratorKey | Builtin::IteratorValue => Err(runtime(
+                        RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                        span,
+                    )),
+                    _ => Ok(Value::NULL),
+                };
+            }
+            if builtin == Builtin::IteratorAdvance {
+                if self
+                    .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                    .as_bool()
+                    == Some(true)
+                {
+                    self.iterator_call(&inner, "advance", depth, calling_function, instruction)?;
+                }
+                self.native_iterator_method(
+                    Builtin::IteratorValid,
+                    iterator,
+                    depth,
+                    calling_function,
+                    instruction,
+                )?;
+                return Ok(Value::NULL);
+            }
+            let inner = if self
+                .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                .as_bool()
+                == Some(true)
+            {
+                inner
+            } else {
+                let next =
+                    self.infinite_next_iterator(iterator, depth, calling_function, instruction)?;
+                iterator
+                    .set_property(thp_hir::PropertyId(1), next.clone())
+                    .map_err(|kind| runtime(kind, span))?;
+                next
+            };
+            let valid = !inner.is_null();
+            return match builtin {
+                Builtin::IteratorValid => Ok(Value::bool(valid)),
+                Builtin::IteratorKey | Builtin::IteratorValue if valid => self.iterator_call(
+                    &inner,
+                    if builtin == Builtin::IteratorKey {
+                        "key"
+                    } else {
+                        "value"
+                    },
+                    depth,
+                    calling_function,
+                    instruction,
+                ),
+                _ => Err(runtime(
+                    RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                    span,
+                )),
+            };
+        }
+        if name == "AppendIterator" {
+            return self.append_iterator_method(
+                builtin,
+                iterator,
+                depth,
+                calling_function,
+                instruction,
+            );
+        }
+        if is_instance_of_name(self.program, class, "CachingIterator") {
+            return self.caching_iterator_method(
+                builtin,
+                iterator,
+                depth,
+                calling_function,
+                instruction,
+            );
         }
         if is_instance_of_name(self.program, class, "FilterIterator") {
             let inner = iterator
@@ -1781,7 +2063,7 @@ impl ExecutionState<'_, '_> {
                             span,
                         ));
                     }
-                    return self.iterator_call(
+                    let current = self.iterator_call(
                         &inner,
                         if builtin == Builtin::IteratorKey {
                             "key"
@@ -1791,7 +2073,19 @@ impl ExecutionState<'_, '_> {
                         depth,
                         calling_function,
                         instruction,
-                    );
+                    )?;
+                    if builtin == Builtin::IteratorValue
+                        && is_instance_of_name(self.program, class, "RecursiveFilterIterator")
+                    {
+                        return self.recursive_filter_entry(
+                            iterator,
+                            &current,
+                            depth,
+                            calling_function,
+                            instruction,
+                        );
+                    }
+                    return Ok(current);
                 }
                 _ => unreachable!(),
             }
@@ -1877,6 +2171,1452 @@ impl ExecutionState<'_, '_> {
                     )
                     .map_err(|kind| runtime(kind, span))?;
                 Ok(Value::NULL)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn infinite_next_iterator(
+        &mut self,
+        wrapper: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let source = wrapper
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, instruction.span))?;
+        let mut current =
+            self.iterator_call(&source, "getIterator", depth, calling_function, instruction)?;
+        for _ in 0..64 {
+            let class = current
+                .class_id()
+                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, instruction.span))?;
+            if is_instance_of_name(self.program, class, "Iterator") {
+                self.iterator_call(&current, "rewind", depth, calling_function, instruction)?;
+                if self
+                    .iterator_call(&current, "valid", depth, calling_function, instruction)?
+                    .as_bool()
+                    == Some(true)
+                {
+                    return Ok(current);
+                }
+                wrapper
+                    .set_property(thp_hir::PropertyId(2), Value::bool(true))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                return Ok(Value::NULL);
+            }
+            self.tick(instruction.span)?;
+            current = self.iterator_call(
+                &current,
+                "getIterator",
+                depth,
+                calling_function,
+                instruction,
+            )?;
+        }
+        Err(self.native_exception(
+            "Error",
+            b"iterator aggregate nesting exceeds 64 levels".to_vec(),
+            None,
+            0,
+            instruction.span,
+        ))
+    }
+
+    fn append_iterator_method(
+        &mut self,
+        builtin: Builtin,
+        wrapper: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let iterators = wrapper
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let index = wrapper
+            .property(thp_hir::PropertyId(1))
+            .map_err(|kind| runtime(kind, span))?
+            .as_int()
+            .unwrap_or(-1);
+        if builtin == Builtin::IteratorRewind {
+            wrapper
+                .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                .map_err(|kind| runtime(kind, span))?;
+            if let Some(first) = iterators.vector_values().and_then(|values| values.first()) {
+                self.iterator_call(first, "rewind", depth, calling_function, instruction)?;
+            }
+            return Ok(Value::NULL);
+        }
+        let mut index = index;
+        let values = iterators
+            .vector_values()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        if index >= 0 {
+            while let Some(inner) = usize::try_from(index)
+                .ok()
+                .and_then(|index| values.get(index))
+            {
+                if self
+                    .iterator_call(inner, "valid", depth, calling_function, instruction)?
+                    .as_bool()
+                    == Some(true)
+                {
+                    break;
+                }
+                self.tick(span)?;
+                index += 1;
+                if let Some(next) = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| values.get(index))
+                {
+                    self.iterator_call(next, "rewind", depth, calling_function, instruction)?;
+                }
+            }
+            wrapper
+                .set_property(thp_hir::PropertyId(1), Value::integer(index))
+                .map_err(|kind| runtime(kind, span))?;
+        }
+        let inner = usize::try_from(index)
+            .ok()
+            .and_then(|index| values.get(index));
+        match builtin {
+            Builtin::IteratorValid => Ok(Value::bool(inner.is_some())),
+            Builtin::IteratorKey | Builtin::IteratorValue => {
+                let inner = inner.ok_or_else(|| {
+                    runtime(
+                        RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                        span,
+                    )
+                })?;
+                self.iterator_call(
+                    inner,
+                    if builtin == Builtin::IteratorKey {
+                        "key"
+                    } else {
+                        "value"
+                    },
+                    depth,
+                    calling_function,
+                    instruction,
+                )
+            }
+            Builtin::IteratorAdvance => {
+                if let Some(inner) = inner {
+                    self.iterator_call(inner, "advance", depth, calling_function, instruction)?;
+                    self.append_iterator_method(
+                        Builtin::IteratorValid,
+                        wrapper,
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                }
+                Ok(Value::NULL)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn caching_pull(
+        &mut self,
+        wrapper: &Value,
+        key_slot: u32,
+        valid_slot: u32,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<(), VmError> {
+        let span = instruction.span;
+        let inner = wrapper
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let valid = self
+            .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+            .as_bool()
+            == Some(true);
+        if valid {
+            let key = self.iterator_call(&inner, "key", depth, calling_function, instruction)?;
+            let value =
+                self.iterator_call(&inner, "value", depth, calling_function, instruction)?;
+            self.iterator_call(&inner, "advance", depth, calling_function, instruction)?;
+            wrapper
+                .set_property(thp_hir::PropertyId(key_slot), key)
+                .map_err(|kind| runtime(kind, span))?;
+            wrapper
+                .set_property(thp_hir::PropertyId(key_slot + 1), value)
+                .map_err(|kind| runtime(kind, span))?;
+        }
+        wrapper
+            .set_property(thp_hir::PropertyId(valid_slot), Value::bool(valid))
+            .map_err(|kind| runtime(kind, span))?;
+        Ok(())
+    }
+
+    fn native_type_arguments(
+        &self,
+        object: &Value,
+        ancestor: &str,
+        span: Span,
+    ) -> Result<Vec<Type>, VmError> {
+        let instance = thp_bytecode::NominalType {
+            class: object.class_id().expect("native object class"),
+            arguments: object.type_arguments().unwrap_or_default().to_vec(),
+        };
+        runtime_instantiation_for_class(self.program, &instance, self.classes_by_name[ancestor])
+            .map(|ty| ty.arguments)
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))
+    }
+
+    fn caching_store_current(
+        &mut self,
+        wrapper: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<(), VmError> {
+        let span = instruction.span;
+        let flags = wrapper
+            .property(thp_hir::PropertyId(1))
+            .map_err(|kind| runtime(kind, span))?
+            .as_int()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        if flags & 1 != 0 {
+            self.caching_builtin(
+                Builtin::CachingToString,
+                std::slice::from_ref(wrapper),
+                depth,
+                calling_function,
+                instruction,
+            )?;
+        }
+        let count = wrapper
+            .property(thp_hir::PropertyId(9))
+            .map_err(|kind| runtime(kind, span))?
+            .as_int()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        wrapper
+            .set_property(
+                thp_hir::PropertyId(9),
+                Value::integer(count.saturating_add(1)),
+            )
+            .map_err(|kind| runtime(kind, span))?;
+        if flags & 256 != 0 {
+            let key = wrapper
+                .property(thp_hir::PropertyId(2))
+                .map_err(|kind| runtime(kind, span))?;
+            let value = wrapper
+                .property(thp_hir::PropertyId(3))
+                .map_err(|kind| runtime(kind, span))?;
+            let mut cache = wrapper
+                .property(thp_hir::PropertyId(8))
+                .map_err(|kind| runtime(kind, span))?;
+            cache
+                .set_index(&key, value)
+                .map_err(|kind| runtime(kind, span))?;
+            wrapper
+                .set_property(thp_hir::PropertyId(8), cache)
+                .map_err(|kind| runtime(kind, span))?;
+        }
+        Ok(())
+    }
+
+    fn caching_iterator_method(
+        &mut self,
+        builtin: Builtin,
+        wrapper: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        if builtin == Builtin::IteratorRewind {
+            let inner = wrapper
+                .property(thp_hir::PropertyId(0))
+                .map_err(|kind| runtime(kind, span))?;
+            self.iterator_call(&inner, "rewind", depth, calling_function, instruction)?;
+            let [key, value] = self
+                .native_type_arguments(wrapper, "CachingIterator", span)?
+                .try_into()
+                .map_err(|_| runtime(RuntimeErrorKind::Unreachable, span))?;
+            let cache = Value::try_map(key, value, vec![]).map_err(|kind| runtime(kind, span))?;
+            wrapper
+                .set_property(thp_hir::PropertyId(8), cache)
+                .map_err(|kind| runtime(kind, span))?;
+            wrapper
+                .set_property(thp_hir::PropertyId(9), Value::integer(0))
+                .map_err(|kind| runtime(kind, span))?;
+            self.caching_pull(wrapper, 2, 6, depth, calling_function, instruction)?;
+            self.caching_pull(wrapper, 4, 7, depth, calling_function, instruction)?;
+            if wrapper
+                .property(thp_hir::PropertyId(6))
+                .map_err(|kind| runtime(kind, span))?
+                .as_bool()
+                == Some(true)
+            {
+                self.caching_store_current(wrapper, depth, calling_function, instruction)?;
+            }
+            return Ok(Value::NULL);
+        }
+        let current = wrapper
+            .property(thp_hir::PropertyId(6))
+            .map_err(|kind| runtime(kind, span))?
+            .as_bool()
+            == Some(true);
+        match builtin {
+            Builtin::IteratorValid => Ok(Value::bool(current)),
+            Builtin::IteratorKey | Builtin::IteratorValue => {
+                if !current {
+                    return Err(runtime(
+                        RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                        span,
+                    ));
+                }
+                wrapper
+                    .property(thp_hir::PropertyId(if builtin == Builtin::IteratorKey {
+                        2
+                    } else {
+                        3
+                    }))
+                    .map_err(|kind| runtime(kind, span))
+            }
+            Builtin::IteratorAdvance => {
+                let next = wrapper
+                    .property(thp_hir::PropertyId(7))
+                    .map_err(|kind| runtime(kind, span))?
+                    .as_bool()
+                    == Some(true);
+                if current && next {
+                    for (from, to) in [(4, 2), (5, 3)] {
+                        let value = wrapper
+                            .property(thp_hir::PropertyId(from))
+                            .map_err(|kind| runtime(kind, span))?;
+                        wrapper
+                            .set_property(thp_hir::PropertyId(to), value)
+                            .map_err(|kind| runtime(kind, span))?;
+                    }
+                    self.caching_pull(wrapper, 4, 7, depth, calling_function, instruction)?;
+                    self.caching_store_current(wrapper, depth, calling_function, instruction)?;
+                } else {
+                    wrapper
+                        .set_property(thp_hir::PropertyId(6), Value::bool(false))
+                        .map_err(|kind| runtime(kind, span))?;
+                }
+                Ok(Value::NULL)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn caching_builtin(
+        &mut self,
+        builtin: Builtin,
+        args: &[Value],
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let wrapper = &args[0];
+        let flags = wrapper
+            .property(thp_hir::PropertyId(1))
+            .map_err(|kind| runtime(kind, span))?
+            .as_int()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        match builtin {
+            Builtin::CachingHasNext => wrapper
+                .property(thp_hir::PropertyId(7))
+                .map_err(|kind| runtime(kind, span)),
+            Builtin::CachingCount => wrapper
+                .property(thp_hir::PropertyId(9))
+                .map_err(|kind| runtime(kind, span)),
+            Builtin::CachingGetFlags => Ok(Value::integer(flags)),
+            Builtin::CachingSetFlags => {
+                let next = args[1].as_int().expect("verified flags");
+                if next < 0
+                    || next & !(1 | 2 | 4 | 8 | 16 | 256) != 0
+                    || (next & (4 | 8 | 16)).count_ones() > 1
+                {
+                    return Err(self.native_exception(
+                        "ValueError",
+                        b"invalid caching iterator flags".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ));
+                }
+                wrapper
+                    .set_property(thp_hir::PropertyId(1), Value::integer(next))
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            Builtin::CachingGetCache
+            | Builtin::CachingOffsetExists
+            | Builtin::CachingOffsetGet
+            | Builtin::CachingOffsetSet
+            | Builtin::CachingOffsetUnset => {
+                if flags & 256 == 0 {
+                    return Err(self.native_exception(
+                        "LogicException",
+                        b"full caching is disabled".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ));
+                }
+                let mut cache = wrapper
+                    .property(thp_hir::PropertyId(8))
+                    .map_err(|kind| runtime(kind, span))?;
+                match builtin {
+                    Builtin::CachingGetCache => Ok(cache),
+                    Builtin::CachingOffsetExists => {
+                        Ok(Value::bool(cache.map_entries().is_some_and(|entries| {
+                            entries.iter().any(|(key, _)| key == &args[1])
+                        })))
+                    }
+                    Builtin::CachingOffsetGet => {
+                        cache.index(&args[1]).map_err(|kind| runtime(kind, span))
+                    }
+                    Builtin::CachingOffsetSet => {
+                        if args[1].is_null() {
+                            return Err(self.native_exception(
+                                "ValueError",
+                                b"cache key cannot be null".to_vec(),
+                                None,
+                                0,
+                                span,
+                            ));
+                        }
+                        cache
+                            .set_index(&args[1], args[2].clone())
+                            .map_err(|kind| runtime(kind, span))?;
+                        wrapper
+                            .set_property(thp_hir::PropertyId(8), cache)
+                            .map_err(|kind| runtime(kind, span))?;
+                        Ok(Value::NULL)
+                    }
+                    Builtin::CachingOffsetUnset => {
+                        let types = cache
+                            .collection_types()
+                            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+                        let entries = cache
+                            .map_entries()
+                            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?
+                            .iter()
+                            .filter(|(key, _)| key != &args[1])
+                            .cloned()
+                            .collect();
+                        let next = Value::try_map(
+                            types.0,
+                            types
+                                .1
+                                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?,
+                            entries,
+                        )
+                        .map_err(|kind| runtime(kind, span))?;
+                        wrapper
+                            .set_property(thp_hir::PropertyId(8), next)
+                            .map_err(|kind| runtime(kind, span))?;
+                        Ok(Value::NULL)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Builtin::CachingToString => {
+                let current = wrapper
+                    .property(thp_hir::PropertyId(6))
+                    .map_err(|kind| runtime(kind, span))?
+                    .as_bool()
+                    == Some(true);
+                if !current {
+                    return Err(runtime(
+                        RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                        span,
+                    ));
+                }
+                let value = if flags & 4 != 0 {
+                    wrapper.property(thp_hir::PropertyId(2))
+                } else if flags & 16 != 0 {
+                    wrapper.property(thp_hir::PropertyId(0))
+                } else {
+                    wrapper.property(thp_hir::PropertyId(3))
+                }
+                .map_err(|kind| runtime(kind, span))?;
+                if let Some(bytes) = value.output_bytes() {
+                    return Value::try_bytes(bytes).map_err(|kind| runtime(kind, span));
+                }
+                if value
+                    .class_id()
+                    .is_some_and(|class| is_instance_of_name(self.program, class, "Stringable"))
+                {
+                    return self.iterator_call(
+                        &value,
+                        "__toString",
+                        depth,
+                        calling_function,
+                        instruction,
+                    );
+                }
+                Err(self.native_exception(
+                    "TypeError",
+                    b"current value is not Stringable".to_vec(),
+                    None,
+                    0,
+                    span,
+                ))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn store_walk_stack(
+        wrapper: &Value,
+        frames: Vec<WalkFrame>,
+        span: Span,
+    ) -> Result<(), VmError> {
+        // ponytail: copying the active path costs O(depth) per yield; use mutable
+        // VM-owned cursor state if very deep trees become a measured bottleneck.
+        let values = frames
+            .into_iter()
+            .map(|frame| frame.encode(span))
+            .collect::<Result<Vec<_>, _>>()?;
+        let stack = Value::try_vector(Type::Mixed, values).map_err(|kind| runtime(kind, span))?;
+        wrapper
+            .set_property(thp_hir::PropertyId(3), stack)
+            .map_err(|kind| runtime(kind, span))
+    }
+
+    fn recursive_walk_publish(
+        &mut self,
+        wrapper: &Value,
+        frames: Vec<WalkFrame>,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<(), VmError> {
+        let span = instruction.span;
+        let frame = frames
+            .last()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        let key =
+            self.iterator_call(&frame.iterator, "key", depth, calling_function, instruction)?;
+        let value =
+            self.iterator_call(&frame.entry, "value", depth, calling_function, instruction)?;
+        wrapper
+            .set_property(thp_hir::PropertyId(4), key)
+            .map_err(|kind| runtime(kind, span))?;
+        wrapper
+            .set_property(thp_hir::PropertyId(5), value)
+            .map_err(|kind| runtime(kind, span))?;
+        wrapper
+            .set_property(
+                thp_hir::PropertyId(6),
+                Value::integer(
+                    i64::try_from(frames.len() - 1)
+                        .map_err(|_| runtime(RuntimeErrorKind::Unreachable, span))?,
+                ),
+            )
+            .map_err(|kind| runtime(kind, span))?;
+        wrapper
+            .set_property(thp_hir::PropertyId(7), Value::bool(true))
+            .map_err(|kind| runtime(kind, span))?;
+        Self::store_walk_stack(wrapper, frames, span)?;
+        self.iterator_call(wrapper, "nextElement", depth, calling_function, instruction)?;
+        Ok(())
+    }
+
+    fn recursive_walk_seek_next(
+        &mut self,
+        wrapper: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<(), VmError> {
+        let span = instruction.span;
+        let mode = wrapper
+            .property(thp_hir::PropertyId(1))
+            .map_err(|kind| runtime(kind, span))?
+            .as_int()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        let max_depth = wrapper
+            .property(thp_hir::PropertyId(2))
+            .map_err(|kind| runtime(kind, span))?
+            .as_int()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        let stack = wrapper
+            .property(thp_hir::PropertyId(3))
+            .map_err(|kind| runtime(kind, span))?;
+        let mut frames = stack
+            .vector_values()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?
+            .iter()
+            .map(|value| WalkFrame::decode(value, span))
+            .collect::<Result<Vec<_>, _>>()?;
+        loop {
+            self.tick(span)?;
+            let Some(top) = frames.len().checked_sub(1) else {
+                wrapper
+                    .set_property(thp_hir::PropertyId(7), Value::bool(false))
+                    .map_err(|kind| runtime(kind, span))?;
+                Self::store_walk_stack(wrapper, frames, span)?;
+                if wrapper
+                    .property(thp_hir::PropertyId(9))
+                    .map_err(|kind| runtime(kind, span))?
+                    .as_bool()
+                    != Some(true)
+                {
+                    wrapper
+                        .set_property(thp_hir::PropertyId(9), Value::bool(true))
+                        .map_err(|kind| runtime(kind, span))?;
+                    self.iterator_call(
+                        wrapper,
+                        "endIteration",
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                }
+                return Ok(());
+            };
+            let phase = frames[top].phase;
+            if phase == 0 {
+                let cursor = frames[top].iterator.clone();
+                if self
+                    .iterator_call(&cursor, "valid", depth, calling_function, instruction)?
+                    .as_bool()
+                    != Some(true)
+                {
+                    frames.pop();
+                    if !frames.is_empty() {
+                        Self::store_walk_stack(wrapper, frames.clone(), span)?;
+                        self.iterator_call(
+                            wrapper,
+                            "endChildren",
+                            depth,
+                            calling_function,
+                            instruction,
+                        )?;
+                    }
+                    continue;
+                }
+                let entry =
+                    self.iterator_call(&cursor, "value", depth, calling_function, instruction)?;
+                let child =
+                    self.iterator_call(&entry, "children", depth, calling_function, instruction)?;
+                frames[top].entry = entry;
+                frames[top].child = child.clone();
+                if mode == 1 {
+                    frames[top].phase = 1;
+                    return self.recursive_walk_publish(
+                        wrapper,
+                        frames,
+                        depth,
+                        calling_function,
+                        instruction,
+                    );
+                }
+                if !child.is_null()
+                    && (max_depth < 0 || i64::try_from(top).is_ok_and(|level| level < max_depth))
+                {
+                    frames[top].phase = if mode == 2 { 2 } else { 3 };
+                    Self::store_walk_stack(wrapper, frames.clone(), span)?;
+                    self.iterator_call(
+                        wrapper,
+                        "beginChildren",
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                    self.iterator_call(&child, "rewind", depth, calling_function, instruction)?;
+                    frames.push(WalkFrame::new(child));
+                    continue;
+                }
+                frames[top].phase = 4;
+                return self.recursive_walk_publish(
+                    wrapper,
+                    frames,
+                    depth,
+                    calling_function,
+                    instruction,
+                );
+            }
+            if phase == 1 {
+                let child = frames[top].child.clone();
+                frames[top].phase = if child.is_null()
+                    || max_depth >= 0 && i64::try_from(top).is_ok_and(|level| level >= max_depth)
+                {
+                    4
+                } else {
+                    3
+                };
+                if frames[top].phase == 3 {
+                    Self::store_walk_stack(wrapper, frames.clone(), span)?;
+                    self.iterator_call(
+                        wrapper,
+                        "beginChildren",
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                    self.iterator_call(&child, "rewind", depth, calling_function, instruction)?;
+                    frames.push(WalkFrame::new(child));
+                }
+                continue;
+            }
+            if phase == 2 {
+                frames[top].phase = 4;
+                return self.recursive_walk_publish(
+                    wrapper,
+                    frames,
+                    depth,
+                    calling_function,
+                    instruction,
+                );
+            }
+            if phase == 3 {
+                frames[top].phase = 4;
+                continue;
+            }
+            let cursor = frames[top].iterator.clone();
+            self.iterator_call(&cursor, "advance", depth, calling_function, instruction)?;
+            frames[top].phase = 0;
+        }
+    }
+
+    fn recursive_walk_cursor(
+        &mut self,
+        builtin: Builtin,
+        wrapper: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        if builtin == Builtin::IteratorRewind {
+            wrapper
+                .set_property(thp_hir::PropertyId(7), Value::bool(false))
+                .map_err(|kind| runtime(kind, span))?;
+            wrapper
+                .set_property(thp_hir::PropertyId(6), Value::integer(-1))
+                .map_err(|kind| runtime(kind, span))?;
+            Self::store_walk_stack(wrapper, Vec::new(), span)?;
+            wrapper
+                .set_property(thp_hir::PropertyId(9), Value::bool(false))
+                .map_err(|kind| runtime(kind, span))?;
+            self.iterator_call(
+                wrapper,
+                "beginIteration",
+                depth,
+                calling_function,
+                instruction,
+            )?;
+            let root = wrapper
+                .property(thp_hir::PropertyId(0))
+                .map_err(|kind| runtime(kind, span))?;
+            self.iterator_call(&root, "rewind", depth, calling_function, instruction)?;
+            Self::store_walk_stack(wrapper, vec![WalkFrame::new(root)], span)?;
+            self.recursive_walk_seek_next(wrapper, depth, calling_function, instruction)?;
+            return Ok(Value::NULL);
+        }
+        let ready = wrapper
+            .property(thp_hir::PropertyId(7))
+            .map_err(|kind| runtime(kind, span))?
+            .as_bool()
+            == Some(true);
+        match builtin {
+            Builtin::IteratorValid => Ok(Value::bool(ready)),
+            Builtin::IteratorKey | Builtin::IteratorValue if ready => wrapper
+                .property(thp_hir::PropertyId(if builtin == Builtin::IteratorKey {
+                    4
+                } else {
+                    5
+                }))
+                .map_err(|kind| runtime(kind, span)),
+            Builtin::IteratorKey | Builtin::IteratorValue => Err(runtime(
+                RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                span,
+            )),
+            Builtin::IteratorAdvance => {
+                if ready {
+                    self.recursive_walk_seek_next(wrapper, depth, calling_function, instruction)?;
+                }
+                Ok(Value::NULL)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn recursive_filter_entry(
+        &mut self,
+        wrapper: &Value,
+        entry: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let child = self.iterator_call(entry, "children", depth, calling_function, instruction)?;
+        if child.is_null() {
+            return Ok(entry.clone());
+        }
+        let class = wrapper.class_id().expect("recursive filter class");
+        let class_info = &self.program.classes[class.0 as usize];
+        let copied = class_info.properties.len().max(
+            if class_info.name == "RecursiveCallbackFilterIterator" {
+                3
+            } else {
+                2
+            },
+        );
+        let child_wrapper = self.allocate_object(
+            class,
+            wrapper.type_arguments().unwrap_or_default().to_vec(),
+            copied,
+            span,
+        )?;
+        for slot in 0..copied {
+            let value = wrapper
+                .property(thp_hir::PropertyId(
+                    u32::try_from(slot).expect("property count fits u32"),
+                ))
+                .map_err(|kind| runtime(kind, span))?;
+            child_wrapper
+                .set_property(
+                    thp_hir::PropertyId(u32::try_from(slot).expect("property count fits u32")),
+                    value,
+                )
+                .map_err(|kind| runtime(kind, span))?;
+        }
+        child_wrapper
+            .set_property(thp_hir::PropertyId(0), child)
+            .map_err(|kind| runtime(kind, span))?;
+        child_wrapper
+            .set_property(thp_hir::PropertyId(1), Value::bool(false))
+            .map_err(|kind| runtime(kind, span))?;
+        let value = self.iterator_call(entry, "value", depth, calling_function, instruction)?;
+        let node = self.allocate_object(
+            self.classes_by_name["RecursiveEntry"],
+            wrapper.type_arguments().unwrap_or_default().to_vec(),
+            2,
+            span,
+        )?;
+        node.set_property(thp_hir::PropertyId(0), value)
+            .map_err(|kind| runtime(kind, span))?;
+        node.set_property(thp_hir::PropertyId(1), child_wrapper)
+            .map_err(|kind| runtime(kind, span))?;
+        Ok(node)
+    }
+
+    fn fixed_sequence_builtin(
+        &self,
+        builtin: Builtin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let object = &arguments[0];
+        let element = object
+            .type_arguments()
+            .and_then(|types| types.first())
+            .cloned()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        let slot_type = if element == Type::Null {
+            Type::Null
+        } else {
+            let mut members = vec![element, Type::Null];
+            members.sort_by_key(ToString::to_string);
+            Type::Union(members)
+        };
+        if matches!(builtin, Builtin::FixedConstruct | Builtin::FixedSetSize) {
+            let size = arguments[1].as_int().expect("verified sequence size");
+            let size = usize::try_from(size).map_err(|_| {
+                self.native_exception(
+                    "ValueError",
+                    b"sequence size must be non-negative".to_vec(),
+                    None,
+                    0,
+                    span,
+                )
+            })?;
+            let old = if builtin == Builtin::FixedSetSize {
+                object
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, span))?
+                    .vector_values()
+                    .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(size)
+                .map_err(|_| runtime(RuntimeErrorKind::AllocationFailure, span))?;
+            values.extend(old.into_iter().take(size));
+            values.resize(size, Value::NULL);
+            let vector =
+                Value::try_vector(slot_type, values).map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(0), vector)
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        let vector = object
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let values = vector
+            .vector_values()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        match builtin {
+            Builtin::FixedGetSize => Ok(Value::integer(
+                i64::try_from(values.len())
+                    .map_err(|_| runtime(RuntimeErrorKind::Unreachable, span))?,
+            )),
+            Builtin::FixedGetIterator => {
+                let class = self.classes_by_name["VectorIterator"];
+                let element = vector
+                    .collection_types()
+                    .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?
+                    .0;
+                let iterator = self.allocate_object(class, vec![element], 2, span)?;
+                iterator
+                    .set_property(thp_hir::PropertyId(0), vector)
+                    .map_err(|kind| runtime(kind, span))?;
+                iterator
+                    .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(iterator)
+            }
+            Builtin::FixedOffsetExists
+            | Builtin::FixedOffsetGet
+            | Builtin::FixedOffsetSet
+            | Builtin::FixedOffsetUnset => {
+                let index = arguments[1].as_int().ok_or_else(|| {
+                    self.native_exception(
+                        "ValueError",
+                        b"fixed sequence does not support append".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                let index = usize::try_from(index)
+                    .ok()
+                    .filter(|index| *index < values.len());
+                if builtin == Builtin::FixedOffsetExists {
+                    return Ok(Value::bool(
+                        index.is_some_and(|index| !values[index].is_null()),
+                    ));
+                }
+                let index = index.ok_or_else(|| {
+                    self.native_exception(
+                        "OutOfBoundsException",
+                        b"sequence index is out of bounds".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                if builtin == Builtin::FixedOffsetGet {
+                    return Ok(values[index].clone());
+                }
+                let mut next = values.to_vec();
+                next[index] = if builtin == Builtin::FixedOffsetUnset {
+                    Value::NULL
+                } else {
+                    arguments[2].clone()
+                };
+                let updated =
+                    Value::try_vector(slot_type, next).map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(thp_hir::PropertyId(0), updated)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn list_builtin(
+        &self,
+        builtin: Builtin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let object = &arguments[0];
+        let element = self
+            .native_type_arguments(object, "LinkedList", span)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        if builtin == Builtin::ListConstruct {
+            let values =
+                Value::try_vector(element, Vec::new()).map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(0), values)
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        let storage = object
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let values = storage
+            .vector_values()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        match builtin {
+            Builtin::ListCount => Ok(Value::integer(
+                i64::try_from(values.len())
+                    .map_err(|_| runtime(RuntimeErrorKind::Unreachable, span))?,
+            )),
+            Builtin::ListIsEmpty => Ok(Value::bool(values.is_empty())),
+            Builtin::ListToVector => Ok(storage),
+            Builtin::ListGetIterator => {
+                let class_name = &self.program.classes
+                    [object.class_id().expect("linked sequence class").0 as usize]
+                    .name;
+                let snapshot = if class_name == "Stack" {
+                    Value::try_vector(element.clone(), values.iter().rev().cloned().collect())
+                        .map_err(|kind| runtime(kind, span))?
+                } else {
+                    storage
+                };
+                let class = self.classes_by_name["VectorIterator"];
+                let iterator = self.allocate_object(class, vec![element], 2, span)?;
+                iterator
+                    .set_property(thp_hir::PropertyId(0), snapshot)
+                    .map_err(|kind| runtime(kind, span))?;
+                iterator
+                    .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(iterator)
+            }
+            Builtin::ListTop | Builtin::ListBottom => values
+                .get(if builtin == Builtin::ListTop {
+                    values.len().saturating_sub(1)
+                } else {
+                    0
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    self.native_exception(
+                        "UnderflowException",
+                        b"linked sequence is empty".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                }),
+            Builtin::ListPush | Builtin::ListUnshift | Builtin::ListPop | Builtin::ListShift => {
+                // ponytail: head operations copy O(n) elements; switch to a deque
+                // representation if large queue workloads justify it.
+                let mut next = values.to_vec();
+                let removed = match builtin {
+                    Builtin::ListPush => {
+                        next.push(arguments[1].clone());
+                        None
+                    }
+                    Builtin::ListUnshift => {
+                        next.insert(0, arguments[1].clone());
+                        None
+                    }
+                    Builtin::ListPop => next.pop(),
+                    Builtin::ListShift if !next.is_empty() => Some(next.remove(0)),
+                    _ => None,
+                };
+                if matches!(builtin, Builtin::ListPop | Builtin::ListShift) && removed.is_none() {
+                    return Err(self.native_exception(
+                        "UnderflowException",
+                        b"linked sequence is empty".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ));
+                }
+                let updated =
+                    Value::try_vector(element, next).map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(thp_hir::PropertyId(0), updated)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(removed.unwrap_or(Value::NULL))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn heap_better(name: &str, left: &Value, right: &Value, span: Span) -> Result<bool, VmError> {
+        if name == "PriorityQueue" {
+            let a = left
+                .vector_values()
+                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+            let b = right
+                .vector_values()
+                .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+            let (ap, bp) = (
+                a[0].as_int().expect("priority"),
+                b[0].as_int().expect("priority"),
+            );
+            return Ok(ap > bp || ap == bp && a[1].as_int() < b[1].as_int());
+        }
+        execute_binary(
+            if name == "MinHeap" {
+                BinaryOp::Less
+            } else {
+                BinaryOp::Greater
+            },
+            left,
+            right,
+            span,
+        )?
+        .as_bool()
+        .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))
+    }
+
+    fn heap_best_index(name: &str, values: &[Value], span: Span) -> Result<usize, VmError> {
+        let mut best = 0;
+        for index in 1..values.len() {
+            if Self::heap_better(name, &values[index], &values[best], span)? {
+                best = index;
+            }
+        }
+        Ok(best)
+    }
+
+    fn heap_builtin(
+        &self,
+        builtin: Builtin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let object = &arguments[0];
+        let class = object.class_id().expect("heap class");
+        let name = self.program.classes[class.0 as usize].name.as_str();
+        let element = object
+            .type_arguments()
+            .and_then(|types| types.first())
+            .cloned()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        if builtin == Builtin::HeapConstruct {
+            let storage =
+                Value::try_vector(Type::Mixed, Vec::new()).map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(0), storage)
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        let storage = object
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let values = storage
+            .vector_values()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        match builtin {
+            Builtin::HeapCount => Ok(Value::integer(
+                i64::try_from(values.len())
+                    .map_err(|_| runtime(RuntimeErrorKind::Unreachable, span))?,
+            )),
+            Builtin::HeapIsEmpty => Ok(Value::bool(values.is_empty())),
+            Builtin::HeapInsert => {
+                let item = if name == "PriorityQueue" {
+                    let sequence = object
+                        .property(thp_hir::PropertyId(1))
+                        .map_err(|kind| runtime(kind, span))?
+                        .as_int()
+                        .expect("sequence");
+                    let next = sequence.checked_add(1).ok_or_else(|| {
+                        self.native_exception(
+                            "OverflowException",
+                            b"priority queue sequence overflow".to_vec(),
+                            None,
+                            0,
+                            span,
+                        )
+                    })?;
+                    let record = Value::try_vector(
+                        Type::Mixed,
+                        vec![
+                            arguments[2].clone(),
+                            Value::integer(sequence),
+                            arguments[1].clone(),
+                        ],
+                    )
+                    .map_err(|kind| runtime(kind, span))?;
+                    object
+                        .set_property(thp_hir::PropertyId(1), Value::integer(next))
+                        .map_err(|kind| runtime(kind, span))?;
+                    record
+                } else {
+                    if arguments[1].as_float().is_some_and(f64::is_nan) {
+                        return Err(self.native_exception(
+                            "ValueError",
+                            b"NaN cannot be ordered in a heap".to_vec(),
+                            None,
+                            0,
+                            span,
+                        ));
+                    }
+                    Self::heap_better(name, &arguments[1], &arguments[1], span)?;
+                    for previous in values {
+                        Self::heap_better(name, &arguments[1], previous, span)?;
+                    }
+                    arguments[1].clone()
+                };
+                let mut next = values.to_vec();
+                next.push(item);
+                let updated =
+                    Value::try_vector(Type::Mixed, next).map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(thp_hir::PropertyId(0), updated)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            Builtin::HeapTop | Builtin::HeapExtract | Builtin::HeapGetIterator => {
+                if values.is_empty() && builtin != Builtin::HeapGetIterator {
+                    return Err(self.native_exception(
+                        "UnderflowException",
+                        b"heap is empty".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ));
+                }
+                if builtin == Builtin::HeapGetIterator {
+                    // ponytail: snapshot ordering scans O(n²); use a binary heap
+                    // if large heaps make iteration a measured bottleneck.
+                    let mut remaining = values.to_vec();
+                    let mut ordered = Vec::new();
+                    while !remaining.is_empty() {
+                        let index = Self::heap_best_index(name, &remaining, span)?;
+                        let item = remaining.remove(index);
+                        ordered.push(if name == "PriorityQueue" {
+                            item.vector_values().expect("priority record")[2].clone()
+                        } else {
+                            item
+                        });
+                    }
+                    let snapshot = Value::try_vector(element.clone(), ordered)
+                        .map_err(|kind| runtime(kind, span))?;
+                    let iterator = self.allocate_object(
+                        self.classes_by_name["VectorIterator"],
+                        vec![element],
+                        2,
+                        span,
+                    )?;
+                    iterator
+                        .set_property(thp_hir::PropertyId(0), snapshot)
+                        .map_err(|kind| runtime(kind, span))?;
+                    iterator
+                        .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                        .map_err(|kind| runtime(kind, span))?;
+                    return Ok(iterator);
+                }
+                let index = Self::heap_best_index(name, values, span)?;
+                let item = values[index].clone();
+                if builtin == Builtin::HeapExtract {
+                    let mut next = values.to_vec();
+                    next.remove(index);
+                    let updated =
+                        Value::try_vector(Type::Mixed, next).map_err(|kind| runtime(kind, span))?;
+                    object
+                        .set_property(thp_hir::PropertyId(0), updated)
+                        .map_err(|kind| runtime(kind, span))?;
+                }
+                Ok(if name == "PriorityQueue" {
+                    item.vector_values().expect("priority record")[2].clone()
+                } else {
+                    item
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn typed_map_builtin(
+        &self,
+        builtin: Builtin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let object = &arguments[0];
+        let [key_type, value_type] = object
+            .type_arguments()
+            .and_then(|types| <[Type; 2]>::try_from(types.to_vec()).ok())
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        if builtin == Builtin::TypedMapConstruct {
+            let map = Value::try_map(key_type, value_type, Vec::new())
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(0), map)
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        let map = object
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let entries = map
+            .map_entries()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        match builtin {
+            Builtin::TypedMapCount => Ok(Value::integer(
+                i64::try_from(entries.len())
+                    .map_err(|_| runtime(RuntimeErrorKind::Unreachable, span))?,
+            )),
+            Builtin::TypedMapToMap => Ok(map),
+            Builtin::TypedMapGetIterator => {
+                let iterator = self.allocate_object(
+                    self.classes_by_name["MapIterator"],
+                    vec![key_type, value_type],
+                    2,
+                    span,
+                )?;
+                iterator
+                    .set_property(thp_hir::PropertyId(0), map)
+                    .map_err(|kind| runtime(kind, span))?;
+                iterator
+                    .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(iterator)
+            }
+            Builtin::TypedMapGet
+            | Builtin::TypedMapContains
+            | Builtin::TypedMapRemove
+            | Builtin::TypedMapSet => {
+                let found = entries.iter().position(|(key, _)| key == &arguments[1]);
+                match builtin {
+                    Builtin::TypedMapGet => {
+                        Ok(found.map_or(Value::NULL, |index| entries[index].1.clone()))
+                    }
+                    Builtin::TypedMapContains => Ok(Value::bool(found.is_some())),
+                    Builtin::TypedMapRemove | Builtin::TypedMapSet => {
+                        let mut next = entries.to_vec();
+                        if builtin == Builtin::TypedMapRemove {
+                            if let Some(index) = found {
+                                next.remove(index);
+                            }
+                        } else if let Some(index) = found {
+                            next[index].1 = arguments[2].clone();
+                        } else {
+                            next.push((arguments[1].clone(), arguments[2].clone()));
+                        }
+                        let updated = Value::try_map(key_type, value_type, next)
+                            .map_err(|kind| runtime(kind, span))?;
+                        object
+                            .set_property(thp_hir::PropertyId(0), updated)
+                            .map_err(|kind| runtime(kind, span))?;
+                        Ok(if builtin == Builtin::TypedMapRemove {
+                            Value::bool(found.is_some())
+                        } else {
+                            Value::NULL
+                        })
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn object_storage_builtin(
+        &self,
+        builtin: Builtin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let object = &arguments[0];
+        if builtin == Builtin::ObjectStorageConstruct {
+            let values =
+                Value::try_vector(Type::Mixed, Vec::new()).map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(0), values)
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        let storage = object
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let records = storage
+            .vector_values()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        if builtin == Builtin::ObjectStorageCount {
+            return Ok(Value::integer(
+                i64::try_from(records.len())
+                    .map_err(|_| runtime(RuntimeErrorKind::Unreachable, span))?,
+            ));
+        }
+        if builtin == Builtin::ObjectStorageGetIterator {
+            let objects = records
+                .iter()
+                .map(|record| record.vector_values().expect("storage record")[0].clone())
+                .collect();
+            let values =
+                Value::try_vector(Type::Mixed, objects).map_err(|kind| runtime(kind, span))?;
+            let iterator = self.allocate_object(
+                self.classes_by_name["VectorIterator"],
+                vec![Type::Mixed],
+                2,
+                span,
+            )?;
+            iterator
+                .set_property(thp_hir::PropertyId(0), values)
+                .map_err(|kind| runtime(kind, span))?;
+            iterator
+                .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(iterator);
+        }
+        if arguments[1].class_id().is_none() {
+            return Err(self.native_exception(
+                "TypeError",
+                b"object storage key must be an object".to_vec(),
+                None,
+                0,
+                span,
+            ));
+        }
+        let found = records
+            .iter()
+            .position(|record| record.vector_values().expect("storage record")[0] == arguments[1]);
+        match builtin {
+            Builtin::ObjectStorageGet => Ok(found.map_or(Value::NULL, |index| {
+                records[index].vector_values().expect("storage record")[1].clone()
+            })),
+            Builtin::ObjectStorageContains => Ok(Value::bool(found.is_some())),
+            Builtin::ObjectStorageAttach | Builtin::ObjectStorageDetach => {
+                let mut next = records.to_vec();
+                if builtin == Builtin::ObjectStorageDetach {
+                    if let Some(index) = found {
+                        next.remove(index);
+                    }
+                } else {
+                    let record = Value::try_vector(
+                        Type::Mixed,
+                        vec![arguments[1].clone(), arguments[2].clone()],
+                    )
+                    .map_err(|kind| runtime(kind, span))?;
+                    if let Some(index) = found {
+                        next[index] = record;
+                    } else {
+                        next.push(record);
+                    }
+                }
+                let updated =
+                    Value::try_vector(Type::Mixed, next).map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(thp_hir::PropertyId(0), updated)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(if builtin == Builtin::ObjectStorageDetach {
+                    Value::bool(found.is_some())
+                } else {
+                    Value::NULL
+                })
             }
             _ => unreachable!(),
         }
@@ -2191,7 +3931,21 @@ impl ExecutionState<'_, '_> {
             Builtin::IteratorConstruct | Builtin::CallbackFilterConstruct => {
                 let class = arguments[0].class_id().expect("iterator object");
                 let name = &self.program.classes[class.0 as usize].name;
-                if name != "EmptyIterator" {
+                if name == "AppendIterator" {
+                    let type_arguments = arguments[0].type_arguments().unwrap_or_default();
+                    let inner = Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: type_arguments.to_vec(),
+                    };
+                    let values = Value::try_vector(inner, vec![])
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(0), values)
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(1), Value::NULL)
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                } else if name != "EmptyIterator" {
                     arguments[0]
                         .set_property(thp_hir::PropertyId(0), arguments[1].clone())
                         .map_err(|kind| runtime(kind, instruction.span))?;
@@ -2211,9 +3965,393 @@ impl ExecutionState<'_, '_> {
                         .set_property(thp_hir::PropertyId(2), arguments[2].clone())
                         .map_err(|kind| runtime(kind, instruction.span))?;
                 }
+                if name == "LimitIterator" {
+                    let offset = arguments[2].as_int().expect("verified offset");
+                    let limit = arguments[3].as_int().expect("verified limit");
+                    if offset < 0 || limit < -1 {
+                        return Err(self.native_exception("ValueError", b"LimitIterator offset must be non-negative and limit must be at least -1".to_vec(), None, 0, instruction.span));
+                    }
+                    for (property, value) in [
+                        (1, arguments[2].clone()),
+                        (2, arguments[3].clone()),
+                        (3, Value::integer(0)),
+                    ] {
+                        arguments[0]
+                            .set_property(thp_hir::PropertyId(property), value)
+                            .map_err(|kind| runtime(kind, instruction.span))?;
+                    }
+                }
+                if name == "InfiniteIterator" {
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(1), Value::NULL)
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(2), Value::bool(false))
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                if is_instance_of_name(self.program, class, "CachingIterator") {
+                    let flags = arguments[2].as_int().expect("verified flags");
+                    if flags < 0
+                        || flags & !(1 | 2 | 4 | 8 | 16 | 256) != 0
+                        || (flags & (4 | 8 | 16)).count_ones() > 1
+                    {
+                        return Err(self.native_exception(
+                            "ValueError",
+                            b"invalid caching iterator flags".to_vec(),
+                            None,
+                            0,
+                            instruction.span,
+                        ));
+                    }
+                    let [key, value] = self
+                        .native_type_arguments(&arguments[0], "CachingIterator", instruction.span)?
+                        .try_into()
+                        .map_err(|_| runtime(RuntimeErrorKind::Unreachable, instruction.span))?;
+                    let cache = Value::try_map(key, value, vec![])
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                    for (slot, value) in [
+                        (1, arguments[2].clone()),
+                        (2, Value::NULL),
+                        (3, Value::NULL),
+                        (4, Value::NULL),
+                        (5, Value::NULL),
+                        (6, Value::bool(false)),
+                        (7, Value::bool(false)),
+                        (8, cache),
+                        (9, Value::integer(0)),
+                    ] {
+                        arguments[0]
+                            .set_property(thp_hir::PropertyId(slot), value)
+                            .map_err(|kind| runtime(kind, instruction.span))?;
+                    }
+                }
                 Ok(Value::NULL)
             }
+            Builtin::CachingHasNext
+            | Builtin::CachingCount
+            | Builtin::CachingGetCache
+            | Builtin::CachingGetFlags
+            | Builtin::CachingSetFlags
+            | Builtin::CachingOffsetExists
+            | Builtin::CachingOffsetGet
+            | Builtin::CachingOffsetSet
+            | Builtin::CachingOffsetUnset
+            | Builtin::CachingToString => {
+                self.caching_builtin(builtin, &arguments, depth, calling_function, instruction)
+            }
+            Builtin::RecursiveEntryConstruct => {
+                arguments[0]
+                    .set_property(thp_hir::PropertyId(0), arguments[1].clone())
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                arguments[0]
+                    .set_property(thp_hir::PropertyId(1), arguments[2].clone())
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(Value::NULL)
+            }
+            Builtin::RecursiveEntryValue | Builtin::RecursiveEntryChildren => arguments[0]
+                .property(thp_hir::PropertyId(u32::from(
+                    builtin == Builtin::RecursiveEntryChildren,
+                )))
+                .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::RecursiveWalkConstruct => {
+                let mode = arguments[2].as_int().expect("verified traversal mode");
+                if !(0..=2).contains(&mode) {
+                    return Err(self.native_exception(
+                        "ValueError",
+                        b"invalid recursive traversal mode".to_vec(),
+                        None,
+                        0,
+                        instruction.span,
+                    ));
+                }
+                let empty = Value::try_vector(Type::Mixed, vec![])
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                for (slot, value) in [
+                    (0, arguments[1].clone()),
+                    (1, arguments[2].clone()),
+                    (2, Value::integer(-1)),
+                    (3, empty),
+                    (4, Value::NULL),
+                    (5, Value::NULL),
+                    (6, Value::integer(-1)),
+                    (7, Value::bool(false)),
+                    (8, Value::bool(false)),
+                    (9, Value::bool(false)),
+                ] {
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(slot), value)
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                Ok(Value::NULL)
+            }
+            Builtin::RecursiveWalkSetMaxDepth => {
+                let max = arguments[1].as_int().expect("verified depth");
+                if max < -1 {
+                    return Err(self.native_exception(
+                        "ValueError",
+                        b"maximum depth must be at least -1".to_vec(),
+                        None,
+                        0,
+                        instruction.span,
+                    ));
+                }
+                arguments[0]
+                    .set_property(thp_hir::PropertyId(2), Value::integer(max))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(Value::NULL)
+            }
+            Builtin::RecursiveWalkGetMaxDepth => {
+                let max = arguments[0]
+                    .property(thp_hir::PropertyId(2))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(if max.as_int() == Some(-1) {
+                    Value::bool(false)
+                } else {
+                    max
+                })
+            }
+            Builtin::RecursiveWalkGetDepth => arguments[0]
+                .property(thp_hir::PropertyId(6))
+                .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::RecursiveWalkGetRecursiveIterator => arguments[0]
+                .property(thp_hir::PropertyId(0))
+                .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::RecursiveWalkGetSubIterator => {
+                let stack = arguments[0]
+                    .property(thp_hir::PropertyId(3))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                let frames = stack
+                    .vector_values()
+                    .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, instruction.span))?;
+                let level = if arguments[1].is_null() {
+                    frames.len().checked_sub(1)
+                } else {
+                    arguments[1]
+                        .as_int()
+                        .and_then(|level| usize::try_from(level).ok())
+                };
+                level
+                    .and_then(|level| frames.get(level))
+                    .map_or(Ok(Value::NULL), |frame| {
+                        WalkFrame::decode(frame, instruction.span).map(|frame| frame.iterator)
+                    })
+            }
+            Builtin::RecursiveWalkHook => Ok(Value::NULL),
+            Builtin::FixedConstruct
+            | Builtin::FixedSetSize
+            | Builtin::FixedGetSize
+            | Builtin::FixedOffsetExists
+            | Builtin::FixedOffsetGet
+            | Builtin::FixedOffsetSet
+            | Builtin::FixedOffsetUnset
+            | Builtin::FixedGetIterator => {
+                self.fixed_sequence_builtin(builtin, &arguments, instruction)
+            }
+            Builtin::ListConstruct
+            | Builtin::ListPush
+            | Builtin::ListPop
+            | Builtin::ListUnshift
+            | Builtin::ListShift
+            | Builtin::ListTop
+            | Builtin::ListBottom
+            | Builtin::ListCount
+            | Builtin::ListIsEmpty
+            | Builtin::ListGetIterator
+            | Builtin::ListToVector => self.list_builtin(builtin, &arguments, instruction),
+            Builtin::HeapConstruct
+            | Builtin::HeapInsert
+            | Builtin::HeapTop
+            | Builtin::HeapExtract
+            | Builtin::HeapCount
+            | Builtin::HeapIsEmpty
+            | Builtin::HeapGetIterator => self.heap_builtin(builtin, &arguments, instruction),
+            Builtin::TypedMapConstruct
+            | Builtin::TypedMapSet
+            | Builtin::TypedMapGet
+            | Builtin::TypedMapContains
+            | Builtin::TypedMapRemove
+            | Builtin::TypedMapCount
+            | Builtin::TypedMapToMap
+            | Builtin::TypedMapGetIterator => {
+                self.typed_map_builtin(builtin, &arguments, instruction)
+            }
+            Builtin::ObjectStorageConstruct
+            | Builtin::ObjectStorageAttach
+            | Builtin::ObjectStorageGet
+            | Builtin::ObjectStorageContains
+            | Builtin::ObjectStorageDetach
+            | Builtin::ObjectStorageCount
+            | Builtin::ObjectStorageGetIterator => {
+                self.object_storage_builtin(builtin, &arguments, instruction)
+            }
+            Builtin::LimitGetPosition => arguments[0]
+                .property(thp_hir::PropertyId(3))
+                .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::LimitSeek => {
+                let position = arguments[1].as_int().expect("verified seek offset");
+                let limit = arguments[0]
+                    .property(thp_hir::PropertyId(2))
+                    .map_err(|kind| runtime(kind, instruction.span))?
+                    .as_int()
+                    .expect("initialized limit");
+                if position < 0 || limit >= 0 && position >= limit {
+                    return Err(self.native_exception(
+                        "OutOfBoundsException",
+                        b"limit iterator position is out of bounds".to_vec(),
+                        None,
+                        0,
+                        instruction.span,
+                    ));
+                }
+                self.native_iterator_method(
+                    Builtin::IteratorRewind,
+                    &arguments[0],
+                    depth,
+                    calling_function,
+                    instruction,
+                )?;
+                for _ in 0..position {
+                    if self
+                        .native_iterator_method(
+                            Builtin::IteratorValid,
+                            &arguments[0],
+                            depth,
+                            calling_function,
+                            instruction,
+                        )?
+                        .as_bool()
+                        != Some(true)
+                    {
+                        break;
+                    }
+                    self.tick(instruction.span)?;
+                    self.native_iterator_method(
+                        Builtin::IteratorAdvance,
+                        &arguments[0],
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?;
+                }
+                if self
+                    .native_iterator_method(
+                        Builtin::IteratorValid,
+                        &arguments[0],
+                        depth,
+                        calling_function,
+                        instruction,
+                    )?
+                    .as_bool()
+                    != Some(true)
+                {
+                    return Err(self.native_exception(
+                        "OutOfBoundsException",
+                        b"limit iterator position is out of bounds".to_vec(),
+                        None,
+                        0,
+                        instruction.span,
+                    ));
+                }
+                Ok(Value::NULL)
+            }
+            Builtin::AppendAdd => {
+                let position = arguments[0]
+                    .property(thp_hir::PropertyId(1))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                if !position.is_null() {
+                    return Err(self.native_exception(
+                        "LogicException",
+                        b"cannot append after traversal starts".to_vec(),
+                        None,
+                        0,
+                        instruction.span,
+                    ));
+                }
+                let mut values = arguments[0]
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                values
+                    .vector_push(arguments[1].clone())
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                arguments[0]
+                    .set_property(thp_hir::PropertyId(0), values)
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(Value::NULL)
+            }
+            Builtin::AppendGetIndex => {
+                let index = arguments[0]
+                    .property(thp_hir::PropertyId(1))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                let len = arguments[0]
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, instruction.span))?
+                    .collection_len()
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(
+                    if index
+                        .as_int()
+                        .and_then(|index| usize::try_from(index).ok())
+                        .is_some_and(|index| index < len)
+                    {
+                        index
+                    } else {
+                        Value::NULL
+                    },
+                )
+            }
+            Builtin::AppendGetIterator => {
+                let values = arguments[0]
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                let element = values
+                    .collection_types()
+                    .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, instruction.span))?
+                    .0;
+                let class = self.classes_by_name["VectorIterator"];
+                let iterator = self.allocate_object(class, vec![element], 2, instruction.span)?;
+                iterator
+                    .set_property(thp_hir::PropertyId(0), values)
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                iterator
+                    .set_property(thp_hir::PropertyId(1), Value::integer(0))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(iterator)
+            }
             Builtin::CallbackFilterAccept => {
+                let callback = arguments[0]
+                    .property(thp_hir::PropertyId(2))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                self.invoke_callback(
+                    &callback,
+                    vec![arguments[1].clone(), arguments[2].clone()],
+                    depth,
+                    calling_function,
+                    instruction,
+                )
+            }
+            Builtin::ParentAccept => {
+                let child = self.iterator_call(
+                    &arguments[1],
+                    "children",
+                    depth,
+                    calling_function,
+                    instruction,
+                )?;
+                Ok(Value::bool(!child.is_null()))
+            }
+            Builtin::RecursiveCallbackConstruct => {
+                for (slot, value) in [
+                    (0, arguments[1].clone()),
+                    (1, Value::bool(false)),
+                    (2, arguments[2].clone()),
+                ] {
+                    arguments[0]
+                        .set_property(thp_hir::PropertyId(slot), value)
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                Ok(Value::NULL)
+            }
+            Builtin::RecursiveCallbackAccept => {
                 let callback = arguments[0]
                     .property(thp_hir::PropertyId(2))
                     .map_err(|kind| runtime(kind, instruction.span))?;
@@ -3773,11 +5911,55 @@ impl ExecutionState<'_, '_> {
         } else if is_instance_of_name(self.program, class, "Throwable") {
             Value::try_throwable_object(class, property_count)
         } else {
-            let property_count = if matches!(
-                class_name,
-                "VectorIterator" | "MapIterator" | "IteratorIterator"
-            ) {
-                property_count.max(2)
+            let recursive_walk =
+                is_instance_of_name(self.program, class, "RecursiveIteratorIterator");
+            let property_count = if recursive_walk
+                || matches!(
+                    class_name,
+                    "VectorIterator"
+                        | "MapIterator"
+                        | "IteratorIterator"
+                        | "LimitIterator"
+                        | "InfiniteIterator"
+                        | "AppendIterator"
+                        | "CachingIterator"
+                        | "RecursiveCachingIterator"
+                        | "FixedSequence"
+                        | "LinkedList"
+                        | "Queue"
+                        | "Stack"
+                        | "MaxHeap"
+                        | "MinHeap"
+                        | "PriorityQueue"
+                        | "TypedMap"
+                        | "ObjectStorage"
+                        | "RecursiveCallbackFilterIterator"
+                        | "RecursiveEntry"
+                        | "RecursiveIteratorIterator"
+                ) {
+                property_count.max(if class_name == "LimitIterator" {
+                    4
+                } else if class_name == "InfiniteIterator" {
+                    3
+                } else if is_instance_of_name(self.program, class, "CachingIterator")
+                    || recursive_walk
+                {
+                    10
+                } else if matches!(
+                    class_name,
+                    "FixedSequence"
+                        | "LinkedList"
+                        | "Queue"
+                        | "Stack"
+                        | "TypedMap"
+                        | "ObjectStorage"
+                ) {
+                    1
+                } else if class_name == "RecursiveCallbackFilterIterator" {
+                    3
+                } else {
+                    2
+                })
             } else {
                 property_count
             };

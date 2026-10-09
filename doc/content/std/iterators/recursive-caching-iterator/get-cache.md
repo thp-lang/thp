@@ -8,7 +8,7 @@ order: 3
 typeParameters: []
 parameters: []
 returns:
-  type: vector<RecursiveEntry<T>>
+  type: map<K, RecursiveEntry<K, T>>
   description: Returns entries retained so far.
 errors:
   - description:
@@ -16,10 +16,8 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This experimental recursive caching member is implemented.
 version: "0.1"
 owner: std.spl.RecursiveCachingIterator
 visibility: public

@@ -42,10 +42,8 @@ constants:
     description: Retains every visited key and value.
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: This adapter executes through the common Iterator<K, V> cursor protocol.
 version: "0.1"
 ---
 
@@ -60,6 +58,17 @@ version: "0.1"
 ## Behavior
 
 `hasNext()` provides one-value lookahead. Cache access is available only when full caching is enabled. String conversion behavior depends on flags.
+
+`rewind()` clears the cache, pulls the current entry, and prefetches one more.
+`advance()` pulls at most one more entry. `count()` reports entries visited in
+the current traversal; `getCache()` snapshots retained keyed entries, with
+repeated keys updated at their first position. Enabling `FULL_CACHE` during a
+traversal starts retention from that point.
+
+The string flags select the current value by default, the current key with
+`TOSTRING_USE_KEY`, or the wrapped iterator with `TOSTRING_USE_INNER`. The
+selected value must be a scalar or `Stringable`. `CATCH_GET_CHILD` has no
+effect on this nonrecursive adapter.
 
 ## Errors
 

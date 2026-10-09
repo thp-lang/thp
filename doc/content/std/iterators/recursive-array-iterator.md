@@ -47,7 +47,7 @@ name. THP's replacement is provisionally called
 
 ## Behavior
 
-The iterator cursor exposes each source key as `K`; its `RecursiveEntry<V>`
+The iterator cursor exposes each source key as `K`; its `RecursiveEntry<K, V>`
 value carries the source value and optional child iterator. Map or vector
 values become the `children()` iterator. With `CHILD_ARRAYS_ONLY`, objects are
 not treated as child collections.
