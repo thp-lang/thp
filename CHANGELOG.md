@@ -7,6 +7,26 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-12
+
+### Added
+
+- std: Added writable and read-write local file streams, all `WriteMode` cases, and local path and `file://` support in `Streams::open()`.
+- std: Added stream capability checks, `write()`, `flush()`, and seeking relative to the current position or end of stream.
+- std: Added `SplFileInfo` path and metadata methods and read-only `SplFileObject` line iteration.
+- std: Added single-directory, recursive-directory, and final-component `*` and `?` glob iterators.
+
+### Changed
+
+- std: `SeekableStream::seek()` now returns the absolute position and accepts an optional `SeekFrom` origin.
+- runtime: Advanced the bytecode schema to version 9; older cached or frozen bytecode must be regenerated.
+
+### Fixed
+
+- runtime: Reading a memory stream after seeking past EOF returns an empty result instead of panicking.
+- std: File streams observe changes made through other handles and reject directories when opened as files.
+- std: Filesystem metadata and iterators handle permission bits, dot paths, Unix backslashes in filenames, and newline-containing glob matches correctly.
+
 ## [0.9.0] - 2026-10-07
 
 ### Added
