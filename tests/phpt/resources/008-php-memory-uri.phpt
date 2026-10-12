@@ -5,13 +5,13 @@ php://memory uses the same behavior as the typed MemoryStream factory
 
 $stream = Streams::open("php://memory", OpenMode::ReadWrite);
 
-if (
-    $stream instanceof ReadableStream
-    && $stream instanceof WritableStream
-    && $stream instanceof SeekableStream
-) {
+if ($stream instanceof WritableStream) {
     $stream->writeAll("uri");
+}
+if ($stream instanceof SeekableStream) {
     $stream->seek(0);
+}
+if ($stream instanceof ReadableStream) {
     echo $stream->readAll() . "\n";
     echo "read-write-seek\n";
 }

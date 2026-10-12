@@ -16,8 +16,8 @@ cases:
   - Create
   - CreateExclusive
 status: experimental
-availability: proposed
-notice: Writable-file modes are proposed and are not implemented.
+availability: implemented
+notice: All five modes execute in both writable file factories.
 version: "0.1"
 ---
 

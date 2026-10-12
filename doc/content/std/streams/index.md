@@ -8,9 +8,8 @@ order: 60
 status: experimental
 availability: partial
 notice:
-  Reading, complete memory/temp writes, absolute seeking, closing, selected
-  factories and URI forms, and typed failures execute. Capability inspection,
-  partial writes, flushing, relative seeking, and writable files remain proposed.
+  Typed stream factories, file modes, capability inspection, writing, flushing,
+  and seeking execute. The public OpenStreamException constructor remains proposed.
 ---
 
 THP does not expose PHP's generic `resource` type. External state is represented
@@ -20,11 +19,10 @@ keeps ownership and cleanup predictable.
 
 ## Availability
 
-| Availability | Symbols                                                                                                                                                                                                                   |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| implemented  | `MemoryStream::open()`, `TempStream::open()`, `Files::openRead()`, `read()`, `readAll()`, `eof()`, `writeAll()`, `tell()`, `close()`, `isClosed()`, stream exception types, `getTarget()`, `getSystemCode()`              |
-| partial      | `MemoryStream`, `TempStream`, `ReadableFileStream`, `ReadableStream`, `WritableStream`, `SeekableStream`, `Files`, `Streams`, `OpenMode`, absolute `seek()`, `Streams::open()`, public `OpenStreamException` construction |
-| proposed     | `Stream` capability inspection, `write()`, `flush()`, `SeekFrom`, relative/end seeking, `WriteMode`, `Files::openWrite()`, `Files::openReadWrite()`, `WritableFileStream`, `ReadWriteFileStream`                          |
+| Availability | Symbols                                                                                                                                                          |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| implemented  | Typed stream factories, file-handle classes, `Stream` capabilities, read/write/flush/seek/close methods, `WriteMode`, `SeekFrom`, and stream exception accessors |
+| partial      | Public `OpenStreamException` construction                                                                                                                        |
 
 See [implementation status](thp:guide.implementationStatus) for the exact
 executable signatures and limitations. An API signature below does not make a
@@ -297,10 +295,10 @@ The modes correspond to PHP's familiar mode strings:
 | `ReadWriteAppend`   | `a+`     | Read, write, and seek; append      |
 | `CreateExclusive`   | `x+`     | Read, write, and seek; new target  |
 
-The executable subset recognizes `php://memory`, `php://temp`,
-`php://temp/maxmemory:N`, and the shared read-only request stream
-`thp:/input`. Local paths and `file://` remain proposed for this bridge; use
-implemented `Files::openRead()` for a local read-only file. Unknown schemes and
+The executable subset recognizes local paths, local `file://` URIs,
+`php://memory`, `php://temp`, `php://temp/maxmemory:N`, and the shared read-only
+request stream `thp:/input`. File URIs accept an empty or `localhost` authority
+and percent-encoded UTF-8 paths. Unknown schemes and
 malformed wrapper options throw
 [`InvalidStreamUriException`](thp:std.streams.InvalidStreamUriException).
 User-registered wrappers, network schemes, standard descriptors, output

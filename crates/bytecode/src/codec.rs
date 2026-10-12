@@ -2,9 +2,9 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId,
-    MAX_CONSTANT_NESTING, MethodSlot, NominalKind, ParameterMetadata, PropertyId,
-    ReflectionBuiltin, Type, TypeParameter, TypeParameterId,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, DirectoryBuiltin, FileInfoBuiltin,
+    FileObjectBuiltin, FunctionId, LocalId, MAX_CONSTANT_NESTING, MethodSlot, NominalKind,
+    ParameterMetadata, PropertyId, ReflectionBuiltin, Type, TypeParameter, TypeParameterId,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
@@ -870,6 +870,25 @@ impl Encoder {
             Callee::Builtin(Builtin::ParentAccept) => self.u8(133),
             Callee::Builtin(Builtin::RecursiveCallbackConstruct) => self.u8(134),
             Callee::Builtin(Builtin::RecursiveCallbackAccept) => self.u8(135),
+            Callee::Builtin(Builtin::FilesOpenWrite) => self.u8(136),
+            Callee::Builtin(Builtin::FilesOpenReadWrite) => self.u8(137),
+            Callee::Builtin(Builtin::StreamWrite) => self.u8(138),
+            Callee::Builtin(Builtin::StreamFlush) => self.u8(139),
+            Callee::Builtin(Builtin::StreamIsReadable) => self.u8(140),
+            Callee::Builtin(Builtin::StreamIsWritable) => self.u8(141),
+            Callee::Builtin(Builtin::StreamIsSeekable) => self.u8(142),
+            Callee::Builtin(Builtin::FileInfo(operation)) => {
+                self.u8(143);
+                self.u8(operation as u8);
+            }
+            Callee::Builtin(Builtin::FileObject(operation)) => {
+                self.u8(144);
+                self.u8(operation as u8);
+            }
+            Callee::Builtin(Builtin::Directory(operation)) => {
+                self.u8(145);
+                self.u8(operation as u8);
+            }
         }
     }
 
@@ -1615,6 +1634,28 @@ impl Decoder<'_> {
             133 => Ok(Callee::Builtin(Builtin::ParentAccept)),
             134 => Ok(Callee::Builtin(Builtin::RecursiveCallbackConstruct)),
             135 => Ok(Callee::Builtin(Builtin::RecursiveCallbackAccept)),
+            136 => Ok(Callee::Builtin(Builtin::FilesOpenWrite)),
+            137 => Ok(Callee::Builtin(Builtin::FilesOpenReadWrite)),
+            138 => Ok(Callee::Builtin(Builtin::StreamWrite)),
+            139 => Ok(Callee::Builtin(Builtin::StreamFlush)),
+            140 => Ok(Callee::Builtin(Builtin::StreamIsReadable)),
+            141 => Ok(Callee::Builtin(Builtin::StreamIsWritable)),
+            142 => Ok(Callee::Builtin(Builtin::StreamIsSeekable)),
+            143 => FileInfoBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::FileInfo(operation)))
+                .ok_or_else(|| self.error("unknown file-info builtin")),
+            144 => FileObjectBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::FileObject(operation)))
+                .ok_or_else(|| self.error("unknown file-object builtin")),
+            145 => DirectoryBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::Directory(operation)))
+                .ok_or_else(|| self.error("unknown directory builtin")),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }

@@ -11,10 +11,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice:
-  read(), readAll(), eof(), tell(), and closing execute. The documented Stream
-  parent and capability-inspection methods remain proposed.
+availability: implemented
+notice: Reading executes on memory, temporary, readable-file, read-write-file, and request-input streams.
 version: "0.1"
 ---
 

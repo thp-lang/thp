@@ -11,10 +11,10 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: partial
+notice: Construction, path accessors, common metadata queries, and __toString()
+  execute. File-opening and class-selection methods remain proposed; access
+  predicates do not yet account for host access-control lists.
 version: "0.1"
 ---
 

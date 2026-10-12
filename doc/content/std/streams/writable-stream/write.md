@@ -21,8 +21,8 @@ errors:
 related:
   - std.streams.WritableStream
 status: experimental
-availability: proposed
-notice: Partial writes are proposed and are not implemented; writeAll() is executable.
+availability: implemented
+notice: Native streams currently accept the complete byte string or throw an I/O exception.
 version: "0.1"
 owner: std.streams.WritableStream
 visibility: public

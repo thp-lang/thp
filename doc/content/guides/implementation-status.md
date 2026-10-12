@@ -98,25 +98,36 @@ cursor; the second consumes an explicit iterator from its current cursor.
 
 ### Stream symbols
 
-| Symbol                                                      | Availability | Executable boundary                                                                                  |
-| ----------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------- |
-| `MemoryStream::open()`, `TempStream::open()`                | implemented  | Binary-safe memory streams and one-time temporary-file spill                                         |
-| `Files::openRead()`                                         | implemented  | Existing local files opened read-only                                                                |
-| `ReadableStream::read()`, `readAll()`, `eof()`              | implemented  | Includes argument, EOF, limit, and closed-handle behavior                                            |
-| `WritableStream::writeAll()`                                | implemented  | Memory and temporary streams only                                                                    |
-| `Closeable::close()`, `isClosed()`                          | implemented  | Shared, idempotent close state and deterministic `using` cleanup                                     |
-| `SeekableStream::tell()`                                    | implemented  | Current absolute byte position                                                                       |
-| `SeekableStream::seek()`                                    | partial      | One absolute position from the start; the executable form is `seek(int): void`                       |
-| `OpenMode`                                                  | partial      | Only `Read`, `Write`, and `ReadWrite` names exist; usable URI combinations are narrower              |
-| `Streams::open()`                                           | partial      | `php://memory`, `php://temp[/maxmemory:N]`, and read-only shared `thp:/input`; no paths or `file://` |
-| Stream exception classes                                    | implemented  | Runtime-produced typed stream failures                                                               |
-| `OpenStreamException::getTarget()`, `getSystemCode()`       | implemented  | Target and platform-code accessors                                                                   |
-| `OpenStreamException::__construct()`                        | partial      | Runtime construction is supported; the documented public four-argument constructor is not            |
-| `Stream::isReadable()`, `isWritable()`, `isSeekable()`      | proposed     | Capability inspection methods are not implemented; use `instanceof`                                  |
-| `WritableStream::write()`, `flush()`                        | proposed     | Partial writes and explicit flushing are not implemented                                             |
-| `SeekFrom`, relative/end seeking                            | proposed     | `Current` and `End` origins are not accepted by executable `seek()`                                  |
-| `Files::openWrite()`, `Files::openReadWrite()`, `WriteMode` | proposed     | Writing factories and modes are not implemented                                                      |
-| `WritableFileStream`, `ReadWriteFileStream`                 | proposed     | Writable and read-write file handles are not implemented                                             |
+| Symbol                                                            | Availability | Executable boundary                                                                       |
+| ----------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------- |
+| `MemoryStream::open()`, `TempStream::open()`                      | implemented  | Binary-safe memory streams and one-time temporary-file spill                              |
+| `Files::openRead()`, `openWrite()`, `openReadWrite()`             | implemented  | Local files with typed read, write, and read-write handles                                |
+| `ReadableStream::read()`, `readAll()`, `eof()`                    | implemented  | Includes argument, EOF, limit, and closed-handle behavior                                 |
+| `WritableStream::write()`, `writeAll()`, `flush()`                | implemented  | Memory, temporary, writable-file, and read-write-file streams                             |
+| `Closeable::close()`, `isClosed()`                                | implemented  | Shared, idempotent close state and deterministic `using` cleanup                          |
+| `SeekableStream::seek()`, `tell()`, `SeekFrom`                    | implemented  | Start, current, and end origins for memory, temporary, and regular files                  |
+| `WriteMode`                                                       | implemented  | All five creation and positioning cases                                                   |
+| `OpenMode`                                                        | implemented  | All seven cases for local files and memory or temporary URI streams                       |
+| `Streams::open()`                                                 | implemented  | Local paths and file://, memory/temp URIs, and read-only shared `thp:/input`              |
+| Stream exception classes                                          | implemented  | Runtime-produced typed stream failures                                                    |
+| `OpenStreamException::getTarget()`, `getSystemCode()`             | implemented  | Target and platform-code accessors                                                        |
+| `OpenStreamException::__construct()`                              | partial      | Runtime construction is supported; the documented public four-argument constructor is not |
+| `Stream::isReadable()`, `isWritable()`, `isSeekable()`            | implemented  | Native stream capabilities, including closed-state inspection                             |
+| `ReadableFileStream`, `WritableFileStream`, `ReadWriteFileStream` | implemented  | Statically typed regular-file operations and shared close state                           |
+
+### Filesystem symbols
+
+| Symbol                                                                                  | Availability | Executable boundary                                                                                 |
+| --------------------------------------------------------------------------------------- | ------------ | --------------------------------------------------------------------------------------------------- |
+| `SplFileInfo::__construct()`, path accessors, `__toString()`                            | implemented  | Paths are stored without an existence check; UTF-8 paths execute                                    |
+| `SplFileInfo` type, size, timestamps, owner, group, inode, permissions, and link target | implemented  | Metadata is queried on each call; unavailable values return `false`                                 |
+| `SplFileInfo::isReadable()`, `isWritable()`, `isExecutable()`                           | partial      | Basic host metadata checks; access-control lists and effective-user checks are not covered          |
+| `SplFileInfo` class selection and `openFile()`                                          | proposed     | No subclass selection or `openFile()` bridge                                                        |
+| `SplFileObject` line iterator, `fgets()`, `eof()`                                       | partial      | Read-only construction, line traversal, and line seeking execute                                    |
+| `SplFileObject` CSV, flags, locking, and writing; `SplTempFileObject`                   | proposed     | These file-object operations are not executable                                                     |
+| `DirectoryIterator`, `FilesystemIterator`                                               | partial      | Single-directory traversal and keyed file information execute                                       |
+| `RecursiveDirectoryIterator`                                                            | partial      | Child iterators feed the common recursive adapter; subpath accessors execute                        |
+| `GlobIterator`                                                                          | partial      | Final-component `*` and `?` patterns, iteration, and count execute; nested patterns remain proposed |
 
 Empty collection literals require an expected generic type:
 

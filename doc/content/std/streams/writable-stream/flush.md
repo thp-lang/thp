@@ -18,8 +18,8 @@ errors:
 related:
   - std.streams.WritableStream
 status: experimental
-availability: proposed
-notice: Explicit stream flushing is proposed and is not implemented.
+availability: implemented
+notice: Native writable streams flush their backing storage and report I/O failures.
 version: "0.1"
 owner: std.streams.WritableStream
 visibility: public

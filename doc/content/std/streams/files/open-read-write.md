@@ -23,8 +23,8 @@ errors:
 related:
   - std.streams.Files
 status: experimental
-availability: proposed
-notice: Read-write file opening is proposed and is not implemented.
+availability: implemented
+notice: All WriteMode cases execute for local paths.
 version: "0.1"
 owner: std.streams.Files
 visibility: public

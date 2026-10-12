@@ -11,10 +11,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice:
-  writeAll() executes on memory and temporary streams. write(), flush(), the
-  documented Stream parent, and writable files remain proposed.
+availability: implemented
+notice: Writing and flushing execute on memory, temporary, writable-file, and read-write-file streams.
 version: "0.1"
 ---
 

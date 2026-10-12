@@ -8,16 +8,16 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, LocalId,
-    MAX_CONSTANT_NESTING, MethodSlot, NominalKind, ParameterMetadata, PropertyId, Type,
-    TypeParameter,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, DirectoryBuiltin, FileInfoBuiltin,
+    FileObjectBuiltin, FunctionId, LocalId, MAX_CONSTANT_NESTING, MethodSlot, NominalKind,
+    ParameterMetadata, PropertyId, Type, TypeParameter,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 8;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 9;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInfo {
@@ -2442,6 +2442,12 @@ fn verify_instruction(
                             | "RecursiveIteratorIterator"
                             | "CallbackFilterIterator"
                             | "TraceLine"
+                            | "SplFileInfo"
+                            | "SplFileObject"
+                            | "DirectoryIterator"
+                            | "FilesystemIterator"
+                            | "RecursiveDirectoryIterator"
+                            | "GlobIterator"
                     ))
             {
                 return Err(error("only a concrete class can be allocated"));
@@ -3763,7 +3769,7 @@ fn verify_builtin_call(
                     Some(Type::Object(name))
                         if matches!(
                             name.as_str(),
-                            "MemoryStream" | "TempStream" | "ReadableStream"
+                            "MemoryStream" | "TempStream" | "ReadableStream" | "Stream" | "ReadableFileStream" | "WritableFileStream" | "ReadWriteFileStream"
                         )
                 )
             {
@@ -3775,8 +3781,16 @@ fn verify_builtin_call(
             &[Type::String],
             &Type::Object("ReadableFileStream".to_owned()),
         ),
+        Builtin::FilesOpenWrite => check(
+            &[Type::String, Type::Int],
+            &Type::Object("WritableFileStream".to_owned()),
+        ),
+        Builtin::FilesOpenReadWrite => check(
+            &[Type::String, Type::Int],
+            &Type::Object("ReadWriteFileStream".to_owned()),
+        ),
         Builtin::StreamTell => {
-            object_receiver("ReadableStream")?;
+            object_receiver("SeekableStream")?;
             if arguments.len() != 1 || result != Some(&Type::Int) {
                 return Err("invalid stream `tell` signature".to_owned());
             }
@@ -3802,11 +3816,17 @@ fn verify_builtin_call(
             }
             Ok(())
         }
-        Builtin::StreamEof | Builtin::StreamIsClosed => {
+        Builtin::StreamEof
+        | Builtin::StreamIsClosed
+        | Builtin::StreamIsReadable
+        | Builtin::StreamIsWritable
+        | Builtin::StreamIsSeekable => {
             object_receiver(if builtin == Builtin::StreamEof {
                 "ReadableStream"
-            } else {
+            } else if builtin == Builtin::StreamIsClosed {
                 "Closeable"
+            } else {
+                "Stream"
             })?;
             if arguments.len() != 1 || result != Some(&Type::Bool) {
                 return Err("invalid boolean stream method signature".to_owned());
@@ -3815,7 +3835,10 @@ fn verify_builtin_call(
         }
         Builtin::StreamSeek => {
             object_receiver("SeekableStream")?;
-            if arguments.len() != 2 || argument_type(1) != &Type::Int || result != Some(&Type::Void)
+            if arguments.len() != 3
+                || argument_type(1) != &Type::Int
+                || argument_type(2) != &Type::Int
+                || result != Some(&Type::Int)
             {
                 return Err("invalid stream `seek` signature".to_owned());
             }
@@ -3831,10 +3854,177 @@ fn verify_builtin_call(
             }
             Ok(())
         }
+        Builtin::StreamWrite => {
+            object_receiver("WritableStream")?;
+            if arguments.len() != 2
+                || argument_type(1) != &Type::String
+                || result != Some(&Type::Int)
+            {
+                return Err("invalid stream `write` signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::StreamFlush => {
+            object_receiver("WritableStream")?;
+            if arguments.len() != 1 || result != Some(&Type::Void) {
+                return Err("invalid stream `flush` signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::StreamClose => {
             object_receiver("Closeable")?;
             if arguments.len() != 1 || result != Some(&Type::Void) {
                 return Err("invalid stream `close` signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::FileInfo(operation) => {
+            object_receiver("SplFileInfo")?;
+            let expected = match operation {
+                FileInfoBuiltin::Construct => {
+                    if arguments.len() != 2 || argument_type(1) != &Type::String {
+                        return Err("invalid file-info constructor".to_owned());
+                    }
+                    Type::Void
+                }
+                FileInfoBuiltin::Basename => {
+                    if arguments.len() != 2 || argument_type(1) != &Type::String {
+                        return Err("invalid file-info basename".to_owned());
+                    }
+                    Type::String
+                }
+                FileInfoBuiltin::Path
+                | FileInfoBuiltin::Pathname
+                | FileInfoBuiltin::Filename
+                | FileInfoBuiltin::Extension
+                | FileInfoBuiltin::ToString => Type::String,
+                FileInfoBuiltin::RealPath | FileInfoBuiltin::LinkTarget | FileInfoBuiltin::Type => {
+                    Type::Union(vec![Type::Bool, Type::String])
+                }
+                FileInfoBuiltin::IsFile
+                | FileInfoBuiltin::IsDir
+                | FileInfoBuiltin::IsLink
+                | FileInfoBuiltin::IsReadable
+                | FileInfoBuiltin::IsWritable
+                | FileInfoBuiltin::IsExecutable => Type::Bool,
+                _ => Type::Union(vec![Type::Bool, Type::Int]),
+            };
+            if arguments.len()
+                != if matches!(
+                    operation,
+                    FileInfoBuiltin::Construct | FileInfoBuiltin::Basename
+                ) {
+                    2
+                } else {
+                    1
+                }
+                || result != Some(&expected)
+            {
+                return Err("invalid file-info builtin signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::FileObject(operation) => {
+            object_receiver("SplFileObject")?;
+            let (count, expected) = match operation {
+                FileObjectBuiltin::Construct => {
+                    if arguments.len() != 2 || argument_type(1) != &Type::String {
+                        return Err("invalid file-object constructor".to_owned());
+                    }
+                    (2, Type::Void)
+                }
+                FileObjectBuiltin::Seek => (2, Type::Void),
+                FileObjectBuiltin::Fread => (2, Type::Union(vec![Type::Bool, Type::String])),
+                FileObjectBuiltin::Rewind | FileObjectBuiltin::Advance => (1, Type::Void),
+                FileObjectBuiltin::Valid | FileObjectBuiltin::Eof => (1, Type::Bool),
+                FileObjectBuiltin::Key | FileObjectBuiltin::Ftell => (1, Type::Int),
+                FileObjectBuiltin::Value | FileObjectBuiltin::Fgets => (1, Type::String),
+            };
+            if arguments.len() != count
+                || (count == 2
+                    && operation != FileObjectBuiltin::Construct
+                    && argument_type(1) != &Type::Int)
+                || result != Some(&expected)
+            {
+                return Err("invalid file-object builtin signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Directory(operation) => {
+            match operation {
+                DirectoryBuiltin::ConstructDirectory
+                | DirectoryBuiltin::KeyInt
+                | DirectoryBuiltin::Seek
+                | DirectoryBuiltin::IsDot
+                | DirectoryBuiltin::ToString => object_receiver("DirectoryIterator")?,
+                DirectoryBuiltin::ConstructFilesystem
+                | DirectoryBuiltin::SkipsDots
+                | DirectoryBuiltin::FollowsSymlinks => object_receiver("FilesystemIterator")?,
+                DirectoryBuiltin::ConstructRecursive
+                | DirectoryBuiltin::RecursiveValue
+                | DirectoryBuiltin::GetSubPath
+                | DirectoryBuiltin::GetSubPathname => {
+                    object_receiver("RecursiveDirectoryIterator")?;
+                }
+                DirectoryBuiltin::ConstructGlob | DirectoryBuiltin::Count => {
+                    object_receiver("GlobIterator")?;
+                }
+                DirectoryBuiltin::KeyPath => object_receiver("FilesystemIterator")
+                    .or_else(|_| object_receiver("RecursiveDirectoryIterator"))
+                    .or_else(|_| object_receiver("GlobIterator"))?,
+                _ => object_receiver("DirectoryIterator")
+                    .or_else(|_| object_receiver("FilesystemIterator"))
+                    .or_else(|_| object_receiver("RecursiveDirectoryIterator"))
+                    .or_else(|_| object_receiver("GlobIterator"))?,
+            }
+            let (count, expected) = match operation {
+                DirectoryBuiltin::ConstructDirectory => (2, Type::Void),
+                DirectoryBuiltin::ConstructFilesystem | DirectoryBuiltin::ConstructRecursive => {
+                    (5, Type::Void)
+                }
+                DirectoryBuiltin::ConstructGlob => (4, Type::Void),
+                DirectoryBuiltin::Rewind | DirectoryBuiltin::Advance | DirectoryBuiltin::Seek => (
+                    if operation == DirectoryBuiltin::Seek {
+                        2
+                    } else {
+                        1
+                    },
+                    Type::Void,
+                ),
+                DirectoryBuiltin::Valid
+                | DirectoryBuiltin::IsDot
+                | DirectoryBuiltin::SkipsDots
+                | DirectoryBuiltin::FollowsSymlinks => (1, Type::Bool),
+                DirectoryBuiltin::KeyInt | DirectoryBuiltin::Count => (1, Type::Int),
+                DirectoryBuiltin::KeyPath | DirectoryBuiltin::ToString => (1, Type::String),
+                DirectoryBuiltin::Value => (1, Type::Object("SplFileInfo".to_owned())),
+                DirectoryBuiltin::RecursiveValue => (
+                    1,
+                    Type::Nominal {
+                        name: "RecursiveEntry".to_owned(),
+                        arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+                    },
+                ),
+                DirectoryBuiltin::GetSubPath | DirectoryBuiltin::GetSubPathname => {
+                    (1, Type::String)
+                }
+            };
+            if arguments.len() != count
+                || (count >= 2
+                    && argument_type(1) != &Type::String
+                    && operation != DirectoryBuiltin::Seek)
+                || (operation == DirectoryBuiltin::Seek && argument_type(1) != &Type::Int)
+                || (matches!(
+                    operation,
+                    DirectoryBuiltin::ConstructFilesystem | DirectoryBuiltin::ConstructRecursive
+                ) && (argument_type(2) != &Type::Bool
+                    || argument_type(3) != &Type::Bool
+                    || argument_type(4) != &Type::Bool))
+                || (operation == DirectoryBuiltin::ConstructGlob
+                    && (argument_type(2) != &Type::Bool || argument_type(3) != &Type::Bool))
+                || result != Some(&expected)
+            {
+                return Err("invalid directory builtin signature".to_owned());
             }
             Ok(())
         }
