@@ -6,17 +6,19 @@ summary: Iterates filesystem entries matched by a glob pattern.
 name: GlobIterator
 module: iterators
 typeParameters: []
-parent:
-  id: std.spl.FilesystemIterator
 interfaces:
+  - id: std.baseTypes.Iterator
+    arguments:
+      - string
+      - SplFileInfo
   - id: std.baseTypes.Countable
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: partial
+notice: Final-component * and ? patterns, iteration, and count() execute. Nested
+  patterns, character classes, and inherited FilesystemIterator behavior remain
+  proposed.
 version: "0.1"
 ---
 
@@ -30,7 +32,9 @@ version: "0.1"
 
 ## Behavior
 
-Pattern matching follows the host filesystem and glob implementation. The constructor exposes symbolic-link following and path-separator normalization as explicit options.
+The constructor matches `*` and `?` in the final path component. It captures
+matching entries when constructed. The optional booleans retain their declared
+signatures; recursive traversal is not implemented.
 
 ## Differences from PHP
 

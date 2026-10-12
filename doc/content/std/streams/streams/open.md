@@ -26,11 +26,10 @@ errors:
 related:
   - std.streams.Streams
 status: experimental
-availability: partial
+availability: implemented
 notice:
-  Implements php://memory, php://temp[/maxmemory:N], and read-only thp:/input.
-  Local paths, file://, capability inspection, and complete OpenMode behavior
-  remain proposed.
+  Local paths, local file:// URIs, php://memory, php://temp[/maxmemory:N], and
+  read-only thp:/input execute with mode-specific capabilities.
 version: "0.1"
 owner: std.streams.Streams
 visibility: public

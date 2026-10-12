@@ -13,10 +13,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice:
-  Opening, reading, writeAll(), absolute seek(int), tell(), and closing execute.
-  write(), flush(), and the documented relative-seek signature remain proposed.
+availability: implemented
+notice: Opening, reading, writing, flushing, seeking, and closing execute.
 version: "0.1"
 ---
 

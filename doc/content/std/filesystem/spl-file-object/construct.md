@@ -34,10 +34,8 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: partial
+notice: The executable signature accepts only the filename and opens it read-only.
 version: "0.1"
 owner: std.spl.SplFileObject
 visibility: public

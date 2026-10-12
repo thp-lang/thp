@@ -7,7 +7,7 @@ use std::alloc::{Layout, alloc};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::mem;
 use std::rc::Rc;
@@ -1053,6 +1053,7 @@ impl Value {
                 cursor: 0,
                 closed: false,
                 spill_threshold: None,
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle,
             }),
         })
@@ -1066,6 +1067,7 @@ impl Value {
                 cursor: 0,
                 closed: false,
                 spill_threshold: None,
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle: None,
             }),
         })
@@ -1083,6 +1085,28 @@ impl Value {
                 cursor: 0,
                 closed: false,
                 spill_threshold: Some(spill_threshold),
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
+                handle,
+            }),
+        })
+    }
+
+    pub fn try_memory_stream_mode(
+        class: ClassId,
+        spill_threshold: Option<usize>,
+        readable: bool,
+        writable: bool,
+        append: bool,
+    ) -> Result<Self, RuntimeErrorKind> {
+        let handle = Self::active_handle_lease()?;
+        Self::try_allocate(HeapData::Stream {
+            class,
+            state: RefCell::new(StreamState {
+                storage: StreamStorage::Memory(Vec::new()),
+                cursor: 0,
+                closed: false,
+                spill_threshold,
+                capabilities: stream_flags(readable, writable, append),
                 handle,
             }),
         })
@@ -1096,6 +1120,7 @@ impl Value {
                 cursor: 0,
                 closed: false,
                 spill_threshold: Some(spill_threshold),
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle: None,
             }),
         })
@@ -1113,6 +1138,30 @@ impl Value {
                 cursor: 0,
                 closed: false,
                 spill_threshold: None,
+                capabilities: STREAM_READ,
+                handle,
+            }),
+        })
+    }
+
+    pub fn try_file_stream(
+        class: ClassId,
+        file: std::fs::File,
+        readable: bool,
+        writable: bool,
+        append: bool,
+    ) -> Result<Self, RuntimeErrorKind> {
+        let length = usize::try_from(file.metadata().map_err(stream_io_error)?.len())
+            .map_err(|_| RuntimeErrorKind::Io("file is too large".to_owned()))?;
+        let handle = Self::active_handle_lease()?;
+        Self::try_allocate(HeapData::Stream {
+            class,
+            state: RefCell::new(StreamState {
+                storage: StreamStorage::File { file },
+                cursor: if append { length } else { 0 },
+                closed: false,
+                spill_threshold: None,
+                capabilities: stream_flags(readable, writable, append),
                 handle,
             }),
         })
@@ -1592,6 +1641,11 @@ impl Value {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
         let bytes = match &state.storage {
             StreamStorage::Input(input) => input.read(length)?,
             StreamStorage::Closed => {
@@ -1599,7 +1653,7 @@ impl Value {
             }
             StreamStorage::Memory(_) | StreamStorage::File { .. } => {
                 let start = state.cursor;
-                let end = start.saturating_add(length).min(state.len());
+                let end = start.saturating_add(length).min(state.len()?);
                 state.read_range(start, end)?
             }
         };
@@ -1616,25 +1670,77 @@ impl Value {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
         let bytes = match &state.storage {
             StreamStorage::Input(input) => input.read_all(limit)?,
             StreamStorage::Closed => {
                 return Err(RuntimeErrorKind::Io("stream is closed".to_owned()));
             }
             StreamStorage::Memory(_) | StreamStorage::File { .. } => {
-                let remaining = state.len().saturating_sub(state.cursor);
+                let end = state.len()?;
+                let remaining = end.saturating_sub(state.cursor);
                 if limit.is_some_and(|limit| remaining > limit) {
                     return Err(RuntimeErrorKind::Io(
                         "stream read limit exceeded".to_owned(),
                     ));
                 }
                 let start = state.cursor;
-                let end = state.len();
                 state.read_range(start, end)?
             }
         };
         state.cursor = state.cursor.saturating_add(bytes.len());
         Ok(bytes)
+    }
+
+    pub fn stream_read_line(&self) -> Result<Option<Vec<u8>>, RuntimeErrorKind> {
+        let state = self.stream_state()?;
+        let mut state = state.borrow_mut();
+        ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
+        let cursor = state.cursor;
+        let bytes = match &mut state.storage {
+            StreamStorage::Memory(storage) => {
+                if cursor >= storage.len() {
+                    return Ok(None);
+                }
+                let remaining = &storage[cursor..];
+                let length = remaining
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(remaining.len(), |index| index + 1);
+                remaining[..length].to_vec()
+            }
+            StreamStorage::File { file, .. } => {
+                file.seek(SeekFrom::Start(cursor as u64))
+                    .map_err(stream_io_error)?;
+                let mut bytes = Vec::new();
+                if std::io::BufReader::new(file)
+                    .read_until(b'\n', &mut bytes)
+                    .map_err(stream_io_error)?
+                    == 0
+                {
+                    return Ok(None);
+                }
+                bytes
+            }
+            _ => {
+                return Err(RuntimeErrorKind::Io(
+                    "stream does not support line reading".to_owned(),
+                ));
+            }
+        };
+        state.cursor = cursor
+            .checked_add(bytes.len())
+            .ok_or_else(|| RuntimeErrorKind::Io("stream position overflow".to_owned()))?;
+        Ok(Some(bytes))
     }
 
     /// Reports whether the shared cursor is at the end.
@@ -1646,11 +1752,16 @@ impl Value {
         let state = self.stream_state()?;
         let state = state.borrow();
         ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
         match &state.storage {
             StreamStorage::Input(input) => input.eof(),
             StreamStorage::Closed => Err(RuntimeErrorKind::Io("stream is closed".to_owned())),
             StreamStorage::Memory(_) | StreamStorage::File { .. } => {
-                Ok(state.cursor >= state.len())
+                Ok(state.cursor >= state.len()?)
             }
         }
     }
@@ -1661,16 +1772,41 @@ impl Value {
     ///
     /// Returns an error for a non-stream or closed stream.
     pub fn stream_seek(&self, position: usize) -> Result<(), RuntimeErrorKind> {
+        self.stream_seek_from(
+            i64::try_from(position)
+                .map_err(|_| RuntimeErrorKind::Io("stream position overflow".to_owned()))?,
+            0,
+        )
+        .map(|_| ())
+    }
+
+    pub fn stream_seek_from(&self, offset: i64, origin: i64) -> Result<usize, RuntimeErrorKind> {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
-        if matches!(state.storage, StreamStorage::Input(_)) {
+        if !state.has(STREAM_SEEK) {
             return Err(RuntimeErrorKind::Io(
                 "stream does not support seeking".to_owned(),
             ));
         }
-        state.cursor = position;
-        Ok(())
+        let base = match origin {
+            0 => 0,
+            1 => state.cursor,
+            2 => state.len()?,
+            _ => return Err(RuntimeErrorKind::Io("invalid seek origin".to_owned())),
+        };
+        let position = (base as i128) + i128::from(offset);
+        if position < 0 {
+            return Err(RuntimeErrorKind::Bounds(
+                "stream position must not be negative".to_owned(),
+            ));
+        }
+        if position > i128::from(i64::MAX) {
+            return Err(RuntimeErrorKind::Io("stream position overflow".to_owned()));
+        }
+        state.cursor = usize::try_from(position)
+            .map_err(|_| RuntimeErrorKind::Io("stream position overflow".to_owned()))?;
+        Ok(state.cursor)
     }
 
     /// Writes all bytes at the cursor, zero-filling any gap.
@@ -1682,10 +1818,13 @@ impl Value {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
-        if matches!(state.storage, StreamStorage::Input(_)) {
+        if !state.has(STREAM_WRITE) {
             return Err(RuntimeErrorKind::Io(
                 "stream does not support writing".to_owned(),
             ));
+        }
+        if state.has(STREAM_APPEND) {
+            state.cursor = state.len()?;
         }
         let end = state
             .cursor
@@ -1712,6 +1851,43 @@ impl Value {
         }
         state.cursor = end;
         Ok(())
+    }
+
+    pub fn stream_write(&self, bytes: &[u8]) -> Result<usize, RuntimeErrorKind> {
+        self.stream_write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    pub fn stream_flush(&self) -> Result<(), RuntimeErrorKind> {
+        let state = self.stream_state()?;
+        let mut state = state.borrow_mut();
+        ensure_stream_open(&state)?;
+        if !state.has(STREAM_WRITE) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support writing".to_owned(),
+            ));
+        }
+        match &mut state.storage {
+            StreamStorage::File { file, .. } => file.flush().map_err(stream_io_error),
+            StreamStorage::Memory(_) => Ok(()),
+            _ => Err(RuntimeErrorKind::Io(
+                "stream does not support writing".to_owned(),
+            )),
+        }
+    }
+
+    pub fn stream_capabilities(&self) -> Result<(bool, bool, bool), RuntimeErrorKind> {
+        let state = self.stream_state()?;
+        let state = state.borrow();
+        Ok(if state.closed {
+            (false, false, false)
+        } else {
+            (
+                state.has(STREAM_READ),
+                state.has(STREAM_WRITE),
+                state.has(STREAM_SEEK),
+            )
+        })
     }
 
     /// Idempotently closes the shared stream state.
@@ -2673,36 +2849,59 @@ impl HeapData {
     }
 }
 
+const STREAM_READ: u8 = 1;
+const STREAM_WRITE: u8 = 2;
+const STREAM_SEEK: u8 = 4;
+const STREAM_APPEND: u8 = 8;
+
+fn stream_flags(readable: bool, writable: bool, append: bool) -> u8 {
+    (u8::from(readable) * STREAM_READ)
+        | (u8::from(writable) * STREAM_WRITE)
+        | STREAM_SEEK
+        | (u8::from(append) * STREAM_APPEND)
+}
+
 #[derive(Debug)]
 struct StreamState {
     storage: StreamStorage,
     cursor: usize,
     closed: bool,
     spill_threshold: Option<usize>,
+    capabilities: u8,
     handle: Option<HandleLease>,
 }
 
 #[derive(Debug)]
 enum StreamStorage {
     Memory(Vec<u8>),
-    File { file: std::fs::File, length: usize },
+    File { file: std::fs::File },
     Input(RequestInput),
     Closed,
 }
 
 impl StreamState {
-    fn len(&self) -> usize {
+    fn has(&self, capability: u8) -> bool {
+        self.capabilities & capability != 0
+    }
+    fn len(&self) -> Result<usize, RuntimeErrorKind> {
         match &self.storage {
-            StreamStorage::Memory(bytes) => bytes.len(),
-            StreamStorage::File { length, .. } => *length,
-            StreamStorage::Input(_) | StreamStorage::Closed => self.cursor,
+            StreamStorage::Memory(bytes) => Ok(bytes.len()),
+            StreamStorage::File { file } => {
+                usize::try_from(file.metadata().map_err(stream_io_error)?.len())
+                    .map_err(|_| RuntimeErrorKind::Io("file is too large".to_owned()))
+            }
+            StreamStorage::Input(_) | StreamStorage::Closed => Ok(self.cursor),
         }
     }
 
     fn read_range(&mut self, start: usize, end: usize) -> Result<Vec<u8>, RuntimeErrorKind> {
         match &mut self.storage {
-            StreamStorage::Memory(bytes) => Ok(bytes[start..end].to_vec()),
-            StreamStorage::File { file, .. } => {
+            StreamStorage::Memory(bytes) => Ok(if start >= end {
+                Vec::new()
+            } else {
+                bytes[start..end].to_vec()
+            }),
+            StreamStorage::File { file } => {
                 file.seek(SeekFrom::Start(start as u64))
                     .map_err(stream_io_error)?;
                 let mut bytes = vec![0; end.saturating_sub(start)];
@@ -2731,10 +2930,7 @@ impl StreamState {
         };
         let mut file = tempfile::tempfile().map_err(stream_io_error)?;
         file.write_all(&bytes).map_err(stream_io_error)?;
-        self.storage = StreamStorage::File {
-            file,
-            length: bytes.len(),
-        };
+        self.storage = StreamStorage::File { file };
         Ok(())
     }
 
@@ -2755,14 +2951,13 @@ impl StreamState {
                 }
                 storage[self.cursor..end].copy_from_slice(bytes);
             }
-            StreamStorage::File { file, length } => {
-                if self.cursor > *length {
+            StreamStorage::File { file } => {
+                if (self.cursor as u64) > file.metadata().map_err(stream_io_error)?.len() {
                     file.set_len(self.cursor as u64).map_err(stream_io_error)?;
                 }
                 file.seek(SeekFrom::Start(self.cursor as u64))
                     .map_err(stream_io_error)?;
                 file.write_all(bytes).map_err(stream_io_error)?;
-                *length = (*length).max(end);
             }
             StreamStorage::Input(_) => {
                 return Err(RuntimeErrorKind::Io(

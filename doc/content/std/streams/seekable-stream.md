@@ -11,11 +11,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice: >-
-  Memory and temporary streams execute seek(int): void from the start and tell():
-  int. SeekFrom, relative/end origins, and the documented returning seek signature
-  remain proposed.
+availability: implemented
+notice: Absolute, relative, and end-origin seeking execute for memory, temporary, and regular-file streams.
 version: "0.1"
 ---
 

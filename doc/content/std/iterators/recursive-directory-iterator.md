@@ -14,10 +14,10 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
+availability: partial
 notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+  Recursive directory entries, child iterators, and subpath accessors execute.
+  Glob expansion and some convenience operations remain proposed.
 version: "0.1"
 ---
 

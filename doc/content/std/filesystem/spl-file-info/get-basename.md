@@ -20,10 +20,8 @@ errors:
       or propagate as the experimental THP I/O failure where no sentinel is available.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method executes against the current host filesystem.
 version: "0.1"
 owner: std.spl.SplFileInfo
 visibility: public

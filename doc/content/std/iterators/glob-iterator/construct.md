@@ -14,7 +14,7 @@ parameters:
     description: Pattern used by the operation.
   - name: follow_symlinks
     type: bool
-    description: Permit traversal through symbolic links when true.
+    description: Reserved for future nested traversal; has no effect on current final-component matches.
     default: "false"
   - name: unix_paths
     type: bool
@@ -30,10 +30,9 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: partial
+notice: Final-component * and ? patterns execute. Nested patterns and character
+  classes remain proposed.
 version: "0.1"
 owner: std.spl.GlobIterator
 visibility: public
@@ -44,7 +43,9 @@ modifiers: []
 
 ## Behavior
 
-Expands $pattern and iterates matching paths as the same typed key-value pairs returned by FilesystemIterator.
+Expands `*` and `?` in the final path component and iterates matching paths as
+`string` keys and `SplFileInfo` values. Unsupported pattern forms raise
+`ValueError`; inaccessible directories raise `OpenStreamException`.
 
 This operation does not change receiver state unless the description explicitly states otherwise.
 

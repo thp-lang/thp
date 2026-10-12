@@ -14,8 +14,8 @@ errors: []
 related:
   - std.streams.Stream
 status: experimental
-availability: proposed
-notice: This capability-inspection method is proposed and is not implemented; use instanceof.
+availability: implemented
+notice: Native streams report their current readable capability.
 version: "0.1"
 owner: std.streams.Stream
 visibility: public

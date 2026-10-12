@@ -8,12 +8,16 @@ rust-version.workspace = true
 description = "Reference THP bytecode interpreter"
 
 [dependencies]
+regex.workspace = true
 thp-bytecode = { path = "../bytecode" }
 thp-diagnostics = { path = "../diagnostics" }
 thp-hir = { path = "../hir" }
 thp-mir = { path = "../mir" }
 thp-runtime = { path = "../runtime" }
 thp-syntax = { path = "../syntax" }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

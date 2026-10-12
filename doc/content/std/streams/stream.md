@@ -11,8 +11,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This capability-inspection interface is proposed and is not implemented.
+availability: implemented
+notice: Capability inspection executes for native memory, temporary, file, and request-input streams.
 version: "0.1"
 ---
 

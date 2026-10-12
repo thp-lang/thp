@@ -16,10 +16,8 @@ errors:
       or propagate as the experimental THP I/O failure where no sentinel is available.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: Reads the next line from the owned read-only file.
 version: "0.1"
 owner: std.spl.SplFileObject
 visibility: public

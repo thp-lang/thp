@@ -302,14 +302,24 @@ pub enum Builtin {
     TempStreamOpen,
     StreamsOpen,
     FilesOpenRead,
+    FilesOpenWrite,
+    FilesOpenReadWrite,
     StreamTell,
     StreamRead,
     StreamReadAll,
     StreamEof,
     StreamSeek,
+    StreamWrite,
     StreamWriteAll,
+    StreamFlush,
+    StreamIsReadable,
+    StreamIsWritable,
+    StreamIsSeekable,
     StreamClose,
     StreamIsClosed,
+    FileInfo(FileInfoBuiltin),
+    FileObject(FileObjectBuiltin),
+    Directory(DirectoryBuiltin),
     ExceptionNew,
     ExceptionConstruct,
     ExceptionGetMessage,
@@ -339,6 +349,144 @@ pub enum Builtin {
     IsNumeric,
     IsVector,
     IsMap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FileInfoBuiltin {
+    Construct,
+    Path,
+    Pathname,
+    Filename,
+    Basename,
+    Extension,
+    RealPath,
+    LinkTarget,
+    Type,
+    IsFile,
+    IsDir,
+    IsLink,
+    IsReadable,
+    IsWritable,
+    IsExecutable,
+    Size,
+    ATime,
+    MTime,
+    CTime,
+    Perms,
+    Owner,
+    Group,
+    Inode,
+    ToString,
+}
+
+impl FileInfoBuiltin {
+    pub const ALL: [Self; 24] = [
+        Self::Construct,
+        Self::Path,
+        Self::Pathname,
+        Self::Filename,
+        Self::Basename,
+        Self::Extension,
+        Self::RealPath,
+        Self::LinkTarget,
+        Self::Type,
+        Self::IsFile,
+        Self::IsDir,
+        Self::IsLink,
+        Self::IsReadable,
+        Self::IsWritable,
+        Self::IsExecutable,
+        Self::Size,
+        Self::ATime,
+        Self::MTime,
+        Self::CTime,
+        Self::Perms,
+        Self::Owner,
+        Self::Group,
+        Self::Inode,
+        Self::ToString,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FileObjectBuiltin {
+    Construct,
+    Rewind,
+    Valid,
+    Key,
+    Value,
+    Advance,
+    Seek,
+    Fgets,
+    Eof,
+    Fread,
+    Ftell,
+}
+
+impl FileObjectBuiltin {
+    pub const ALL: [Self; 11] = [
+        Self::Construct,
+        Self::Rewind,
+        Self::Valid,
+        Self::Key,
+        Self::Value,
+        Self::Advance,
+        Self::Seek,
+        Self::Fgets,
+        Self::Eof,
+        Self::Fread,
+        Self::Ftell,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DirectoryBuiltin {
+    ConstructDirectory,
+    ConstructFilesystem,
+    Rewind,
+    Valid,
+    KeyInt,
+    KeyPath,
+    Value,
+    Advance,
+    Seek,
+    IsDot,
+    ToString,
+    SkipsDots,
+    FollowsSymlinks,
+    ConstructRecursive,
+    RecursiveValue,
+    GetSubPath,
+    GetSubPathname,
+    ConstructGlob,
+    Count,
+}
+
+impl DirectoryBuiltin {
+    pub const ALL: [Self; 19] = [
+        Self::ConstructDirectory,
+        Self::ConstructFilesystem,
+        Self::Rewind,
+        Self::Valid,
+        Self::KeyInt,
+        Self::KeyPath,
+        Self::Value,
+        Self::Advance,
+        Self::Seek,
+        Self::IsDot,
+        Self::ToString,
+        Self::SkipsDots,
+        Self::FollowsSymlinks,
+        Self::ConstructRecursive,
+        Self::RecursiveValue,
+        Self::GetSubPath,
+        Self::GetSubPathname,
+        Self::ConstructGlob,
+        Self::Count,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3925,6 +4073,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             | "RecursiveCallbackFilterIterator"
                             | "CallbackFilterIterator"
                             | "TraceLine"
+                            | "SplFileInfo"
+                            | "SplFileObject"
+                            | "DirectoryIterator"
+                            | "FilesystemIterator"
+                            | "RecursiveDirectoryIterator"
+                            | "GlobIterator"
                     )
                 {
                     self.diagnostics.push(Diagnostic::error(
@@ -4400,21 +4554,29 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 name_span,
             } => {
                 let value = match (class_name.as_str(), name.as_str()) {
-                    ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_KEY") => 4,
                     ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_CURRENT") => 8,
                     ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_INNER") => 16,
                     ("CachingIterator" | "RecursiveCachingIterator", "FULL_CACHE") => 256,
                     ("OpenMode", "Read")
+                    | ("WriteMode", "OpenExisting")
                     | ("SeekFrom", "Start")
                     | ("RecursiveIteratorIterator", "LEAVES_ONLY") => 0,
                     ("OpenMode", "Write")
+                    | ("WriteMode", "Truncate")
                     | ("SeekFrom", "Current")
                     | ("CachingIterator" | "RecursiveCachingIterator", "CALL_TOSTRING")
                     | ("RecursiveIteratorIterator", "SELF_FIRST") => 1,
                     ("OpenMode", "ReadWrite")
+                    | ("WriteMode", "Append")
                     | ("SeekFrom", "End")
                     | ("CachingIterator" | "RecursiveCachingIterator", "CATCH_GET_CHILD")
                     | ("RecursiveIteratorIterator", "CHILD_FIRST") => 2,
+                    ("OpenMode", "Append") | ("WriteMode", "Create") => 3,
+                    ("OpenMode", "ReadWriteTruncate")
+                    | ("WriteMode", "CreateExclusive")
+                    | ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_KEY") => 4,
+                    ("OpenMode", "ReadWriteAppend") => 5,
+                    ("OpenMode", "CreateExclusive") => 6,
                     _ => {
                         self.diagnostics.push(Diagnostic::error(
                             "name_resolution",
@@ -4428,6 +4590,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 if !matches!(
                     class_name.as_str(),
                     "OpenMode"
+                        | "WriteMode"
                         | "SeekFrom"
                         | "CachingIterator"
                         | "RecursiveCachingIterator"
@@ -5131,10 +5294,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     Some(ExprKind::String(uri)) if uri == b"thp:/input" => {
                         Type::Object("ReadableStream".to_owned())
                     }
-                    Some(ExprKind::String(uri)) if uri.starts_with(b"php://temp") => {
-                        Type::Object("TempStream".to_owned())
-                    }
-                    _ => Type::Object("MemoryStream".to_owned()),
+                    _ => Type::Object("Stream".to_owned()),
                 };
                 (
                     Builtin::StreamsOpen,
@@ -5149,6 +5309,30 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 Builtin::FilesOpenRead,
                 vec![native_parameter("path", Type::String, None, span)],
                 Type::Object("ReadableFileStream".to_owned()),
+            ),
+            ("Files", "openWrite" | "openReadWrite") => (
+                if name == "openWrite" {
+                    Builtin::FilesOpenWrite
+                } else {
+                    Builtin::FilesOpenReadWrite
+                },
+                vec![
+                    native_parameter("path", Type::String, None, span),
+                    native_parameter(
+                        "mode",
+                        Type::Int,
+                        Some(ExprKind::Integer(i64::from(name == "openWrite"))),
+                        span,
+                    ),
+                ],
+                Type::Object(
+                    if name == "openWrite" {
+                        "WritableFileStream"
+                    } else {
+                        "ReadWriteFileStream"
+                    }
+                    .to_owned(),
+                ),
             ),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
@@ -7279,11 +7463,19 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         ),
         ("Closeable", NominalKind::Interface, true, false, None, &[]),
         (
-            "ReadableStream",
+            "Stream",
             NominalKind::Interface,
             true,
             false,
             Some("Closeable"),
+            &[],
+        ),
+        (
+            "ReadableStream",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Stream"),
             &[],
         ),
         (
@@ -7291,7 +7483,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             NominalKind::Interface,
             true,
             false,
-            Some("Closeable"),
+            Some("Stream"),
             &[],
         ),
         (
@@ -7299,7 +7491,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             NominalKind::Interface,
             true,
             false,
-            Some("Closeable"),
+            Some("Stream"),
             &[],
         ),
         (
@@ -7334,14 +7526,103 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         ("Streams", NominalKind::Class, false, true, None, &[]),
         ("Files", NominalKind::Class, false, true, None, &[]),
         (
+            "SplFileInfo",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["Stringable"],
+        ),
+        (
+            "SplFileObject",
+            NominalKind::Class,
+            false,
+            false,
+            Some("SplFileInfo"),
+            &["SeekableIterator"],
+        ),
+        (
+            "DirectoryIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["SeekableIterator", "Stringable"],
+        ),
+        (
+            "FilesystemIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "RecursiveDirectoryIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["RecursiveIterator"],
+        ),
+        (
+            "GlobIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator", "Countable"],
+        ),
+        (
             "ReadableFileStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["ReadableStream", "SeekableStream"],
+        ),
+        (
+            "RequestInputStream",
             NominalKind::Class,
             false,
             true,
             None,
             &["ReadableStream"],
         ),
+        (
+            "ReadableUriStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["ReadableStream", "SeekableStream"],
+        ),
+        (
+            "WritableUriStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["WritableStream", "SeekableStream"],
+        ),
+        (
+            "WritableFileStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["WritableStream", "SeekableStream"],
+        ),
+        (
+            "ReadWriteFileStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["ReadableStream", "WritableStream", "SeekableStream"],
+        ),
         ("OpenMode", NominalKind::Class, false, true, None, &[]),
+        ("WriteMode", NominalKind::Class, false, true, None, &[]),
         ("SeekFrom", NominalKind::Class, false, true, None, &[]),
         (
             "Exception",
@@ -9602,9 +9883,46 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         Type::Bool,
         true,
     );
+    for (name, builtin) in [
+        ("isReadable", Builtin::StreamIsReadable),
+        ("isWritable", Builtin::StreamIsWritable),
+        ("isSeekable", Builtin::StreamIsSeekable),
+    ] {
+        add_native_method(
+            &mut classes,
+            "Stream",
+            name,
+            None,
+            false,
+            vec![],
+            Type::Bool,
+            true,
+        );
+        for class in [
+            "MemoryStream",
+            "TempStream",
+            "ReadableFileStream",
+            "WritableFileStream",
+            "ReadWriteFileStream",
+            "RequestInputStream",
+            "ReadableUriStream",
+            "WritableUriStream",
+        ] {
+            add_native_method(
+                &mut classes,
+                class,
+                name,
+                Some(builtin),
+                false,
+                vec![],
+                Type::Bool,
+                false,
+            );
+        }
+    }
     add_native_method(
         &mut classes,
-        "ReadableStream",
+        "SeekableStream",
         "tell",
         None,
         false,
@@ -9650,6 +9968,16 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
     add_native_method(
         &mut classes,
         "WritableStream",
+        "write",
+        None,
+        false,
+        vec![native_parameter("data", Type::String, None, Span::empty(0))],
+        Type::Int,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "WritableStream",
         "writeAll",
         None,
         false,
@@ -9664,17 +9992,30 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
     );
     add_native_method(
         &mut classes,
+        "WritableStream",
+        "flush",
+        None,
+        false,
+        vec![],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
         "SeekableStream",
         "seek",
         None,
         false,
-        vec![native_parameter(
-            "position",
-            Type::Int,
-            None,
-            Span::empty(0),
-        )],
-        Type::Void,
+        vec![
+            native_parameter("offset", Type::Int, None, Span::empty(0)),
+            native_parameter(
+                "from",
+                Type::Int,
+                Some(ExprKind::Integer(0)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Int,
         true,
     );
 
@@ -9792,7 +10133,16 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         false,
     );
 
-    for class in ["MemoryStream", "TempStream", "ReadableFileStream"] {
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "ReadableFileStream",
+        "WritableFileStream",
+        "ReadWriteFileStream",
+        "RequestInputStream",
+        "ReadableUriStream",
+        "WritableUriStream",
+    ] {
         add_native_method(
             &mut classes,
             class,
@@ -9813,16 +10163,15 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Type::Bool,
             false,
         );
-        add_native_method(
-            &mut classes,
-            class,
-            "tell",
-            Some(Builtin::StreamTell),
-            false,
-            vec![],
-            Type::Int,
-            false,
-        );
+    }
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "ReadableFileStream",
+        "ReadWriteFileStream",
+        "RequestInputStream",
+        "ReadableUriStream",
+    ] {
         add_native_method(
             &mut classes,
             class,
@@ -9859,7 +10208,33 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             false,
         );
     }
-    for class in ["MemoryStream", "TempStream"] {
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "WritableFileStream",
+        "ReadWriteFileStream",
+        "WritableUriStream",
+    ] {
+        add_native_method(
+            &mut classes,
+            class,
+            "write",
+            Some(Builtin::StreamWrite),
+            false,
+            vec![native_parameter("data", Type::String, None, Span::empty(0))],
+            Type::Int,
+            false,
+        );
+        add_native_method(
+            &mut classes,
+            class,
+            "flush",
+            Some(Builtin::StreamFlush),
+            false,
+            vec![],
+            Type::Void,
+            false,
+        );
         add_native_method(
             &mut classes,
             class,
@@ -9875,22 +10250,531 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Type::Void,
             false,
         );
+    }
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "ReadableFileStream",
+        "WritableFileStream",
+        "ReadWriteFileStream",
+        "ReadableUriStream",
+        "WritableUriStream",
+    ] {
+        add_native_method(
+            &mut classes,
+            class,
+            "tell",
+            Some(Builtin::StreamTell),
+            false,
+            vec![],
+            Type::Int,
+            false,
+        );
         add_native_method(
             &mut classes,
             class,
             "seek",
             Some(Builtin::StreamSeek),
             false,
-            vec![native_parameter(
-                "position",
-                Type::Int,
-                None,
-                Span::empty(0),
-            )],
-            Type::Void,
+            vec![
+                native_parameter("offset", Type::Int, None, Span::empty(0)),
+                native_parameter(
+                    "from",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+            ],
+            Type::Int,
             false,
         );
     }
+    {
+        let class = classes
+            .get_mut("SplFileInfo")
+            .expect("native file info exists");
+        class.declared_properties.push(Property {
+            id: PropertyId(0),
+            name: "__path".to_owned(),
+            ty: Type::String,
+            visibility: Visibility::Private,
+            declaring_class: class.id,
+            default: None,
+            origin_trait: None,
+            span: Span::empty(0),
+        });
+        class.declared_property_initializers.push(None);
+    }
+    classes
+        .get_mut("SplFileObject")
+        .expect("native file iterator exists")
+        .interface_types = vec![Type::Nominal {
+        name: "SeekableIterator".to_owned(),
+        arguments: vec![Type::Int, Type::String],
+    }];
+    classes
+        .get_mut("DirectoryIterator")
+        .expect("native directory iterator exists")
+        .interface_types = vec![
+        Type::Nominal {
+            name: "SeekableIterator".to_owned(),
+            arguments: vec![Type::Int, Type::Object("SplFileInfo".to_owned())],
+        },
+        Type::Object("Stringable".to_owned()),
+    ];
+    classes
+        .get_mut("FilesystemIterator")
+        .expect("native filesystem iterator exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Iterator".to_owned(),
+        arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+    }];
+    classes
+        .get_mut("RecursiveDirectoryIterator")
+        .expect("native recursive directory iterator exists")
+        .interface_types = vec![Type::Nominal {
+        name: "RecursiveIterator".to_owned(),
+        arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+    }];
+    classes
+        .get_mut("GlobIterator")
+        .expect("native glob iterator exists")
+        .interface_types = vec![
+        Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+        },
+        Type::Object("Countable".to_owned()),
+    ];
+    let file_info_string = normalize_union(vec![Type::String, Type::Bool]);
+    let file_info_int = normalize_union(vec![Type::Int, Type::Bool]);
+    add_native_method(
+        &mut classes,
+        "SplFileInfo",
+        "__construct",
+        Some(Builtin::FileInfo(FileInfoBuiltin::Construct)),
+        false,
+        vec![native_parameter(
+            "filename",
+            Type::String,
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    for (name, operation) in [
+        ("getPath", FileInfoBuiltin::Path),
+        ("getPathname", FileInfoBuiltin::Pathname),
+        ("getFilename", FileInfoBuiltin::Filename),
+        ("getExtension", FileInfoBuiltin::Extension),
+        ("__toString", FileInfoBuiltin::ToString),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            Type::String,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "SplFileInfo",
+        "getBasename",
+        Some(Builtin::FileInfo(FileInfoBuiltin::Basename)),
+        false,
+        vec![native_parameter(
+            "suffix",
+            Type::String,
+            Some(ExprKind::String(Vec::new())),
+            Span::empty(0),
+        )],
+        Type::String,
+        false,
+    );
+    for (name, operation) in [
+        ("getRealPath", FileInfoBuiltin::RealPath),
+        ("getLinkTarget", FileInfoBuiltin::LinkTarget),
+        ("getType", FileInfoBuiltin::Type),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            file_info_string.clone(),
+            false,
+        );
+    }
+    for (name, operation) in [
+        ("isFile", FileInfoBuiltin::IsFile),
+        ("isDir", FileInfoBuiltin::IsDir),
+        ("isLink", FileInfoBuiltin::IsLink),
+        ("isReadable", FileInfoBuiltin::IsReadable),
+        ("isWritable", FileInfoBuiltin::IsWritable),
+        ("isExecutable", FileInfoBuiltin::IsExecutable),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            Type::Bool,
+            false,
+        );
+    }
+    for (name, operation) in [
+        ("getSize", FileInfoBuiltin::Size),
+        ("getATime", FileInfoBuiltin::ATime),
+        ("getMTime", FileInfoBuiltin::MTime),
+        ("getCTime", FileInfoBuiltin::CTime),
+        ("getPerms", FileInfoBuiltin::Perms),
+        ("getOwner", FileInfoBuiltin::Owner),
+        ("getGroup", FileInfoBuiltin::Group),
+        ("getInode", FileInfoBuiltin::Inode),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            file_info_int.clone(),
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "SplFileObject",
+        "__construct",
+        Some(Builtin::FileObject(FileObjectBuiltin::Construct)),
+        false,
+        vec![native_parameter(
+            "filename",
+            Type::String,
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    for (name, operation, result) in [
+        ("rewind", FileObjectBuiltin::Rewind, Type::Void),
+        ("valid", FileObjectBuiltin::Valid, Type::Bool),
+        ("key", FileObjectBuiltin::Key, Type::Int),
+        ("value", FileObjectBuiltin::Value, Type::String),
+        ("advance", FileObjectBuiltin::Advance, Type::Void),
+        ("fgets", FileObjectBuiltin::Fgets, Type::String),
+        ("eof", FileObjectBuiltin::Eof, Type::Bool),
+        ("ftell", FileObjectBuiltin::Ftell, Type::Int),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileObject",
+            name,
+            Some(Builtin::FileObject(operation)),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "SplFileObject",
+        "seek",
+        Some(Builtin::FileObject(FileObjectBuiltin::Seek)),
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "SplFileObject",
+        "fread",
+        Some(Builtin::FileObject(FileObjectBuiltin::Fread)),
+        false,
+        vec![native_parameter("length", Type::Int, None, Span::empty(0))],
+        normalize_union(vec![Type::String, Type::Bool]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructDirectory)),
+        false,
+        vec![native_parameter(
+            "directory",
+            Type::String,
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructFilesystem)),
+        false,
+        vec![
+            native_parameter("directory", Type::String, None, Span::empty(0)),
+            native_parameter(
+                "skipDots",
+                Type::Bool,
+                Some(ExprKind::Bool(true)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "followSymlinks",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "unixPaths",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructRecursive)),
+        false,
+        vec![
+            native_parameter("directory", Type::String, None, Span::empty(0)),
+            native_parameter(
+                "skipDots",
+                Type::Bool,
+                Some(ExprKind::Bool(true)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "followSymlinks",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "unixPaths",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "GlobIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructGlob)),
+        false,
+        vec![
+            native_parameter("pattern", Type::String, None, Span::empty(0)),
+            native_parameter(
+                "followSymlinks",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "unixPaths",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    for class in [
+        "DirectoryIterator",
+        "FilesystemIterator",
+        "RecursiveDirectoryIterator",
+        "GlobIterator",
+    ] {
+        for (name, operation, result) in [
+            ("rewind", DirectoryBuiltin::Rewind, Type::Void),
+            ("valid", DirectoryBuiltin::Valid, Type::Bool),
+            ("advance", DirectoryBuiltin::Advance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                class,
+                name,
+                Some(Builtin::Directory(operation)),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    for class in ["DirectoryIterator", "FilesystemIterator", "GlobIterator"] {
+        add_native_method(
+            &mut classes,
+            class,
+            "value",
+            Some(Builtin::Directory(DirectoryBuiltin::Value)),
+            false,
+            vec![],
+            Type::Object("SplFileInfo".to_owned()),
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyInt)),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "GlobIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "value",
+        Some(Builtin::Directory(DirectoryBuiltin::RecursiveValue)),
+        false,
+        vec![],
+        Type::Nominal {
+            name: "RecursiveEntry".to_owned(),
+            arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+        },
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "seek",
+        Some(Builtin::Directory(DirectoryBuiltin::Seek)),
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "isDot",
+        Some(Builtin::Directory(DirectoryBuiltin::IsDot)),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "__toString",
+        Some(Builtin::Directory(DirectoryBuiltin::ToString)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "skipsDots",
+        Some(Builtin::Directory(DirectoryBuiltin::SkipsDots)),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "followsSymlinks",
+        Some(Builtin::Directory(DirectoryBuiltin::FollowsSymlinks)),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "getSubPath",
+        Some(Builtin::Directory(DirectoryBuiltin::GetSubPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "getSubPathname",
+        Some(Builtin::Directory(DirectoryBuiltin::GetSubPathname)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "GlobIterator",
+        "count",
+        Some(Builtin::Directory(DirectoryBuiltin::Count)),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
     add_reflection_api(&mut classes);
     classes
 }

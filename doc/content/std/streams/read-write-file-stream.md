@@ -13,8 +13,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: Read-write file handles are proposed and are not implemented.
+availability: implemented
+notice: Files::openReadWrite() returns a readable, writable, seekable, and closeable file handle.
 version: "0.1"
 ---
 

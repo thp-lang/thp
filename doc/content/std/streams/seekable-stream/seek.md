@@ -27,11 +27,8 @@ errors:
 related:
   - std.streams.SeekableStream
 status: experimental
-availability: partial
-notice: >-
-  The executable subset is seek(int $position): void from the stream start on
-  memory and temporary streams. SeekFrom, relative/end origins, file seeking,
-  and returning the new position remain proposed.
+availability: implemented
+notice: All three SeekFrom origins execute for memory, temporary, and regular-file streams.
 version: "0.1"
 owner: std.streams.SeekableStream
 visibility: public

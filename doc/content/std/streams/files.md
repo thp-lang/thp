@@ -10,10 +10,8 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice:
-  Files::openRead() is implemented. Writing factories, WriteMode, and writable
-  or read-write file handles remain proposed.
+availability: implemented
+notice: All three typed file factories and WriteMode cases execute for local paths.
 version: "0.1"
 ---
 

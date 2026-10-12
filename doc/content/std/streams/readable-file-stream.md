@@ -12,9 +12,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice: Files::openRead(), reading, tell(), and closing execute. The documented
-  SeekableStream relationship and seek() operation are not implemented for files.
+availability: implemented
+notice: Files::openRead() returns a readable, seekable, and closeable file handle.
 version: "0.1"
 ---
 

@@ -14,8 +14,8 @@ cases:
   - Current
   - End
 status: experimental
-availability: proposed
-notice: Relative and end-origin seeking are proposed and are not implemented.
+availability: implemented
+notice: Start, Current, and End origins execute on seekable native streams.
 version: "0.1"
 ---
 

@@ -18,10 +18,8 @@ cases:
   - ReadWriteAppend
   - CreateExclusive
 status: experimental
-availability: partial
-notice:
-  Read, Write, and ReadWrite names are recognized. Only Read for thp:/input and
-  the supported memory/temp combinations execute; the other cases remain proposed.
+availability: implemented
+notice: All seven cases execute for local files and memory or temporary URIs; thp:/input accepts Read only.
 version: "0.1"
 ---
 

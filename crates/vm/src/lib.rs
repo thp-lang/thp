@@ -16,8 +16,8 @@ use thp_bytecode::{
 };
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, ConstantValue, FunctionId, MethodSlot,
-    ParameterMetadata, ReflectionBuiltin, Type,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, DirectoryBuiltin, FileInfoBuiltin,
+    FileObjectBuiltin, FunctionId, MethodSlot, ParameterMetadata, ReflectionBuiltin, Type,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_runtime::{
@@ -27,6 +27,36 @@ use thp_runtime::{
 use thp_syntax::{BinaryOp, UnaryOp, Visibility};
 
 const GENERATOR_EXIT_CODE: i64 = i64::MIN;
+
+fn local_file_uri_path(uri: &[u8]) -> Option<Vec<u8>> {
+    let raw = uri.strip_prefix(b"file://")?;
+    let raw = raw.strip_prefix(b"localhost").unwrap_or(raw);
+    if !raw.starts_with(b"/") || raw.contains(&b'?') || raw.contains(&b'#') {
+        return None;
+    }
+    let mut path = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' {
+            let digits = raw.get(index + 1..index + 3)?;
+            let digits = std::str::from_utf8(digits).ok()?;
+            path.push(u8::from_str_radix(digits, 16).ok()?);
+            index += 3;
+        } else {
+            path.push(raw[index]);
+            index += 1;
+        }
+    }
+    Some(path)
+}
+
+fn directory_entry_name(path: &str) -> &str {
+    if cfg!(windows) {
+        path.rsplit(['/', '\\']).next().unwrap_or("")
+    } else {
+        path.rsplit('/').next().unwrap_or("")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Limits {
@@ -4463,20 +4493,19 @@ impl ExecutionState<'_, '_> {
             }
             Builtin::StreamsOpen => {
                 let uri = arguments[0].as_bytes().expect("verified URI string");
-                if !(uri == b"thp:/input"
-                    || uri == b"php://memory"
-                    || uri.starts_with(b"php://temp"))
-                {
+                let mode = arguments[1].as_int().expect("verified mode");
+                // ReadWrite keeps its existing encoded value, 2; Append uses 3.
+                if !(0..=6).contains(&mode) {
                     return Err(self.native_exception(
-                        "InvalidStreamUriException",
-                        b"invalid stream URI".to_vec(),
+                        "ValueError",
+                        b"invalid open mode".to_vec(),
                         Some(uri.to_vec()),
                         0,
                         instruction.span,
                     ));
                 }
                 if uri == b"thp:/input" {
-                    if arguments[1].as_int() != Some(0) {
+                    if mode != 0 {
                         return Err(self.native_exception(
                             "UnsupportedStreamOperationException",
                             b"thp:/input is read-only".to_vec(),
@@ -4489,63 +4518,135 @@ impl ExecutionState<'_, '_> {
                         return Ok(stream.clone());
                     }
                     let stream = Value::try_request_input_stream(
-                        self.class_named("ReadableFileStream", instruction.span)?,
+                        self.class_named("RequestInputStream", instruction.span)?,
                         self.request_input.clone(),
                     )
                     .map_err(|kind| runtime(kind, instruction.span))?;
                     self.request_input_stream = Some(stream.clone());
                     Ok(stream)
-                } else if uri.starts_with(b"php://temp") {
-                    let threshold = uri
-                        .strip_prefix(b"php://temp/maxmemory:")
-                        .map(|threshold| {
-                            std::str::from_utf8(threshold)
-                                .ok()
-                                .and_then(|threshold| threshold.parse::<usize>().ok())
-                                .ok_or_else(|| {
-                                    self.native_exception(
-                                        "InvalidStreamUriException",
-                                        b"invalid temporary-stream threshold".to_vec(),
-                                        Some(uri.to_vec()),
-                                        0,
-                                        instruction.span,
-                                    )
+                } else if uri == b"php://memory"
+                    || uri == b"php://temp"
+                    || uri.starts_with(b"php://temp/maxmemory:")
+                {
+                    let threshold = if uri == b"php://memory" {
+                        None
+                    } else {
+                        Some(
+                            uri.strip_prefix(b"php://temp/maxmemory:")
+                                .map(|threshold| {
+                                    std::str::from_utf8(threshold)
+                                        .ok()
+                                        .and_then(|threshold| threshold.parse::<usize>().ok())
+                                        .ok_or_else(|| {
+                                            self.native_exception(
+                                                "InvalidStreamUriException",
+                                                b"invalid temporary-stream threshold".to_vec(),
+                                                Some(uri.to_vec()),
+                                                0,
+                                                instruction.span,
+                                            )
+                                        })
                                 })
-                        })
-                        .transpose()?
-                        .unwrap_or(2 * 1024 * 1024);
-                    Value::try_temp_stream(self.result_class(instruction)?, threshold)
+                                .transpose()?
+                                .unwrap_or(2 * 1024 * 1024),
+                        )
+                    };
+                    let readable = !matches!(mode, 1 | 3);
+                    let writable = mode != 0;
+                    let append = matches!(mode, 3 | 5);
+                    let class = self.class_named(
+                        match (readable, writable, threshold.is_some()) {
+                            (true, false, _) => "ReadableUriStream",
+                            (false, true, _) => "WritableUriStream",
+                            (true, true, false) => "MemoryStream",
+                            (true, true, true) => "TempStream",
+                            _ => unreachable!(),
+                        },
+                        instruction.span,
+                    )?;
+                    Value::try_memory_stream_mode(class, threshold, readable, writable, append)
                         .map_err(|kind| runtime(kind, instruction.span))
                 } else {
-                    Value::try_stream(self.result_class(instruction)?, Vec::new())
-                        .map_err(|kind| runtime(kind, instruction.span))
-                }
-            }
-            Builtin::FilesOpenRead => {
-                let path =
-                    std::str::from_utf8(arguments[0].as_bytes().expect("verified path string"))
-                        .map_err(|_| {
-                            runtime(
-                                RuntimeErrorKind::Io("file path must be UTF-8".to_owned()),
+                    let file_path = if uri.starts_with(b"file://") {
+                        Some(local_file_uri_path(uri).ok_or_else(|| {
+                            self.native_exception(
+                                "InvalidStreamUriException",
+                                b"invalid file URI".to_vec(),
+                                Some(uri.to_vec()),
+                                0,
                                 instruction.span,
                             )
-                        })?;
-                let resolved = if Path::new(path).is_relative() {
-                    self.filesystem_base.join(path)
-                } else {
-                    PathBuf::from(path)
-                };
-                let bytes = std::fs::read(resolved).map_err(|error| {
-                    self.native_exception(
-                        "OpenStreamException",
-                        format!("cannot open `{path}`: {error}").into_bytes(),
-                        Some(path.as_bytes().to_vec()),
-                        i64::from(error.raw_os_error().unwrap_or(-1)),
+                        })?)
+                    } else {
+                        None
+                    };
+                    let path = if let Some(path) = file_path.as_deref() {
+                        path
+                    } else if uri.windows(3).any(|part| part == b"://")
+                        || uri.starts_with(b"php:")
+                        || uri.starts_with(b"thp:")
+                    {
+                        return Err(self.native_exception(
+                            "InvalidStreamUriException",
+                            b"invalid stream URI".to_vec(),
+                            Some(uri.to_vec()),
+                            0,
+                            instruction.span,
+                        ));
+                    } else {
+                        uri
+                    };
+                    let flags = match mode {
+                        0 => (true, false, false, false, false, false),
+                        1 => (false, true, false, true, true, false),
+                        2 => (true, true, false, false, false, false),
+                        3 => (false, true, true, false, true, false),
+                        4 => (true, true, false, true, true, false),
+                        5 => (true, true, true, false, true, false),
+                        6 => (true, true, false, false, false, true),
+                        _ => unreachable!(),
+                    };
+                    let class = self.class_named(
+                        match mode {
+                            0 => "ReadableFileStream",
+                            1 | 3 => "WritableFileStream",
+                            _ => "ReadWriteFileStream",
+                        },
                         instruction.span,
-                    )
-                })?;
-                Value::try_stream(self.result_class(instruction)?, bytes)
-                    .map_err(|kind| runtime(kind, instruction.span))
+                    )?;
+                    self.open_local_stream(path, flags, class, instruction.span)
+                }
+            }
+            Builtin::FilesOpenRead | Builtin::FilesOpenWrite | Builtin::FilesOpenReadWrite => {
+                let flags = match builtin {
+                    Builtin::FilesOpenRead => (true, false, false, false, false, false),
+                    Builtin::FilesOpenWrite | Builtin::FilesOpenReadWrite => {
+                        let read = builtin == Builtin::FilesOpenReadWrite;
+                        match arguments[1].as_int().expect("verified write mode") {
+                            0 => (read, true, false, false, false, false),
+                            1 => (read, true, false, true, true, false),
+                            2 => (read, true, true, false, true, false),
+                            3 => (read, true, false, false, true, false),
+                            4 => (read, true, false, false, false, true),
+                            _ => {
+                                return Err(self.native_exception(
+                                    "ValueError",
+                                    b"invalid write mode".to_vec(),
+                                    None,
+                                    0,
+                                    instruction.span,
+                                ));
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                self.open_local_stream(
+                    arguments[0].as_bytes().expect("verified path"),
+                    flags,
+                    self.result_class(instruction)?,
+                    instruction.span,
+                )
             }
             Builtin::StreamTell => {
                 let position = arguments[0]
@@ -4598,21 +4699,63 @@ impl ExecutionState<'_, '_> {
                 })?))
             }
             Builtin::StreamSeek => {
-                let position = self.nonnegative_stream_value(
-                    arguments[1].as_int().expect("verified seek position"),
-                    "stream seek position",
-                    instruction.span,
-                )?;
-                arguments[0]
-                    .stream_seek(position)
+                let position = arguments[0]
+                    .stream_seek_from(
+                        arguments[1].as_int().expect("verified seek offset"),
+                        arguments[2].as_int().expect("verified seek origin"),
+                    )
+                    .map_err(|kind| {
+                        if matches!(kind, RuntimeErrorKind::Bounds(_)) {
+                            self.native_exception(
+                                "ValueError",
+                                kind.to_string().into_bytes(),
+                                None,
+                                0,
+                                instruction.span,
+                            )
+                        } else {
+                            self.stream_exception(kind, instruction.span)
+                        }
+                    })?;
+                Ok(Value::integer(i64::try_from(position).map_err(|_| {
+                    runtime(
+                        RuntimeErrorKind::Io("stream position overflow".to_owned()),
+                        instruction.span,
+                    )
+                })?))
+            }
+            Builtin::StreamWrite => {
+                let written = arguments[0]
+                    .stream_write(arguments[1].as_bytes().expect("verified bytes"))
                     .map_err(|kind| self.stream_exception(kind, instruction.span))?;
-                Ok(Value::NULL)
+                Ok(Value::integer(i64::try_from(written).map_err(|_| {
+                    runtime(
+                        RuntimeErrorKind::Io("write count overflow".to_owned()),
+                        instruction.span,
+                    )
+                })?))
             }
             Builtin::StreamWriteAll => {
                 arguments[0]
                     .stream_write_all(arguments[1].as_bytes().expect("verified write bytes"))
                     .map_err(|kind| self.stream_exception(kind, instruction.span))?;
                 Ok(Value::NULL)
+            }
+            Builtin::StreamFlush => {
+                arguments[0]
+                    .stream_flush()
+                    .map_err(|kind| self.stream_exception(kind, instruction.span))?;
+                Ok(Value::NULL)
+            }
+            Builtin::StreamIsReadable | Builtin::StreamIsWritable | Builtin::StreamIsSeekable => {
+                let capabilities = arguments[0]
+                    .stream_capabilities()
+                    .map_err(|kind| self.stream_exception(kind, instruction.span))?;
+                Ok(Value::bool(match builtin {
+                    Builtin::StreamIsReadable => capabilities.0,
+                    Builtin::StreamIsWritable => capabilities.1,
+                    _ => capabilities.2,
+                }))
             }
             Builtin::StreamClose => {
                 arguments[0]
@@ -4624,6 +4767,15 @@ impl ExecutionState<'_, '_> {
                 Ok(Value::bool(arguments[0].stream_is_closed().map_err(
                     |kind| self.stream_exception(kind, instruction.span),
                 )?))
+            }
+            Builtin::FileInfo(operation) => {
+                self.file_info_builtin(operation, &arguments, instruction)
+            }
+            Builtin::FileObject(operation) => {
+                self.file_object_builtin(operation, &arguments, instruction)
+            }
+            Builtin::Directory(operation) => {
+                self.directory_builtin(operation, &arguments, instruction)
             }
             Builtin::ExceptionNew => {
                 let message = arguments
@@ -5911,9 +6063,16 @@ impl ExecutionState<'_, '_> {
         } else if is_instance_of_name(self.program, class, "Throwable") {
             Value::try_throwable_object(class, property_count)
         } else {
+            let file_object = is_instance_of_name(self.program, class, "SplFileObject");
+            let directory_iterator = is_instance_of_name(self.program, class, "DirectoryIterator")
+                || is_instance_of_name(self.program, class, "FilesystemIterator")
+                || is_instance_of_name(self.program, class, "RecursiveDirectoryIterator")
+                || is_instance_of_name(self.program, class, "GlobIterator");
             let recursive_walk =
                 is_instance_of_name(self.program, class, "RecursiveIteratorIterator");
             let property_count = if recursive_walk
+                || file_object
+                || directory_iterator
                 || matches!(
                     class_name,
                     "VectorIterator"
@@ -5937,7 +6096,9 @@ impl ExecutionState<'_, '_> {
                         | "RecursiveEntry"
                         | "RecursiveIteratorIterator"
                 ) {
-                property_count.max(if class_name == "LimitIterator" {
+                property_count.max(if class_name == "RecursiveDirectoryIterator" {
+                    7
+                } else if file_object || directory_iterator || class_name == "LimitIterator" {
                     4
                 } else if class_name == "InfiniteIterator" {
                     3
@@ -6429,6 +6590,903 @@ impl ExecutionState<'_, '_> {
             other => ("IoException", other.to_string().into_bytes()),
         };
         self.native_exception(class, message, None, 0, span)
+    }
+
+    fn open_local_stream(
+        &self,
+        path: &[u8],
+        flags: (bool, bool, bool, bool, bool, bool),
+        class: ClassId,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        let path_text = std::str::from_utf8(path).map_err(|_| {
+            self.native_exception(
+                "InvalidStreamUriException",
+                b"file path must be UTF-8".to_vec(),
+                Some(path.to_vec()),
+                0,
+                span,
+            )
+        })?;
+        if path_text.is_empty() || path_text.contains('\0') {
+            return Err(self.native_exception(
+                "InvalidStreamUriException",
+                b"invalid file path".to_vec(),
+                Some(path.to_vec()),
+                0,
+                span,
+            ));
+        }
+        let resolved = if Path::new(path_text).is_relative() {
+            self.filesystem_base.join(path_text)
+        } else {
+            PathBuf::from(path_text)
+        };
+        let (readable, writable, append, truncate, create, exclusive) = flags;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(readable)
+            .write(writable && !append)
+            .append(append)
+            .truncate(truncate)
+            .create(create && !exclusive)
+            .create_new(exclusive);
+        let file = options
+            .open(resolved)
+            .and_then(|file| {
+                if file.metadata()?.is_file() {
+                    Ok(file)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ))
+                }
+            })
+            .map_err(|error| {
+                self.native_exception(
+                    "OpenStreamException",
+                    format!("cannot open `{path_text}`: {error}").into_bytes(),
+                    Some(path.to_vec()),
+                    i64::from(error.raw_os_error().unwrap_or(-1)),
+                    span,
+                )
+            })?;
+        Value::try_file_stream(class, file, readable, writable, append)
+            .map_err(|kind| runtime(kind, span))
+    }
+
+    fn file_info_builtin(
+        &self,
+        operation: FileInfoBuiltin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        if operation == FileInfoBuiltin::Construct {
+            let bytes = arguments[1].as_bytes().expect("verified filename");
+            if std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
+                return Err(self.native_exception(
+                    "ValueError",
+                    b"invalid filesystem path".to_vec(),
+                    None,
+                    0,
+                    span,
+                ));
+            }
+            arguments[0]
+                .set_property(thp_hir::PropertyId(0), arguments[1].clone())
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        let path_value = arguments[0]
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let original =
+            std::str::from_utf8(path_value.as_bytes().expect("initialized file info path"))
+                .expect("constructor validates UTF-8");
+        let path = Path::new(original);
+        let resolved = if path.is_relative() {
+            self.filesystem_base.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        let false_value = || Value::bool(false);
+        match operation {
+            FileInfoBuiltin::Pathname | FileInfoBuiltin::ToString => self.bytes(original, span),
+            FileInfoBuiltin::Path => {
+                self.bytes(path.parent().and_then(Path::to_str).unwrap_or(""), span)
+            }
+            FileInfoBuiltin::Filename | FileInfoBuiltin::Basename => {
+                let name = if original == "."
+                    || original.ends_with("/.")
+                    || (cfg!(windows) && original.ends_with("\\."))
+                {
+                    "."
+                } else if original == ".."
+                    || original.ends_with("/..")
+                    || (cfg!(windows) && original.ends_with("\\.."))
+                {
+                    ".."
+                } else {
+                    path.file_name()
+                        .and_then(|part| part.to_str())
+                        .unwrap_or("")
+                };
+                let name = if operation == FileInfoBuiltin::Basename {
+                    let suffix = arguments[1].as_bytes().expect("verified suffix");
+                    if suffix.is_empty() {
+                        name
+                    } else {
+                        name.strip_suffix(std::str::from_utf8(suffix).unwrap_or("\0"))
+                            .unwrap_or(name)
+                    }
+                } else {
+                    name
+                };
+                self.bytes(name, span)
+            }
+            FileInfoBuiltin::Extension => self.bytes(
+                path.extension()
+                    .and_then(|part| part.to_str())
+                    .unwrap_or(""),
+                span,
+            ),
+            FileInfoBuiltin::RealPath => match std::fs::canonicalize(&resolved)
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned))
+            {
+                Some(path) => self.bytes(path, span),
+                None => Ok(false_value()),
+            },
+            FileInfoBuiltin::LinkTarget => match std::fs::read_link(&resolved)
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned))
+            {
+                Some(path) => self.bytes(path, span),
+                None => Ok(false_value()),
+            },
+            FileInfoBuiltin::Type => {
+                let value = std::fs::symlink_metadata(&resolved).ok().map(|metadata| {
+                    let ty = metadata.file_type();
+                    if ty.is_symlink() {
+                        "link"
+                    } else if ty.is_dir() {
+                        "dir"
+                    } else if ty.is_file() {
+                        "file"
+                    } else {
+                        "unknown"
+                    }
+                });
+                match value {
+                    Some(value) => self.bytes(value, span),
+                    None => Ok(false_value()),
+                }
+            }
+            FileInfoBuiltin::IsFile => Ok(Value::bool(resolved.is_file())),
+            FileInfoBuiltin::IsDir => Ok(Value::bool(resolved.is_dir())),
+            FileInfoBuiltin::IsLink => Ok(Value::bool(resolved.is_symlink())),
+            FileInfoBuiltin::IsReadable => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    Ok(Value::bool(std::fs::metadata(&resolved).is_ok_and(
+                        |metadata| metadata.permissions().mode() & 0o444 != 0,
+                    )))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(Value::bool(std::fs::metadata(&resolved).is_ok()))
+                }
+            }
+            FileInfoBuiltin::IsWritable => Ok(Value::bool(
+                std::fs::metadata(&resolved)
+                    .is_ok_and(|metadata| !metadata.permissions().readonly()),
+            )),
+            FileInfoBuiltin::IsExecutable => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    Ok(Value::bool(std::fs::metadata(&resolved).is_ok_and(
+                        |metadata| metadata.permissions().mode() & 0o111 != 0,
+                    )))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(false_value())
+                }
+            }
+            FileInfoBuiltin::Size
+            | FileInfoBuiltin::ATime
+            | FileInfoBuiltin::MTime
+            | FileInfoBuiltin::CTime
+            | FileInfoBuiltin::Perms
+            | FileInfoBuiltin::Owner
+            | FileInfoBuiltin::Group
+            | FileInfoBuiltin::Inode => {
+                let value =
+                    std::fs::metadata(&resolved)
+                        .ok()
+                        .and_then(|metadata| match operation {
+                            FileInfoBuiltin::Size => i64::try_from(metadata.len()).ok(),
+                            FileInfoBuiltin::ATime => metadata
+                                .accessed()
+                                .ok()
+                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                                .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+                            FileInfoBuiltin::MTime => metadata
+                                .modified()
+                                .ok()
+                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                                .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+                            #[cfg(unix)]
+                            _ => {
+                                use std::os::unix::fs::MetadataExt;
+                                match operation {
+                                    FileInfoBuiltin::CTime => Some(metadata.ctime()),
+                                    FileInfoBuiltin::Perms => Some(i64::from(metadata.mode())),
+                                    FileInfoBuiltin::Owner => Some(i64::from(metadata.uid())),
+                                    FileInfoBuiltin::Group => Some(i64::from(metadata.gid())),
+                                    FileInfoBuiltin::Inode => i64::try_from(metadata.ino()).ok(),
+                                    _ => None,
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            _ => None,
+                        });
+                Ok(value.map_or_else(false_value, Value::integer))
+            }
+            FileInfoBuiltin::Construct => unreachable!(),
+        }
+    }
+
+    fn file_object_builtin(
+        &self,
+        operation: FileObjectBuiltin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let object = &arguments[0];
+        let stream_slot = thp_hir::PropertyId(1);
+        let line_slot = thp_hir::PropertyId(2);
+        let index_slot = thp_hir::PropertyId(3);
+        if operation == FileObjectBuiltin::Construct {
+            let path = arguments[1].as_bytes().expect("verified file path");
+            let stream = self.open_local_stream(
+                path,
+                (true, false, false, false, false, false),
+                self.class_named("ReadableFileStream", span)?,
+                span,
+            )?;
+            object
+                .set_property(thp_hir::PropertyId(0), arguments[1].clone())
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(stream_slot, stream)
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(line_slot, Value::NULL)
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(index_slot, Value::integer(0))
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        let stream = object
+            .property(stream_slot)
+            .map_err(|kind| runtime(kind, span))?;
+        let read_line = || -> Result<Value, VmError> {
+            match stream
+                .stream_read_line()
+                .map_err(|kind| self.stream_exception(kind, span))?
+            {
+                Some(bytes) => Value::try_bytes(bytes).map_err(|kind| runtime(kind, span)),
+                None => Ok(Value::NULL),
+            }
+        };
+        match operation {
+            FileObjectBuiltin::Rewind => {
+                stream
+                    .stream_seek(0)
+                    .map_err(|kind| self.stream_exception(kind, span))?;
+                object
+                    .set_property(index_slot, Value::integer(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(line_slot, read_line()?)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            FileObjectBuiltin::Valid => Ok(Value::bool(
+                !object
+                    .property(line_slot)
+                    .map_err(|kind| runtime(kind, span))?
+                    .is_null(),
+            )),
+            FileObjectBuiltin::Key => object
+                .property(index_slot)
+                .map_err(|kind| runtime(kind, span)),
+            FileObjectBuiltin::Value => {
+                let line = object
+                    .property(line_slot)
+                    .map_err(|kind| runtime(kind, span))?;
+                if line.is_null() {
+                    Err(self.native_exception(
+                        "OutOfBoundsException",
+                        b"file iterator is not valid".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ))
+                } else {
+                    Ok(line)
+                }
+            }
+            FileObjectBuiltin::Advance => {
+                if object
+                    .property(line_slot)
+                    .map_err(|kind| runtime(kind, span))?
+                    .is_null()
+                {
+                    return Ok(Value::NULL);
+                }
+                let index = object
+                    .property(index_slot)
+                    .map_err(|kind| runtime(kind, span))?
+                    .as_int()
+                    .expect("initialized line index");
+                let next = index.checked_add(1).ok_or_else(|| {
+                    runtime(
+                        RuntimeErrorKind::Arithmetic("line index overflow".to_owned()),
+                        span,
+                    )
+                })?;
+                object
+                    .set_property(index_slot, Value::integer(next))
+                    .map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(line_slot, read_line()?)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            FileObjectBuiltin::Seek => {
+                let line = self.nonnegative_stream_value(
+                    arguments[1].as_int().expect("verified line"),
+                    "line number",
+                    span,
+                )?;
+                stream
+                    .stream_seek(0)
+                    .map_err(|kind| self.stream_exception(kind, span))?;
+                for _ in 0..line {
+                    if read_line()?.is_null() {
+                        return Err(self.native_exception(
+                            "OutOfBoundsException",
+                            b"line is past end of file".to_vec(),
+                            None,
+                            0,
+                            span,
+                        ));
+                    }
+                }
+                let current = read_line()?;
+                if current.is_null() {
+                    return Err(self.native_exception(
+                        "OutOfBoundsException",
+                        b"line is past end of file".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ));
+                }
+                object
+                    .set_property(
+                        index_slot,
+                        Value::integer(i64::try_from(line).map_err(|_| {
+                            runtime(
+                                RuntimeErrorKind::Arithmetic("line index overflow".to_owned()),
+                                span,
+                            )
+                        })?),
+                    )
+                    .map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(line_slot, current)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            FileObjectBuiltin::Fgets => {
+                object
+                    .set_property(line_slot, Value::NULL)
+                    .map_err(|kind| runtime(kind, span))?;
+                let value = read_line()?;
+                if value.is_null() {
+                    self.bytes("", span)
+                } else {
+                    Ok(value)
+                }
+            }
+            FileObjectBuiltin::Eof => Ok(Value::bool(
+                stream
+                    .stream_eof()
+                    .map_err(|kind| self.stream_exception(kind, span))?,
+            )),
+            FileObjectBuiltin::Fread => {
+                let length = self.nonnegative_stream_value(
+                    arguments[1].as_int().expect("verified read length"),
+                    "read length",
+                    span,
+                )?;
+                Value::try_bytes(
+                    stream
+                        .stream_read(length)
+                        .map_err(|kind| self.stream_exception(kind, span))?,
+                )
+                .map_err(|kind| runtime(kind, span))
+            }
+            FileObjectBuiltin::Ftell => {
+                let position = stream
+                    .stream_tell()
+                    .map_err(|kind| self.stream_exception(kind, span))?;
+                Ok(Value::integer(i64::try_from(position).map_err(|_| {
+                    runtime(
+                        RuntimeErrorKind::Arithmetic("file position overflow".to_owned()),
+                        span,
+                    )
+                })?))
+            }
+            FileObjectBuiltin::Construct => unreachable!(),
+        }
+    }
+
+    fn directory_builtin(
+        &self,
+        operation: DirectoryBuiltin,
+        arguments: &[Value],
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let object = &arguments[0];
+        let entries_slot = thp_hir::PropertyId(0);
+        let index_slot = thp_hir::PropertyId(1);
+        if matches!(
+            operation,
+            DirectoryBuiltin::ConstructDirectory
+                | DirectoryBuiltin::ConstructFilesystem
+                | DirectoryBuiltin::ConstructRecursive
+                | DirectoryBuiltin::ConstructGlob
+        ) {
+            let bytes = arguments[1].as_bytes().expect("verified directory path");
+            let input = std::str::from_utf8(bytes).map_err(|_| {
+                self.native_exception(
+                    "ValueError",
+                    b"directory path must be UTF-8".to_vec(),
+                    None,
+                    0,
+                    span,
+                )
+            })?;
+            if input.is_empty() || input.contains('\0') {
+                return Err(self.native_exception(
+                    "ValueError",
+                    b"invalid directory path".to_vec(),
+                    None,
+                    0,
+                    span,
+                ));
+            }
+            let glob = operation == DirectoryBuiltin::ConstructGlob;
+            let (directory, matcher) = if glob {
+                let path = Path::new(input);
+                let parent = path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        self.native_exception(
+                            "ValueError",
+                            b"invalid glob pattern".to_vec(),
+                            None,
+                            0,
+                            span,
+                        )
+                    })?;
+                let parent_text = parent.to_str().ok_or_else(|| {
+                    self.native_exception(
+                        "ValueError",
+                        b"glob directory must be UTF-8".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                if parent_text.contains(['*', '?', '[', ']']) || name.contains(['[', ']']) {
+                    return Err(self.native_exception(
+                        "ValueError",
+                        b"glob supports * and ? in the final path component".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ));
+                }
+                // shortcut: only final-component * and ? are supported, extend when nested globbing is specified.
+                let expression = format!(
+                    "(?s)^{}$",
+                    name.chars()
+                        .map(|ch| match ch {
+                            '*' => ".*".to_owned(),
+                            '?' => ".".to_owned(),
+                            _ => regex::escape(&ch.to_string()),
+                        })
+                        .collect::<String>()
+                );
+                let matcher = regex::Regex::new(&expression).map_err(|error| {
+                    self.native_exception(
+                        "ValueError",
+                        format!("invalid glob pattern: {error}").into_bytes(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                (parent_text, Some(matcher))
+            } else {
+                (input, None)
+            };
+            let options = operation != DirectoryBuiltin::ConstructDirectory;
+            let skip_dots = glob || (options && arguments[2].as_bool() == Some(true));
+            let follow = options && arguments[if glob { 2 } else { 3 }].as_bool() == Some(true);
+            let unix_paths = options && arguments[if glob { 3 } else { 4 }].as_bool() == Some(true);
+            let resolved = if Path::new(directory).is_relative() {
+                self.filesystem_base.join(directory)
+            } else {
+                PathBuf::from(directory)
+            };
+            let entries = std::fs::read_dir(resolved).map_err(|error| {
+                self.native_exception(
+                    "OpenStreamException",
+                    format!("cannot open directory `{directory}`: {error}").into_bytes(),
+                    Some(bytes.to_vec()),
+                    i64::from(error.raw_os_error().unwrap_or(-1)),
+                    span,
+                )
+            })?;
+            let info_class = self.class_named("SplFileInfo", span)?;
+            let mut values = Vec::new();
+            let mut add_entry = |name: &str| -> Result<(), VmError> {
+                let path = Path::new(directory).join(name);
+                let path = path.to_str().ok_or_else(|| {
+                    self.native_exception(
+                        "IoException",
+                        b"non-UTF-8 directory entry".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                let path = if unix_paths && cfg!(windows) {
+                    path.replace('\\', "/")
+                } else {
+                    path.to_owned()
+                };
+                let info = self.allocate_object(info_class, Vec::new(), 1, span)?;
+                info.set_property(
+                    thp_hir::PropertyId(0),
+                    Value::try_bytes(path.into_bytes()).map_err(|kind| runtime(kind, span))?,
+                )
+                .map_err(|kind| runtime(kind, span))?;
+                values.push(info);
+                Ok(())
+            };
+            if !skip_dots {
+                add_entry(".")?;
+                add_entry("..")?;
+            }
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    self.native_exception(
+                        "IoException",
+                        error.to_string().into_bytes(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    self.native_exception(
+                        "IoException",
+                        b"non-UTF-8 directory entry".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                if matcher
+                    .as_ref()
+                    .is_none_or(|matcher| matcher.is_match(name))
+                {
+                    add_entry(name)?;
+                }
+            }
+            object
+                .set_property(
+                    entries_slot,
+                    Value::try_vector(Type::Object("SplFileInfo".to_owned()), values)
+                        .map_err(|kind| runtime(kind, span))?,
+                )
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(index_slot, Value::integer(0))
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(2), Value::bool(skip_dots))
+                .map_err(|kind| runtime(kind, span))?;
+            object
+                .set_property(thp_hir::PropertyId(3), Value::bool(follow))
+                .map_err(|kind| runtime(kind, span))?;
+            if operation == DirectoryBuiltin::ConstructRecursive {
+                object
+                    .set_property(thp_hir::PropertyId(4), Value::bool(unix_paths))
+                    .map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(thp_hir::PropertyId(5), arguments[1].clone())
+                    .map_err(|kind| runtime(kind, span))?;
+                object
+                    .set_property(
+                        thp_hir::PropertyId(6),
+                        Value::try_bytes(Vec::new()).map_err(|kind| runtime(kind, span))?,
+                    )
+                    .map_err(|kind| runtime(kind, span))?;
+            }
+            return Ok(Value::NULL);
+        }
+        let entries = object
+            .property(entries_slot)
+            .map_err(|kind| runtime(kind, span))?;
+        let entries = entries
+            .vector_values()
+            .expect("initialized directory entries");
+        let index = object
+            .property(index_slot)
+            .map_err(|kind| runtime(kind, span))?
+            .as_int()
+            .expect("initialized directory index");
+        let current = usize::try_from(index)
+            .ok()
+            .and_then(|index| entries.get(index));
+        match operation {
+            DirectoryBuiltin::Rewind => {
+                object
+                    .set_property(index_slot, Value::integer(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            DirectoryBuiltin::Valid => Ok(Value::bool(current.is_some())),
+            DirectoryBuiltin::Advance => {
+                if current.is_some() {
+                    let next = index.checked_add(1).ok_or_else(|| {
+                        runtime(
+                            RuntimeErrorKind::Arithmetic("directory index overflow".to_owned()),
+                            span,
+                        )
+                    })?;
+                    object
+                        .set_property(index_slot, Value::integer(next))
+                        .map_err(|kind| runtime(kind, span))?;
+                }
+                Ok(Value::NULL)
+            }
+            DirectoryBuiltin::Seek => {
+                let position = self.nonnegative_stream_value(
+                    arguments[1].as_int().expect("verified position"),
+                    "directory position",
+                    span,
+                )?;
+                if position >= entries.len() {
+                    return Err(self.native_exception(
+                        "OutOfBoundsException",
+                        b"directory position is past end".to_vec(),
+                        None,
+                        0,
+                        span,
+                    ));
+                }
+                object
+                    .set_property(
+                        index_slot,
+                        Value::integer(i64::try_from(position).map_err(|_| {
+                            runtime(
+                                RuntimeErrorKind::Arithmetic("directory index overflow".to_owned()),
+                                span,
+                            )
+                        })?),
+                    )
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(Value::NULL)
+            }
+            DirectoryBuiltin::KeyInt => Ok(Value::integer(index)),
+            DirectoryBuiltin::Value => current.cloned().ok_or_else(|| {
+                self.native_exception(
+                    "OutOfBoundsException",
+                    b"directory iterator is not valid".to_vec(),
+                    None,
+                    0,
+                    span,
+                )
+            }),
+            DirectoryBuiltin::RecursiveValue => {
+                let info = current.cloned().ok_or_else(|| {
+                    self.native_exception(
+                        "OutOfBoundsException",
+                        b"directory iterator is not valid".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                let path_value = info
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                let path_text = std::str::from_utf8(path_value.as_bytes().expect("file info path"))
+                    .expect("UTF-8 directory path");
+                let filename = directory_entry_name(path_text);
+                let resolved = if Path::new(path_text).is_relative() {
+                    self.filesystem_base.join(path_text)
+                } else {
+                    PathBuf::from(path_text)
+                };
+                let follow = object
+                    .property(thp_hir::PropertyId(3))
+                    .map_err(|kind| runtime(kind, span))?
+                    .as_bool()
+                    == Some(true);
+                let child = if !matches!(filename, "." | "..")
+                    && resolved.is_dir()
+                    && (follow || !resolved.is_symlink())
+                {
+                    let class = self.class_named("RecursiveDirectoryIterator", span)?;
+                    let child = self.allocate_object(class, Vec::new(), 7, span)?;
+                    self.directory_builtin(
+                        DirectoryBuiltin::ConstructRecursive,
+                        &[
+                            child.clone(),
+                            path_value.clone(),
+                            object
+                                .property(thp_hir::PropertyId(2))
+                                .map_err(|kind| runtime(kind, span))?,
+                            object
+                                .property(thp_hir::PropertyId(3))
+                                .map_err(|kind| runtime(kind, span))?,
+                            object
+                                .property(thp_hir::PropertyId(4))
+                                .map_err(|kind| runtime(kind, span))?,
+                        ],
+                        instruction,
+                    )?;
+                    child
+                        .set_property(
+                            thp_hir::PropertyId(5),
+                            object
+                                .property(thp_hir::PropertyId(5))
+                                .map_err(|kind| runtime(kind, span))?,
+                        )
+                        .map_err(|kind| runtime(kind, span))?;
+                    let subpath = object
+                        .property(thp_hir::PropertyId(6))
+                        .map_err(|kind| runtime(kind, span))?;
+                    let subpath = std::str::from_utf8(subpath.as_bytes().expect("subpath string"))
+                        .expect("UTF-8 subpath");
+                    child
+                        .set_property(
+                            thp_hir::PropertyId(6),
+                            Value::try_bytes(
+                                Path::new(subpath)
+                                    .join(filename)
+                                    .to_string_lossy()
+                                    .into_owned()
+                                    .into_bytes(),
+                            )
+                            .map_err(|kind| runtime(kind, span))?,
+                        )
+                        .map_err(|kind| runtime(kind, span))?;
+                    child
+                } else {
+                    Value::NULL
+                };
+                let entry = self.allocate_object(
+                    self.class_named("RecursiveEntry", span)?,
+                    vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+                    2,
+                    span,
+                )?;
+                entry
+                    .set_property(thp_hir::PropertyId(0), info)
+                    .map_err(|kind| runtime(kind, span))?;
+                entry
+                    .set_property(thp_hir::PropertyId(1), child)
+                    .map_err(|kind| runtime(kind, span))?;
+                Ok(entry)
+            }
+            DirectoryBuiltin::GetSubPath => object
+                .property(thp_hir::PropertyId(6))
+                .map_err(|kind| runtime(kind, span)),
+            DirectoryBuiltin::GetSubPathname => {
+                let subpath = object
+                    .property(thp_hir::PropertyId(6))
+                    .map_err(|kind| runtime(kind, span))?;
+                let subpath = std::str::from_utf8(subpath.as_bytes().expect("subpath string"))
+                    .expect("UTF-8 subpath");
+                let info = current.ok_or_else(|| {
+                    self.native_exception(
+                        "OutOfBoundsException",
+                        b"directory iterator is not valid".to_vec(),
+                        None,
+                        0,
+                        span,
+                    )
+                })?;
+                let path = info
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                let path = std::str::from_utf8(path.as_bytes().expect("file info path"))
+                    .expect("UTF-8 directory path");
+                let name = directory_entry_name(path);
+                self.bytes(Path::new(subpath).join(name).to_string_lossy(), span)
+            }
+            DirectoryBuiltin::KeyPath | DirectoryBuiltin::IsDot | DirectoryBuiltin::ToString => {
+                let Some(info) = current else {
+                    return if operation == DirectoryBuiltin::ToString {
+                        self.bytes("", span)
+                    } else {
+                        Err(self.native_exception(
+                            "OutOfBoundsException",
+                            b"directory iterator is not valid".to_vec(),
+                            None,
+                            0,
+                            span,
+                        ))
+                    };
+                };
+                let path = info
+                    .property(thp_hir::PropertyId(0))
+                    .map_err(|kind| runtime(kind, span))?;
+                let path_text = std::str::from_utf8(path.as_bytes().expect("file info path"))
+                    .expect("UTF-8 directory path");
+                if operation == DirectoryBuiltin::KeyPath {
+                    return Ok(path);
+                }
+                let name = directory_entry_name(path_text);
+                if operation == DirectoryBuiltin::IsDot {
+                    Ok(Value::bool(matches!(name, "." | "..")))
+                } else {
+                    self.bytes(name, span)
+                }
+            }
+            DirectoryBuiltin::SkipsDots => object
+                .property(thp_hir::PropertyId(2))
+                .map_err(|kind| runtime(kind, span)),
+            DirectoryBuiltin::FollowsSymlinks => object
+                .property(thp_hir::PropertyId(3))
+                .map_err(|kind| runtime(kind, span)),
+            DirectoryBuiltin::Count => Ok(Value::integer(i64::try_from(entries.len()).map_err(
+                |_| {
+                    runtime(
+                        RuntimeErrorKind::Arithmetic("directory entry count overflow".to_owned()),
+                        span,
+                    )
+                },
+            )?)),
+            DirectoryBuiltin::ConstructDirectory
+            | DirectoryBuiltin::ConstructFilesystem
+            | DirectoryBuiltin::ConstructRecursive
+            | DirectoryBuiltin::ConstructGlob => unreachable!(),
+        }
     }
 
     fn nonnegative_stream_value(
@@ -7691,16 +8749,29 @@ var_dump($stream->readAll() === "abcd\x00\x00z");
     }
 
     #[test]
+    fn memory_stream_reads_after_seeking_past_eof_are_empty() {
+        let execution = run(r#"<?thp
+$stream = MemoryStream::open("abc");
+$stream->seek(5);
+var_dump($stream->read(1) === "");
+var_dump($stream->readAll() === "");
+var_dump($stream->tell() === 5);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"bool(true)\nbool(true)\nbool(true)\n");
+    }
+
+    #[test]
     fn stream_uri_and_temp_factories_execute() {
         let execution = run(r#"<?thp
 $memory = Streams::open("php://memory", OpenMode::ReadWrite);
-if (
-    $memory instanceof ReadableStream
-    && $memory instanceof WritableStream
-    && $memory instanceof SeekableStream
-) {
+if ($memory instanceof WritableStream) {
     $memory->writeAll("uri");
+}
+if ($memory instanceof SeekableStream) {
     $memory->seek(0);
+}
+if ($memory instanceof ReadableStream) {
     echo $memory->readAll() . "\n";
 }
 
@@ -7711,6 +8782,286 @@ echo $temp->readAll() . "\n";
 "#)
         .unwrap();
         assert_eq!(execution.output, b"uri\ndisk-backed\n");
+    }
+
+    #[test]
+    fn file_stream_modes_preserve_data_and_enforce_capabilities() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream name.bin");
+        let source = format!(
+            r#"<?thp
+$path = "{}";
+$write = Files::openWrite($path, WriteMode::Truncate);
+$write->writeAll("abc");
+$write->flush();
+var_dump($write->isReadable());
+$write->close();
+$append = Files::openWrite($path, WriteMode::Append);
+$append->seek(0);
+$append->writeAll("d");
+$append->close();
+$read = Files::openRead($path);
+echo $read->readAll() . "\n";
+$read->close();
+$both = Files::openReadWrite($path);
+var_dump($both->seek(-1, SeekFrom::End));
+$both->writeAll("Z");
+$both->seek(0);
+echo $both->readAll() . "\n";
+$both->close();
+try {{
+    Files::openWrite($path, WriteMode::CreateExclusive);
+}} catch (OpenStreamException $error) {{
+    echo "exclusive\n";
+}}
+$uri = "file://" . $path;
+$dynamic = Streams::open($uri, OpenMode::Read);
+var_dump($dynamic->isReadable());
+if ($dynamic instanceof ReadableStream) {{
+    echo $dynamic->readAll() . "\n";
+}}
+$encoded = Streams::open("file://{}", OpenMode::Read);
+if ($encoded instanceof ReadableStream) {{
+    echo $encoded->readAll() . "\n";
+}}
+"#,
+            path.display(),
+            path.display().to_string().replace(' ', "%20")
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(
+            execution.output,
+            b"bool(false)\nabcd\nint(3)\nabcZ\nexclusive\nbool(true)\nabcZ\nabcZ\n"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"abcZ");
+    }
+
+    #[test]
+    fn file_stream_observes_appends_from_another_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.txt");
+        std::fs::write(&path, b"base").unwrap();
+        let source = format!(
+            r#"<?thp
+$reader = Files::openRead("{}");
+$writer = Files::openWrite("{}", WriteMode::Append);
+$writer->writeAll("more");
+$writer->close();
+var_dump($reader->seek(-4, SeekFrom::End));
+echo $reader->readAll() . "\n";
+"#,
+            path.display(),
+            path.display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"int(4)\nmore\n");
+    }
+
+    #[test]
+    fn file_stream_write_preserves_bytes_added_by_another_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.txt");
+        std::fs::write(&path, b"base").unwrap();
+        let source = format!(
+            r#"<?thp
+$editor = Files::openReadWrite("{}");
+$writer = Files::openWrite("{}", WriteMode::Append);
+$writer->writeAll("more");
+$writer->close();
+$editor->seek(5);
+$editor->writeAll("X");
+$editor->close();
+"#,
+            path.display(),
+            path.display()
+        );
+        run(&source).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"basemXre");
+    }
+
+    #[test]
+    fn file_factories_reject_directories_at_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"<?thp
+$path = "{}";
+try {{ Files::openRead($path); }} catch (OpenStreamException $error) {{ echo "files\n"; }}
+try {{ Streams::open($path, OpenMode::Read); }} catch (OpenStreamException $error) {{ echo "streams\n"; }}
+try {{ new SplFileObject($path); }} catch (OpenStreamException $error) {{ echo "object\n"; }}
+"#,
+            directory.path().display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"files\nstreams\nobject\n");
+    }
+
+    #[test]
+    fn empty_file_iterator_and_missing_file_failures_are_typed() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = directory.path().join("empty.txt");
+        std::fs::write(&empty, b"").unwrap();
+        let source = format!(
+            r#"<?thp
+$file = new SplFileObject("{}");
+var_dump($file->isFile());
+foreach ($file as $line) {{ echo $line; }}
+var_dump($file->valid());
+try {{ $file->seek(0); }} catch (OutOfBoundsException $error) {{ echo "past\n"; }}
+try {{ new SplFileObject("{}/missing.txt"); }} catch (OpenStreamException $error) {{ echo "missing\n"; }}
+"#,
+            empty.display(),
+            directory.path().display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(
+            execution.output,
+            b"bool(true)\nbool(false)\npast\nmissing\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_info_readability_respects_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("write-only.txt");
+        std::fs::write(&path, b"content").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let source = format!(
+            r#"<?thp
+$info = new SplFileInfo("{}");
+var_dump($info->isReadable());
+var_dump($info->isWritable());
+"#,
+            path.display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"bool(false)\nbool(true)\n");
+    }
+
+    #[test]
+    fn file_info_preserves_dot_path_components() {
+        let execution = run(r#"<?thp
+var_dump((new SplFileInfo("."))->getFilename());
+var_dump((new SplFileInfo(".."))->getBasename());
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"string(1) \".\"\nstring(2) \"..\"\n");
+    }
+
+    #[test]
+    fn empty_directory_iterators_and_missing_directory_failures_are_typed() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"<?thp
+$raw = new DirectoryIterator("{}");
+$raw->rewind();
+var_dump($raw->isDot());
+try {{ $raw->seek(2); }} catch (OutOfBoundsException $error) {{ echo "past\n"; }}
+$files = new FilesystemIterator("{}");
+$files->rewind();
+var_dump($files->valid());
+try {{ new FilesystemIterator("{}/missing"); }} catch (OpenStreamException $error) {{ echo "missing\n"; }}
+"#,
+            directory.path().display(),
+            directory.path().display(),
+            directory.path().display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(
+            execution.output,
+            b"bool(true)\npast\nbool(false)\nmissing\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_iterators_preserve_backslashes_in_unix_filenames() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a\\.."), b"entry").unwrap();
+        let source = format!(
+            r#"<?thp
+$files = new FilesystemIterator("{}", true, false, true);
+foreach ($files as $info) {{
+    var_dump($info->isFile());
+    echo $info->getFilename() . "\n";
+}}
+$raw = new DirectoryIterator("{}");
+$raw->seek(2);
+var_dump($raw->isDot());
+$tree = new RecursiveDirectoryIterator("{}");
+$tree->rewind();
+echo $tree->getSubPathname() . "\n";
+"#,
+            directory.path().display(),
+            directory.path().display(),
+            directory.path().display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"bool(true)\na\\..\nbool(false)\na\\..\n");
+    }
+
+    #[test]
+    fn recursive_directory_entries_feed_the_common_recursive_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("leaf.txt"), b"leaf").unwrap();
+        let source = format!(
+            r#"<?thp
+$tree = new RecursiveDirectoryIterator("{}");
+$tree->rewind();
+echo $tree->getSubPathname() . "\n";
+$walk = new RecursiveIteratorIterator<string, SplFileInfo>($tree);
+foreach ($walk as $info) {{ echo $info->getFilename() . "\n"; }}
+"#,
+            directory.path().display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"sub\nleaf.txt\n");
+    }
+
+    #[test]
+    fn glob_iterator_empty_matches_and_unsupported_parent_pattern() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"<?thp
+$files = new GlobIterator("{}/*.phpt");
+var_dump($files->count());
+var_dump($files->valid());
+try {{ new GlobIterator("{}/*/file.txt"); }} catch (ValueError $error) {{ echo "pattern\n"; }}
+"#,
+            directory.path().display(),
+            directory.path().display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"int(0)\nbool(false)\npattern\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_wildcards_match_newlines_in_filenames() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a\nb.txt"), b"match").unwrap();
+        let source = format!(
+            r#"<?thp
+var_dump((new GlobIterator("{}/a?b.txt"))->count());
+"#,
+            directory.path().display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"int(1)\n");
+    }
+
+    #[test]
+    fn oversized_glob_pattern_throws_value_error() {
+        let source = format!(
+            "<?thp\ntry {{ new GlobIterator(\"{}\"); }} catch (ValueError $error) {{ echo \"invalid\\n\"; }}\n",
+            "?".repeat(250_000)
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"invalid\n");
     }
 
     #[test]

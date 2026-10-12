@@ -16,10 +16,8 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: Returns the current entry path relative to the traversal root.
 version: "0.1"
 owner: std.spl.RecursiveDirectoryIterator
 visibility: public
