@@ -95,14 +95,38 @@ authority for accepted syntax and executable behavior.
 
 ## Try it locally
 
-Install THP on Linux or macOS:
+On Linux x86-64 with glibc, download the prebuilt THP 0.9.0 release and its
+checksum manifest:
 
 ```sh
-bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/thp-lang/thp/main/install.sh | bash'
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+  -O https://github.com/thp-lang/thp/releases/download/v0.9.0/thp-0.9.0-linux-x86_64.tar.gz \
+  -O https://github.com/thp-lang/thp/releases/download/v0.9.0/SHA256SUMS
 ```
 
-Follow the printed `PATH` instruction if needed. Save the collection example as
-`collections.thp`, then run:
+Verify the exact archive name:
+
+```sh
+awk '$2 == "thp-0.9.0-linux-x86_64.tar.gz" { print }' SHA256SUMS |
+  sha256sum -c -
+```
+
+Continue only if it prints `thp-0.9.0-linux-x86_64.tar.gz: OK`. Extract the
+archive and install the binary in `~/.local/bin`:
+
+```sh
+tar -xzf thp-0.9.0-linux-x86_64.tar.gz
+install -Dm755 thp-0.9.0-linux-x86_64/bin/thp "$HOME/.local/bin/thp"
+```
+
+Add `~/.local/bin` to `PATH` for this terminal. Add the same line to `~/.bashrc`
+for Bash or `~/.zshrc` for Zsh to keep it available in new terminals:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Save the collection example as `collections.thp`, then run:
 
 ```sh
 thp --version
@@ -110,9 +134,8 @@ thp check collections.thp
 thp run collections.thp
 ```
 
-On Windows, use `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/thp-lang/thp/main/install.ps1 -ErrorAction Stop)))`
-in PowerShell. The [getting-started guide](thp:guide.gettingStarted) covers
-supported platforms, manual archive installation, building from source,
+The [getting-started guide](thp:guide.gettingStarted) covers macOS and Windows
+archives, manual installation, building from source,
 compiler stages, the VM or JIT, and the persistent cache.
 
 ## Clear experimental boundaries

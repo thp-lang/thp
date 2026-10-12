@@ -370,6 +370,10 @@ svg {
   box-shadow: 0 1.5rem 3rem rgb(0 0 0 / 18%);
 }
 
+.shiki {
+  overflow-x: auto;
+}
+
 .code-window-bar,
 .synopsis-toolbar {
   display: flex;
