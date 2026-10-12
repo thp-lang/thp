@@ -10,7 +10,7 @@ fn project(source: &str) -> tempfile::TempDir {
 
 fn minimal_lock(body: &str) -> Vec<u8> {
     format!(
-        "THP-LOCK 1\n\
+        "THP-LOCK 2\n\
          fingerprint {}\n\
          package-roots 0\n\
          autoload 0\n\
@@ -21,6 +21,7 @@ fn minimal_lock(body: &str) -> Vec<u8> {
          request.max_open_handles 256\n\
          time.max_input 60\n\
          time.max_execution 30\n\
+         extension-libraries 0\n\
          {body}",
         "0".repeat(64)
     )
@@ -28,7 +29,7 @@ fn minimal_lock(body: &str) -> Vec<u8> {
 }
 
 #[test]
-fn deterministic_lock_matches_the_version_one_snapshot() {
+fn deterministic_lock_matches_the_version_two_snapshot() {
     let root = project("");
     let result = build_lock(root.path()).expect("build lock");
     assert!(result.changed);
@@ -44,7 +45,7 @@ fn deterministic_lock_matches_the_version_one_snapshot() {
     hasher.update(&[0]);
     let fingerprint = hasher.finalize().to_hex();
     let expected = format!(
-        "THP-LOCK 1\n\
+        "THP-LOCK 2\n\
          fingerprint {fingerprint}\n\
          package-roots 0\n\
          autoload 0\n\
@@ -55,6 +56,7 @@ fn deterministic_lock_matches_the_version_one_snapshot() {
          request.max_open_handles 256\n\
          time.max_input 60\n\
          time.max_execution 30\n\
+         extension-libraries 0\n\
          end-profile\n\
          end-lock\n"
     );
@@ -138,8 +140,7 @@ fn old_version_one_layout_requires_regeneration() {
         "0".repeat(64)
     );
     let error = parse_lock(old.as_bytes()).expect_err("old layout");
-    assert_eq!(error.kind, LockErrorKind::Corrupt);
-    assert!(error.message.contains("thp lock"));
+    assert_eq!(error.kind, LockErrorKind::UnsupportedVersion);
 }
 
 #[test]
@@ -291,6 +292,7 @@ fn rejects_unknown_duplicate_missing_and_malformed_records() {
              request.max_open_handles 1\n\
              time.max_input 1\n\
              time.max_execution 1\n\
+             extension-libraries 0\n\
              end-profile\n\
              profile target cli\n",
         ),

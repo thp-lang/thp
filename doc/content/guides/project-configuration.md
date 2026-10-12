@@ -2,14 +2,14 @@
 kind: guide
 id: guide.projectConfiguration
 title: Project configuration
-summary: Define package discovery, runtime limits, target overrides, and extension settings in project TOML.
+summary: Define package discovery, runtime limits, native libraries, and extension settings in project TOML.
 nav:
   section: learn
   order: 40
 status: experimental
 availability: implemented
 notice: >-
-  The configuration loader and lock format are implemented, but THP does not yet enforce these limits at runtime or validate extension-owned settings.
+  Project library loading and the lock format are implemented. Extension-owned settings remain opaque until an extension decodes them.
 ---
 
 THP project settings live beside the project source. The project root must
@@ -119,11 +119,17 @@ max_execution = "30s"
 [extensions.example]
 custom_key = "value"
 
+[extension_libraries]
+example = "extensions/example.so"
+
 [targets.cli.memory]
 limit = "400M"
 
 [targets.cli.extensions.example]
 custom_key = "cli-value"
+
+[targets.cli.extension_libraries]
+example = "extensions/example-debug.so"
 ```
 
 All core tables and fields are optional, but `thp.toml` itself is required.
@@ -223,6 +229,33 @@ values. The core loader preserves and merges this data but does not apply an
 extension-owned schema. An extension can decode and validate its table only
 when it requests the configuration.
 
+## Native extension libraries
+
+`[extension_libraries]` maps validated extension names to paths for ABI-v1
+native libraries. Relative paths resolve from the project root. A target can
+replace a library path in `[targets.NAME.extension_libraries]`; local project
+configuration can replace the same name. Library paths are separate from
+opaque `[extensions.NAME]` settings. The bundled PCRE2 regex extension needs
+no entry.
+
+THP reads and loads selected libraries before compiling project source. Each
+library exports `thp_extension_entry`, declares the configured name, and
+registers fixed typed functions through the size-versioned host table in
+`crates/abi/include/thp.h`. A missing library, ABI mismatch, invalid signature,
+duplicate function, or failed initializer stops project preparation. Native
+functions participate in static calls and bytecode verification. Values cross
+the C boundary through checked opaque handles valid only during one callback;
+the callback returns a live handle, and THP checks its declared return type.
+Prepared projects retain their loaded libraries until released.
+
+Native calls run in the VM. An explicit JIT run rejects a project with native
+functions; automatic selection uses the VM. The library's file bytes and
+registered signatures contribute to cache and frozen-project identity, so
+rebuild frozen artifacts after replacing a library.
+The host table lends that library's canonical `[extensions.NAME]` TOML bytes
+during initialization. A library can parse its own schema without the lock
+reader parsing other extensions' settings.
+
 ## Generated lock file
 
 During deployment preparation, run `thp lock [--project=DIR]` to generate
@@ -233,6 +266,9 @@ configured package roots, every resolved namespace mapping, and fully resolved
 common and target profiles. Core sizes are canonical byte counts, core
 durations are canonical seconds, and mappings, targets, and extensions have
 deterministic lexical ordering.
+
+Lock format version 2 records native library names and paths separately from
+length-delimited extension settings. Version-1 lock files must be regenerated.
 
 Extension data is stored as length-delimited canonical TOML. Startup code can
 load core records and skip or retain these payloads without parsing them.

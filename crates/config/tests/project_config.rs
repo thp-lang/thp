@@ -534,6 +534,32 @@ fn extension_entries_must_be_tables() {
 }
 
 #[test]
+fn extension_library_paths_are_separate_from_extension_settings() {
+    let root = project(
+        "[extension_libraries]\ndemo = 'libdemo.so'\n[extensions.demo]\nvalue = 1\n[targets.cli.extension_libraries]\ndemo = 'libdemo-debug.so'\n",
+    );
+    let config = ProjectConfig::load(root.path()).expect("configuration");
+    assert_eq!(
+        config.resolve(None).expect("common").extension_libraries["demo"],
+        std::path::PathBuf::from("libdemo.so")
+    );
+    assert_eq!(
+        config
+            .resolve(Some("cli"))
+            .expect("target")
+            .extension_libraries["demo"],
+        std::path::PathBuf::from("libdemo-debug.so")
+    );
+    assert!(
+        config
+            .resolve(None)
+            .expect("common")
+            .extension("demo")
+            .is_some()
+    );
+}
+
+#[test]
 fn syntax_diagnostics_include_path_and_source_position() {
     let root = project("[memory\nlimit = \"1M\"\n");
     let error = ProjectConfig::load(root.path()).expect_err("invalid TOML");

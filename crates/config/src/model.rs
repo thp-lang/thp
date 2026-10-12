@@ -150,6 +150,7 @@ impl ExtensionConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedProfile {
     pub runtime: RuntimeConfig,
+    pub extension_libraries: BTreeMap<ExtensionName, PathBuf>,
     pub(crate) extensions: BTreeMap<ExtensionName, ExtensionConfig>,
 }
 
@@ -329,6 +330,7 @@ struct ProfileLayer {
     max_open_handles: Option<CountLimit>,
     max_input: Option<Limit<Duration>>,
     max_execution: Option<Limit<Duration>>,
+    extension_libraries: BTreeMap<ExtensionName, PathBuf>,
     extensions: BTreeMap<ExtensionName, toml::Value>,
 }
 
@@ -367,6 +369,7 @@ impl ProfileLayer {
         if later.max_execution.is_some() {
             self.max_execution = later.max_execution;
         }
+        self.extension_libraries.extend(later.extension_libraries);
         for (name, later_value) in later.extensions {
             match self.extensions.get_mut(&name) {
                 Some(earlier) => merge_toml(earlier, later_value),
@@ -427,6 +430,7 @@ fn resolve_profile(layer: &ProfileLayer, path: &Path) -> Result<ResolvedProfile,
         .collect::<Result<_, _>>()?;
     Ok(ResolvedProfile {
         runtime,
+        extension_libraries: layer.extension_libraries.clone(),
         extensions,
     })
 }
@@ -439,6 +443,8 @@ struct RawDocument {
     memory: Option<RawMemory>,
     request: Option<RawRequest>,
     time: Option<RawTime>,
+    #[serde(default)]
+    extension_libraries: BTreeMap<String, String>,
     #[serde(default)]
     extensions: BTreeMap<String, toml::Value>,
     #[serde(default)]
@@ -458,6 +464,8 @@ struct RawProfile {
     memory: Option<RawMemory>,
     request: Option<RawRequest>,
     time: Option<RawTime>,
+    #[serde(default)]
+    extension_libraries: BTreeMap<String, String>,
     #[serde(default)]
     extensions: BTreeMap<String, toml::Value>,
 }
@@ -588,6 +596,7 @@ fn parse_layer(path: &Path, source: &str) -> Result<DocumentLayer, Diagnostic> {
             memory: raw.memory,
             request: raw.request,
             time: raw.time,
+            extension_libraries: raw.extension_libraries,
             extensions: raw.extensions,
         },
         path,
@@ -847,6 +856,8 @@ fn convert_profile(
         raw.time.and_then(|time| time.max_execution),
         "time.max_execution",
     )?;
+    let extension_libraries =
+        convert_extension_libraries(raw.extension_libraries, path, source, prefix)?;
     let extensions = raw
         .extensions
         .into_iter()
@@ -873,6 +884,33 @@ fn convert_profile(
         max_open_handles,
         max_input,
         max_execution,
+        extension_libraries,
         extensions,
     })
+}
+
+fn convert_extension_libraries(
+    libraries: BTreeMap<String, String>,
+    path: &Path,
+    source: &str,
+    prefix: &str,
+) -> Result<BTreeMap<ExtensionName, PathBuf>, Diagnostic> {
+    libraries
+        .into_iter()
+        .map(|(name, path_value)| {
+            let field = format!("{prefix}extension_libraries.{name}");
+            let name = ExtensionName::new(name)
+                .map_err(|message| Diagnostic::at_field(path, source, &field, message))?;
+            let library = PathBuf::from(path_value);
+            if library.as_os_str().is_empty() {
+                return Err(Diagnostic::at_field(
+                    path,
+                    source,
+                    &field,
+                    "extension library path must not be empty",
+                ));
+            }
+            Ok((name, library))
+        })
+        .collect()
 }

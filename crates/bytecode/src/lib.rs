@@ -17,7 +17,7 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 9;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInfo {
@@ -31,6 +31,7 @@ pub struct Program {
     pub sources: Vec<SourceInfo>,
     pub functions: Vec<Function>,
     pub classes: Vec<Class>,
+    pub native_functions: Vec<thp_hir::NativeSignature>,
     pub entry: FunctionId,
 }
 
@@ -334,6 +335,7 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                 traits: class.traits.clone(),
             })
             .collect(),
+        native_functions: module.native_functions.clone(),
         functions: module
             .functions
             .iter()
@@ -2441,6 +2443,8 @@ fn verify_instruction(
                             | "RecursiveEntry"
                             | "RecursiveIteratorIterator"
                             | "CallbackFilterIterator"
+                            | "RegexIterator"
+                            | "RecursiveRegexIterator"
                             | "TraceLine"
                             | "SplFileInfo"
                             | "SplFileObject"
@@ -2922,6 +2926,104 @@ fn verify_builtin_call(
             .ok_or_else(|| format!("builtin requires a {expected} receiver"))
     };
     match builtin {
+        Builtin::PregMatch | Builtin::PregSplit => {
+            let count = if builtin == Builtin::PregMatch { 3 } else { 4 };
+            if arguments.len() != count
+                || argument_type(0) != &Type::String
+                || argument_type(1) != &Type::String
+                || (count == 4 && argument_type(2) != &Type::Int)
+                || argument_type(count - 1) != &Type::Int
+            {
+                return Err("regex arguments do not match the signature".to_owned());
+            }
+            let flag_register = arguments[count - 1];
+            let flags = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .find(|instruction| instruction.destination == Some(flag_register))
+                .and_then(|instruction| match &instruction.kind {
+                    InstructionKind::Constant(thp_mir::Constant::Integer(value)) => Some(*value),
+                    _ => None,
+                })
+                .ok_or_else(|| "regex flags must be constant".to_owned())?;
+            let allowed = if builtin == Builtin::PregMatch {
+                256 | 512
+            } else {
+                1 | 2 | 4
+            };
+            if flags < 0 || flags & !allowed != 0 {
+                return Err("unsupported regex flags".to_owned());
+            }
+            let capture = if flags
+                & (if builtin == Builtin::PregMatch {
+                    256
+                } else {
+                    4
+                })
+                != 0
+            {
+                Type::Object("RegexCapture".to_owned())
+            } else if flags & 512 != 0 {
+                Type::Union(vec![Type::Null, Type::String])
+            } else {
+                Type::String
+            };
+            let expected = if builtin == Builtin::PregMatch {
+                Type::Union(vec![
+                    Type::Map(Box::new(Type::String), Box::new(capture)),
+                    Type::Null,
+                ])
+            } else {
+                Type::Vector(Box::new(capture))
+            };
+            if result != Some(&expected) {
+                return Err("regex result type does not match constant flags".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::PregReplace => check(
+            &[Type::String, Type::String, Type::String, Type::Int],
+            &Type::String,
+        ),
+        Builtin::RegexCaptureText | Builtin::RegexCaptureOffset => {
+            if arguments.len() != 1 {
+                return Err("RegexCapture method signature mismatch".to_owned());
+            }
+            object_receiver("RegexCapture")?;
+            if result
+                != Some(&if builtin == Builtin::RegexCaptureText {
+                    Type::Union(vec![Type::Null, Type::String])
+                } else {
+                    Type::Int
+                })
+            {
+                return Err("RegexCapture method signature mismatch".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Native(index) => {
+            let native = program
+                .native_functions
+                .get(index as usize)
+                .ok_or_else(|| "native function index is out of bounds".to_owned())?;
+            if arguments.len() != native.parameters.len() {
+                return Err("native function argument count does not match signature".to_owned());
+            }
+            for (argument, parameter) in arguments.iter().zip(&native.parameters) {
+                if !type_accepts(
+                    program,
+                    parameter,
+                    &function.register_types[argument.0 as usize],
+                ) {
+                    return Err("native function argument type does not match signature".to_owned());
+                }
+            }
+            if result != Some(&native.return_type) {
+                return Err("native function result type does not match signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::VectorMap | Builtin::VectorFilter => {
             if arguments.len() != 2 {
                 return Err("vector callback operation requires two arguments".to_owned());
@@ -3048,6 +3150,119 @@ fn verify_builtin_call(
                 .then_some(())
                 .ok_or_else(|| "collection iterator result type is wrong".to_owned())
         }
+        Builtin::RegexIteratorConstruct => {
+            if arguments.len() != 7 || result != Some(&Type::Void) {
+                return Err("invalid regex iterator constructor".to_owned());
+            }
+            let Some((name, [key, input, output])) = encoded_nominal_parts(argument_type(0)) else {
+                return Err("invalid regex iterator receiver".to_owned());
+            };
+            if !matches!(name, "RegexIterator" | "RecursiveRegexIterator") {
+                return Err("invalid regex iterator receiver".to_owned());
+            }
+            let inner = Type::Nominal {
+                name: if name == "RecursiveRegexIterator" {
+                    "RecursiveIterator"
+                } else {
+                    "Iterator"
+                }
+                .to_owned(),
+                arguments: vec![key.clone(), input.clone()],
+            };
+            if !type_accepts(program, &inner, argument_type(1))
+                || argument_type(2) != &Type::String
+                || argument_type(3) != &Type::Int
+                || argument_type(4) != &Type::Bool
+                || argument_type(5) != &Type::Int
+                || argument_type(6) != &Type::String
+            {
+                return Err("invalid regex iterator constructor arguments".to_owned());
+            }
+            let constant = |register| {
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instructions)
+                    .find(|instruction| instruction.destination == Some(register))
+                    .and_then(|instruction| match &instruction.kind {
+                        InstructionKind::Constant(thp_mir::Constant::Integer(value)) => {
+                            Some(*value)
+                        }
+                        _ => None,
+                    })
+            };
+            let mode = constant(arguments[3]).ok_or("regex iterator mode must be constant")?;
+            let flags = constant(arguments[5]).ok_or("regex iterator flags must be constant")?;
+            let allowed = match mode {
+                0 | 4 | 5 => 0,
+                1 | 2 => 256 | 512,
+                3 => 1 | 2 | 4,
+                _ => return Err("invalid regex iterator mode".to_owned()),
+            };
+            let valid = flags >= 0
+                && flags & !allowed == 0
+                && (mode == 5 || input == &Type::String)
+                && (mode != 5 || key == &Type::String);
+            if !valid {
+                return Err("invalid regex iterator mode or flags".to_owned());
+            }
+            let capture = Type::Map(
+                Box::new(Type::String),
+                Box::new(if flags & 256 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else if flags & 512 != 0 {
+                    Type::Union(vec![Type::Null, Type::String])
+                } else {
+                    Type::String
+                }),
+            );
+            let expected = match mode {
+                0 | 5 => input.clone(),
+                1 => capture.clone(),
+                2 => Type::Vector(Box::new(capture)),
+                3 => Type::Vector(Box::new(if flags & 4 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else {
+                    Type::String
+                })),
+                4 => Type::String,
+                _ => return Err("invalid regex iterator mode".to_owned()),
+            };
+            if output != &expected {
+                return Err("regex iterator output type does not match mode".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::RegexIteratorGetInner
+        | Builtin::RegexIteratorGetRegex
+        | Builtin::RegexIteratorGetMode
+        | Builtin::RegexIteratorGetPregFlags => {
+            if arguments.len() != 1 {
+                return Err("invalid regex iterator getter".to_owned());
+            }
+            let Some((name, [key, input, _])) = encoded_nominal_parts(argument_type(0)) else {
+                return Err("invalid regex iterator receiver".to_owned());
+            };
+            if !matches!(name, "RegexIterator" | "RecursiveRegexIterator") {
+                return Err("invalid regex iterator receiver".to_owned());
+            }
+            let expected = match builtin {
+                Builtin::RegexIteratorGetInner => Type::Nominal {
+                    name: if name == "RecursiveRegexIterator" {
+                        "RecursiveIterator"
+                    } else {
+                        "Iterator"
+                    }
+                    .to_owned(),
+                    arguments: vec![key.clone(), input.clone()],
+                },
+                Builtin::RegexIteratorGetRegex => Type::String,
+                _ => Type::Int,
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid regex iterator getter type".to_owned())
+        }
         Builtin::IteratorConstruct | Builtin::CallbackFilterConstruct => {
             let Some((name, type_arguments)) = arguments
                 .first()
@@ -3168,6 +3383,8 @@ fn verify_builtin_call(
                             | "RecursiveCachingIterator"
                             | "RecursiveIteratorIterator"
                             | "Generator"
+                            | "RegexIterator"
+                            | "RecursiveRegexIterator"
                     ))
             {
                 return Err("invalid iterator cursor call".to_owned());

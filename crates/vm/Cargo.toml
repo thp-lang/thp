@@ -9,10 +9,12 @@ description = "Reference THP bytecode interpreter"
 
 [dependencies]
 regex.workspace = true
+pcre2.workspace = true
 thp-bytecode = { path = "../bytecode" }
 thp-diagnostics = { path = "../diagnostics" }
 thp-hir = { path = "../hir" }
 thp-mir = { path = "../mir" }
+thp-native = { path = "../native" }
 thp-runtime = { path = "../runtime" }
 thp-syntax = { path = "../syntax" }
 

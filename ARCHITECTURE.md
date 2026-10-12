@@ -47,6 +47,9 @@ exposes version-one opaque engine/prepared-project handles, size-versioned
 runtime limits, synchronous input/output and module-provider callbacks, owned
 byte buffers, and extension/host function tables through
 `crates/abi/include/thp.h`. Legacy captured run functions remain available.
+`thp-native` loads project libraries before type checking, retains them with
+prepared programs, and exposes call-scoped opaque values to C callbacks. Its
+fixed signatures and library digests are verified against linked bytecode.
 Rust layouts are never part of that ABI, panics are caught before returning to
 C, and every allocation has an explicit matching release function.
 

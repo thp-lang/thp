@@ -12,9 +12,9 @@ notice:
   InfiniteIterator, AppendIterator, CachingIterator, FilterIterator, CallbackFilterIterator,
   OuterIterator, SeekableIterator, and four consuming functions are implemented.
   RecursiveIterator, RecursiveEntry, RecursiveIteratorIterator, RecursiveCachingIterator,
-  RecursiveFilterIterator, ParentIterator, and RecursiveCallbackFilterIterator are
-  implemented. Filesystem, regex, tree formatting, and other iterator classes
-  remain proposed.
+  RecursiveFilterIterator, ParentIterator, RecursiveCallbackFilterIterator,
+  RegexIterator, and RecursiveRegexIterator are implemented. Tree formatting
+  and other iterator classes remain proposed.
 ---
 
 | Family                | Classes                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |

@@ -58,6 +58,8 @@ compiler if used as though it were available.
 | `try`, `catch`, `finally`, `throw`, `using`                                                 | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                                                                         |
 | Namespaces, imports, and project/package autoload discovery                                 | implemented  | Semicolon namespaces and deterministic configured and installed-package source maps; no downloading, runtime source loading, or runtime include/autoload callbacks      |
 | OPcache, frozen projects, metrics, embedding, C ABI                                         | implemented  | Reified generic and reflection metadata is schema-versioned; the public C ABI remains version 1                                                                         |
+| Native extension libraries and fixed typed functions                                        | implemented  | Project libraries load before compilation; opaque call-scoped value handles, checked return types, and library-aware frozen identity run in the VM                      |
+| `preg_match()`, `preg_replace()`, `preg_split()`, `RegexCapture`                            | implemented  | PCRE2 patterns, named captures, byte offsets, constant result-changing flags, and runtime pattern errors                                                                |
 | Cranelift JIT                                                                               | partial      | Safe scalar subset; automatic mode falls back to the VM                                                                                                                 |
 | Language Server Protocol and detached docblocks                                             | implemented  | Independent 0.5.0 stdio server; workspace diagnostics, navigation, safe rename, symbols, semantic tokens, source-preserving formatting, and LSP-only local `@var` hints |
 
@@ -79,6 +81,7 @@ compiler if used as though it were available.
 | `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()`                           | implemented  | Dense vector results; typed value callbacks; negative slice offsets and lengths                                                  |
 | `map_transform()`, `map_filter()`, `map_merge()`                                                 | implemented  | Insertion order and first key position preserved; typed value-then-key callbacks                                                 |
 | `FilterIterator<K, V>`, `CallbackFilterIterator<K, V>`                                           | implemented  | Lazy filtering over an inner cursor with preserved keys; base `accept(V, K)` is abstract                                         |
+| `RegexIterator<K, TIn, TOut>`, `RecursiveRegexIterator<K, TIn, TOut>`                            | implemented  | Constant modes and flags fix output type; recursive children retain the same regex policy                                        |
 | `LimitIterator`, `InfiniteIterator`, `AppendIterator`, `SeekableIterator`                        | implemented  | Bounded windows, replay from an aggregate, sequential concatenation, and position seeking use the shared cursor protocol         |
 | `CachingIterator<K, V>`                                                                          | implemented  | One-entry lookahead, keyed full cache, map access, scalar/Stringable formatting, and visited-entry count                         |
 | `RecursiveIterator<K, T>`, `RecursiveEntry<K, T>`                                                | implemented  | Generic recursive cursor interface and immutable value/child pair                                                                |
@@ -184,7 +187,7 @@ PHP behavior. Pending work includes:
 - global constants, general dynamic calls and member names, runtime
   includes/autoload callbacks, attributes, and cooperative
   async;
-- the broader standard library, extension registration/dispatch, concrete
+- the broader standard library and bundled extensions beyond PCRE2, concrete
   FastCGI and web-server SAPI adapters, relocatable module code generation,
   dependency-minimal incremental invalidation, broader JIT coverage, hotness
   tiering, and shared native-code caching.
@@ -212,8 +215,9 @@ typing, lowering, or generated code.
 engines and prepared projects, size-versioned runtime limits, synchronous
 input/output and module enumeration/loading callbacks, legacy captured output,
 binary-safe owned buffers, explicit release, panic containment, and versioned
-extension/host tables. Loading and invoking third-party extensions and concrete
-server adapters remain pending.
+extension/host tables. Project libraries register fixed typed functions before
+compilation. The VM validates native call results and retains libraries for
+prepared projects. Concrete server adapters remain pending.
 
 The resource and core-language PHPT files run through the THP compiler and VM
 as part of `cargo test --workspace`. They must not be passed to PHP.

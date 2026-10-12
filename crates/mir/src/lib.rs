@@ -21,6 +21,7 @@ pub struct Register(pub u32);
 pub struct Module {
     pub functions: Vec<Function>,
     pub classes: Vec<thp_hir::Class>,
+    pub native_functions: Vec<thp_hir::NativeSignature>,
     pub entry: FunctionId,
 }
 
@@ -225,6 +226,7 @@ pub fn lower(module: &thp_hir::Module) -> Module {
     Module {
         entry: module.entry,
         classes: module.classes.clone(),
+        native_functions: module.native_functions.clone(),
         functions: module.functions.iter().map(lower_function).collect(),
     }
 }

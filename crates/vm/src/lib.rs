@@ -2,6 +2,7 @@
 
 #![allow(clippy::float_cmp, clippy::too_many_lines)]
 
+mod pcre;
 mod serialization;
 
 use std::collections::HashMap;
@@ -1739,6 +1740,15 @@ impl ExecutionState<'_, '_> {
             .class_id()
             .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
         let name = self.program.classes[class.0 as usize].name.as_str();
+        if matches!(name, "RegexIterator" | "RecursiveRegexIterator") {
+            return self.regex_iterator_method(
+                builtin,
+                iterator,
+                depth,
+                calling_function,
+                instruction,
+            );
+        }
         if name == "Generator" {
             return self.native_generator_method(builtin, iterator, depth, span);
         }
@@ -2203,6 +2213,330 @@ impl ExecutionState<'_, '_> {
                 Ok(Value::NULL)
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn regex_match_map(
+        &self,
+        regex: &pcre2::bytes::Regex,
+        captures: &pcre2::bytes::Captures<'_>,
+        flags: i64,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        let capture_type = if flags & 256 != 0 {
+            Type::Object("RegexCapture".to_owned())
+        } else if flags & 512 != 0 {
+            Type::Union(vec![Type::Null, Type::String])
+        } else {
+            Type::String
+        };
+        let mut entries = Vec::new();
+        for index in 0..captures.len() {
+            let matched = captures.get(index);
+            let value = if flags & 256 != 0 {
+                self.regex_capture(
+                    matched.map(|value| value.as_bytes()),
+                    matched.map_or(-1, |value| i64::try_from(value.start()).unwrap_or(i64::MAX)),
+                    span,
+                )?
+            } else if flags & 512 != 0 && matched.is_none() {
+                Value::NULL
+            } else {
+                Value::try_bytes(matched.map_or(&b""[..], |value| value.as_bytes()))
+                    .map_err(|kind| runtime(kind, span))?
+            };
+            entries.push((
+                Value::try_bytes(index.to_string().into_bytes())
+                    .map_err(|kind| runtime(kind, span))?,
+                value.clone(),
+            ));
+            if let Some(name) = regex.capture_names().get(index).and_then(Option::as_ref) {
+                entries.push((
+                    Value::try_bytes(name.as_bytes()).map_err(|kind| runtime(kind, span))?,
+                    value,
+                ));
+            }
+        }
+        Value::try_map(Type::String, capture_type, entries).map_err(|kind| runtime(kind, span))
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keep mode, flags, and replacement explicit at each call site.
+    fn regex_transform(
+        &self,
+        regex: &pcre2::bytes::Regex,
+        value: &Value,
+        subject: &[u8],
+        mode: i64,
+        flags: i64,
+        replacement: &[u8],
+        span: Span,
+    ) -> Result<Value, VmError> {
+        match mode {
+            0 | 5 => Ok(value.clone()),
+            1 => match regex.captures(subject).map_err(|error| {
+                runtime(
+                    RuntimeErrorKind::TypeError(format!("PCRE2 match failed: {error}")),
+                    span,
+                )
+            })? {
+                Some(captures) => self.regex_match_map(regex, &captures, flags, span),
+                None => Value::try_map(
+                    Type::String,
+                    if flags & 256 != 0 {
+                        Type::Object("RegexCapture".to_owned())
+                    } else if flags & 512 != 0 {
+                        Type::Union(vec![Type::Null, Type::String])
+                    } else {
+                        Type::String
+                    },
+                    Vec::new(),
+                )
+                .map_err(|kind| runtime(kind, span)),
+            },
+            2 => {
+                let mut maps = Vec::new();
+                for captures in regex.captures_iter(subject) {
+                    let captures = captures.map_err(|error| {
+                        runtime(
+                            RuntimeErrorKind::TypeError(format!("PCRE2 match failed: {error}")),
+                            span,
+                        )
+                    })?;
+                    maps.push(self.regex_match_map(regex, &captures, flags, span)?);
+                }
+                let capture = if flags & 256 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else if flags & 512 != 0 {
+                    Type::Union(vec![Type::Null, Type::String])
+                } else {
+                    Type::String
+                };
+                Value::try_vector(Type::Map(Box::new(Type::String), Box::new(capture)), maps)
+                    .map_err(|kind| runtime(kind, span))
+            }
+            3 => {
+                let pieces = pcre::split(regex, subject, -1, flags)
+                    .map_err(|message| runtime(RuntimeErrorKind::TypeError(message), span))?;
+                let mut values = Vec::new();
+                for (part, offset) in pieces {
+                    values.push(if flags & 4 != 0 {
+                        self.regex_capture(
+                            Some(&part),
+                            i64::try_from(offset).unwrap_or(i64::MAX),
+                            span,
+                        )?
+                    } else {
+                        Value::try_bytes(part).map_err(|kind| runtime(kind, span))?
+                    });
+                }
+                Value::try_vector(
+                    if flags & 4 != 0 {
+                        Type::Object("RegexCapture".to_owned())
+                    } else {
+                        Type::String
+                    },
+                    values,
+                )
+                .map_err(|kind| runtime(kind, span))
+            }
+            4 => {
+                let output = pcre::replace(regex, replacement, subject, -1)
+                    .map_err(|message| runtime(RuntimeErrorKind::TypeError(message), span))?;
+                Value::try_bytes(output).map_err(|kind| runtime(kind, span))
+            }
+            _ => Err(runtime(RuntimeErrorKind::Unreachable, span)),
+        }
+    }
+
+    fn regex_iterator_method(
+        &mut self,
+        builtin: Builtin,
+        wrapper: &Value,
+        depth: usize,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let inner = wrapper
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let ready = || {
+            wrapper
+                .property(thp_hir::PropertyId(6))
+                .map_err(|kind| runtime(kind, span))
+        };
+        if builtin == Builtin::IteratorRewind {
+            self.iterator_call(&inner, "rewind", depth, calling_function, instruction)?;
+            wrapper
+                .set_property(thp_hir::PropertyId(6), Value::bool(false))
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        if builtin == Builtin::IteratorAdvance {
+            if self
+                .regex_iterator_method(
+                    Builtin::IteratorValid,
+                    wrapper,
+                    depth,
+                    calling_function,
+                    instruction,
+                )?
+                .as_bool()
+                == Some(true)
+            {
+                self.iterator_call(&inner, "advance", depth, calling_function, instruction)?;
+            }
+            wrapper
+                .set_property(thp_hir::PropertyId(6), Value::bool(false))
+                .map_err(|kind| runtime(kind, span))?;
+            return Ok(Value::NULL);
+        }
+        if ready()?.as_bool() != Some(true) {
+            let pattern = wrapper
+                .property(thp_hir::PropertyId(1))
+                .map_err(|kind| runtime(kind, span))?;
+            // shortcut: recompile for each cursor search, cache compiled patterns if profiling shows repeated compilation dominates.
+            let regex = pcre::compile(pattern.as_bytes().expect("verified pattern"))
+                .map_err(|message| runtime(RuntimeErrorKind::TypeError(message), span))?;
+            let mode = wrapper
+                .property(thp_hir::PropertyId(2))
+                .map_err(|kind| runtime(kind, span))?
+                .as_int()
+                .expect("verified mode");
+            let invert = wrapper
+                .property(thp_hir::PropertyId(3))
+                .map_err(|kind| runtime(kind, span))?
+                .as_bool()
+                .expect("verified invert");
+            let flags = wrapper
+                .property(thp_hir::PropertyId(4))
+                .map_err(|kind| runtime(kind, span))?
+                .as_int()
+                .expect("verified flags");
+            let replacement = wrapper
+                .property(thp_hir::PropertyId(5))
+                .map_err(|kind| runtime(kind, span))?;
+            let recursive = wrapper.class_id().is_some_and(|id| {
+                self.program.classes[id.0 as usize].name == "RecursiveRegexIterator"
+            });
+            while self
+                .iterator_call(&inner, "valid", depth, calling_function, instruction)?
+                .as_bool()
+                == Some(true)
+            {
+                self.tick(span)?;
+                let key =
+                    self.iterator_call(&inner, "key", depth, calling_function, instruction)?;
+                let entry =
+                    self.iterator_call(&inner, "value", depth, calling_function, instruction)?;
+                let value = if recursive {
+                    self.iterator_call(&entry, "value", depth, calling_function, instruction)?
+                } else {
+                    entry.clone()
+                };
+                let subject = if mode == 5 {
+                    key.as_bytes()
+                } else {
+                    value.as_bytes()
+                }
+                .ok_or_else(|| {
+                    runtime(
+                        RuntimeErrorKind::TypeError("regex input must be a string".to_owned()),
+                        span,
+                    )
+                })?;
+                let matched = regex.is_match(subject).map_err(|error| {
+                    runtime(
+                        RuntimeErrorKind::TypeError(format!("PCRE2 match failed: {error}")),
+                        span,
+                    )
+                })?;
+                let child = if recursive {
+                    self.iterator_call(&entry, "children", depth, calling_function, instruction)?
+                } else {
+                    Value::NULL
+                };
+                if (matched != invert) || (recursive && !child.is_null()) {
+                    let transformed = self.regex_transform(
+                        &regex,
+                        &value,
+                        subject,
+                        mode,
+                        flags,
+                        replacement.as_bytes().expect("verified replacement"),
+                        span,
+                    )?;
+                    let output = if recursive {
+                        let children = if child.is_null() {
+                            Value::NULL
+                        } else {
+                            let class = wrapper.class_id().expect("recursive regex class");
+                            let nested = self.allocate_object(
+                                class,
+                                wrapper.type_arguments().unwrap_or_default().to_vec(),
+                                8,
+                                span,
+                            )?;
+                            nested
+                                .set_property(thp_hir::PropertyId(0), child)
+                                .map_err(|kind| runtime(kind, span))?;
+                            for slot in 1..=5 {
+                                nested
+                                    .set_property(
+                                        thp_hir::PropertyId(slot),
+                                        wrapper
+                                            .property(thp_hir::PropertyId(slot))
+                                            .map_err(|kind| runtime(kind, span))?,
+                                    )
+                                    .map_err(|kind| runtime(kind, span))?;
+                            }
+                            nested
+                                .set_property(thp_hir::PropertyId(6), Value::bool(false))
+                                .map_err(|kind| runtime(kind, span))?;
+                            nested
+                                .set_property(thp_hir::PropertyId(7), Value::NULL)
+                                .map_err(|kind| runtime(kind, span))?;
+                            nested
+                        };
+                        let args = wrapper.type_arguments().unwrap_or_default();
+                        let node = self.allocate_object(
+                            self.classes_by_name["RecursiveEntry"],
+                            vec![args[0].clone(), args[2].clone()],
+                            2,
+                            span,
+                        )?;
+                        node.set_property(thp_hir::PropertyId(0), transformed)
+                            .map_err(|kind| runtime(kind, span))?;
+                        node.set_property(thp_hir::PropertyId(1), children)
+                            .map_err(|kind| runtime(kind, span))?;
+                        node
+                    } else {
+                        transformed
+                    };
+                    wrapper
+                        .set_property(thp_hir::PropertyId(7), output)
+                        .map_err(|kind| runtime(kind, span))?;
+                    wrapper
+                        .set_property(thp_hir::PropertyId(6), Value::bool(true))
+                        .map_err(|kind| runtime(kind, span))?;
+                    break;
+                }
+                self.iterator_call(&inner, "advance", depth, calling_function, instruction)?;
+            }
+        }
+        let ready = ready()?.as_bool() == Some(true);
+        match builtin {
+            Builtin::IteratorValid => Ok(Value::bool(ready)),
+            Builtin::IteratorKey if ready => {
+                self.iterator_call(&inner, "key", depth, calling_function, instruction)
+            }
+            Builtin::IteratorValue if ready => wrapper
+                .property(thp_hir::PropertyId(7))
+                .map_err(|kind| runtime(kind, span)),
+            _ => Err(runtime(
+                RuntimeErrorKind::Bounds("iterator is exhausted".to_owned()),
+                span,
+            )),
         }
     }
 
@@ -3917,6 +4251,32 @@ impl ExecutionState<'_, '_> {
         }
     }
 
+    fn regex_capture(
+        &self,
+        text: Option<&[u8]>,
+        offset: i64,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        let class = self
+            .classes_by_name
+            .get("RegexCapture")
+            .copied()
+            .ok_or_else(|| runtime(RuntimeErrorKind::Unreachable, span))?;
+        let capture = Value::try_object(class, 2).map_err(|kind| runtime(kind, span))?;
+        let text = text
+            .map(Value::try_bytes)
+            .transpose()
+            .map_err(|kind| runtime(kind, span))?
+            .unwrap_or(Value::NULL);
+        capture
+            .set_property(thp_hir::PropertyId(0), text)
+            .map_err(|kind| runtime(kind, span))?;
+        capture
+            .set_property(thp_hir::PropertyId(1), Value::integer(offset))
+            .map_err(|kind| runtime(kind, span))?;
+        Ok(capture)
+    }
+
     fn execute_builtin(
         &mut self,
         builtin: Builtin,
@@ -3926,6 +4286,164 @@ impl ExecutionState<'_, '_> {
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
         match builtin {
+            Builtin::PregMatch => {
+                let regex = pcre::compile(arguments[0].as_bytes().expect("verified regex pattern"))
+                    .map_err(|message| {
+                        runtime(RuntimeErrorKind::TypeError(message), instruction.span)
+                    })?;
+                let subject = arguments[1].as_bytes().expect("verified regex subject");
+                let flags = arguments[2].as_int().expect("verified regex flags");
+                let captures = regex.captures(subject).map_err(|error| {
+                    runtime(
+                        RuntimeErrorKind::TypeError(format!("PCRE2 match failed: {error}")),
+                        instruction.span,
+                    )
+                })?;
+                let Some(captures) = captures else {
+                    return Ok(Value::NULL);
+                };
+                let capture_type = if flags & 256 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else if flags & 512 != 0 {
+                    Type::Union(vec![Type::Null, Type::String])
+                } else {
+                    Type::String
+                };
+                let mut entries = Vec::new();
+                for index in 0..captures.len() {
+                    let matched = captures.get(index);
+                    let value = if flags & 256 != 0 {
+                        self.regex_capture(
+                            matched.map(|value| value.as_bytes()),
+                            matched.map_or(-1, |value| {
+                                i64::try_from(value.start()).unwrap_or(i64::MAX)
+                            }),
+                            instruction.span,
+                        )?
+                    } else if flags & 512 != 0 && matched.is_none() {
+                        Value::NULL
+                    } else {
+                        Value::try_bytes(matched.map_or(&b""[..], |value| value.as_bytes()))
+                            .map_err(|kind| runtime(kind, instruction.span))?
+                    };
+                    entries.push((
+                        Value::try_bytes(index.to_string().into_bytes())
+                            .map_err(|kind| runtime(kind, instruction.span))?,
+                        value.clone(),
+                    ));
+                    if let Some(name) = regex.capture_names().get(index).and_then(Option::as_ref) {
+                        entries.push((
+                            Value::try_bytes(name.as_bytes())
+                                .map_err(|kind| runtime(kind, instruction.span))?,
+                            value,
+                        ));
+                    }
+                }
+                Value::try_map(Type::String, capture_type, entries)
+                    .map_err(|kind| runtime(kind, instruction.span))
+            }
+            Builtin::PregReplace => {
+                let regex = pcre::compile(arguments[0].as_bytes().expect("verified regex pattern"))
+                    .map_err(|message| {
+                        runtime(RuntimeErrorKind::TypeError(message), instruction.span)
+                    })?;
+                let output = pcre::replace(
+                    &regex,
+                    arguments[1].as_bytes().expect("verified replacement"),
+                    arguments[2].as_bytes().expect("verified subject"),
+                    arguments[3].as_int().expect("verified limit"),
+                )
+                .map_err(|message| {
+                    runtime(RuntimeErrorKind::TypeError(message), instruction.span)
+                })?;
+                Value::try_bytes(output).map_err(|kind| runtime(kind, instruction.span))
+            }
+            Builtin::PregSplit => {
+                let regex = pcre::compile(arguments[0].as_bytes().expect("verified regex pattern"))
+                    .map_err(|message| {
+                        runtime(RuntimeErrorKind::TypeError(message), instruction.span)
+                    })?;
+                let flags = arguments[3].as_int().expect("verified flags");
+                let pieces = pcre::split(
+                    &regex,
+                    arguments[1].as_bytes().expect("verified subject"),
+                    arguments[2].as_int().expect("verified limit"),
+                    flags,
+                )
+                .map_err(|message| {
+                    runtime(RuntimeErrorKind::TypeError(message), instruction.span)
+                })?;
+                let mut values = Vec::with_capacity(pieces.len());
+                for (part, offset) in pieces {
+                    values.push(if flags & 4 != 0 {
+                        self.regex_capture(
+                            Some(&part),
+                            i64::try_from(offset).unwrap_or(i64::MAX),
+                            instruction.span,
+                        )?
+                    } else {
+                        Value::try_bytes(part).map_err(|kind| runtime(kind, instruction.span))?
+                    });
+                }
+                Value::try_vector(
+                    if flags & 4 != 0 {
+                        Type::Object("RegexCapture".to_owned())
+                    } else {
+                        Type::String
+                    },
+                    values,
+                )
+                .map_err(|kind| runtime(kind, instruction.span))
+            }
+            Builtin::RegexCaptureText | Builtin::RegexCaptureOffset => arguments[0]
+                .property(thp_hir::PropertyId(u32::from(
+                    builtin != Builtin::RegexCaptureText,
+                )))
+                .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::RegexIteratorConstruct => {
+                pcre::compile(arguments[2].as_bytes().expect("verified regex pattern")).map_err(
+                    |message| runtime(RuntimeErrorKind::TypeError(message), instruction.span),
+                )?;
+                for (index, value) in arguments.iter().skip(1).enumerate() {
+                    arguments[0]
+                        .set_property(
+                            thp_hir::PropertyId(
+                                u32::try_from(index).expect("regex property index fits"),
+                            ),
+                            value.clone(),
+                        )
+                        .map_err(|kind| runtime(kind, instruction.span))?;
+                }
+                arguments[0]
+                    .set_property(thp_hir::PropertyId(6), Value::bool(false))
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                arguments[0]
+                    .set_property(thp_hir::PropertyId(7), Value::NULL)
+                    .map_err(|kind| runtime(kind, instruction.span))?;
+                Ok(Value::NULL)
+            }
+            Builtin::RegexIteratorGetInner
+            | Builtin::RegexIteratorGetRegex
+            | Builtin::RegexIteratorGetMode
+            | Builtin::RegexIteratorGetPregFlags => arguments[0]
+                .property(thp_hir::PropertyId(match builtin {
+                    Builtin::RegexIteratorGetInner => 0,
+                    Builtin::RegexIteratorGetRegex => 1,
+                    Builtin::RegexIteratorGetMode => 2,
+                    _ => 4,
+                }))
+                .map_err(|kind| runtime(kind, instruction.span)),
+            Builtin::Native(index) => {
+                let registry = thp_native::Registry::current().ok_or_else(|| {
+                    runtime(
+                        RuntimeErrorKind::TypeError("native library is not active".to_owned()),
+                        instruction.span,
+                    )
+                })?;
+                registry
+                    .invoke(self.program, index, arguments)
+                    .map_err(|error| runtime(RuntimeErrorKind::TypeError(error), instruction.span))
+            }
             Builtin::VectorMap
             | Builtin::VectorFilter
             | Builtin::VectorSlice

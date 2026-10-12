@@ -9,13 +9,16 @@ use std::path::{Path, PathBuf};
 use thp_bytecode::{Program as BytecodeProgram, lower as lower_bytecode, verify};
 use thp_config::{AutoloadConfig, LOCK_FILE_NAME, LockFile, ProjectConfig};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, SourceMap, Span};
-use thp_hir::{Module as HirModule, lower_with_modules as lower_hir_with_modules};
+use thp_hir::{
+    Module as HirModule, lower_with_modules as lower_hir_with_modules, lower_with_native_functions,
+};
 use thp_metrics::{Metrics, Stage};
 use thp_mir::{Module as MirModule, lower as lower_mir};
 use thp_modules::{
     AutoloadMapping, FilesystemSourceProvider, ModuleGraph, ModuleId, ModuleInterface, ModulePath,
     ModuleSourceProvider, build_export_index, extract_interface, resolve_program,
 };
+use thp_native::Registry;
 use thp_opcache::{
     ArtifactKind, CACHE_FORMAT_VERSION, CacheKey, CacheStatus, FrozenManifest, Store,
 };
@@ -93,6 +96,7 @@ pub struct ProjectCompilation {
     pub hir: Option<HirModule>,
     pub mir: Option<MirModule>,
     pub bytecode: Option<BytecodeProgram>,
+    pub native_registry: Registry,
     pub diagnostics: Vec<ProjectDiagnostic>,
     pub metrics: Metrics,
 }
@@ -117,6 +121,7 @@ impl ProjectCompilation {
 #[derive(Clone, Debug)]
 pub struct PreparedProject {
     pub bytecode: BytecodeProgram,
+    pub native_registry: Registry,
     pub sources: SourceMap,
     pub entry_source: SourceId,
 }
@@ -130,6 +135,7 @@ impl PreparedProject {
             .source_id;
         Some(Self {
             bytecode: compilation.bytecode.clone()?,
+            native_registry: compilation.native_registry.clone(),
             sources: compilation.sources.clone(),
             entry_source,
         })
@@ -259,10 +265,51 @@ fn project_autoload(root: &Path) -> Result<AutoloadConfig, LoadError> {
     }
 }
 
+fn project_native_registry(request: &ProjectRequest) -> Result<Registry, LoadError> {
+    let profile = if request.project_root.join(LOCK_FILE_NAME).exists() {
+        Some(
+            LockFile::load(&request.project_root)
+                .map_err(|error| LoadError {
+                    path: error.path,
+                    message: error.message,
+                    metrics: Metrics::default(),
+                })?
+                .select(request.target.as_deref())
+                .clone(),
+        )
+    } else if request.project_root.join("thp.toml").exists() {
+        Some(
+            ProjectConfig::load(&request.project_root)
+                .and_then(|config| config.resolve(request.target.as_deref()))
+                .map_err(|error| LoadError {
+                    path: error.path,
+                    message: error.message,
+                    metrics: Metrics::default(),
+                })?,
+        )
+    } else {
+        None
+    };
+    let paths = profile.as_ref().map(|profile| &profile.extension_libraries);
+    let settings = profile
+        .as_ref()
+        .map(thp_config::ResolvedProfile::extensions);
+    Registry::load(
+        &request.project_root,
+        paths.unwrap_or(&BTreeMap::new()),
+        settings.unwrap_or(&BTreeMap::new()),
+    )
+    .map_err(|message| LoadError {
+        path: request.project_root.join("thp.toml"),
+        message,
+        metrics: Metrics::default(),
+    })
+}
+
 fn project_configuration_bytes(root: &Path) -> Result<Vec<u8>, LoadError> {
     let lock_path = root.join(LOCK_FILE_NAME);
-    if lock_path.exists() {
-        LockFile::load(root).map_err(|error| {
+    let (mut bytes, project) = if lock_path.exists() {
+        let lock = LockFile::load(root).map_err(|error| {
             let message = error.to_string();
             LoadError {
                 path: error.path,
@@ -270,11 +317,12 @@ fn project_configuration_bytes(root: &Path) -> Result<Vec<u8>, LoadError> {
                 metrics: Metrics::default(),
             }
         })?;
-        fs::read(&lock_path).map_err(|error| LoadError {
+        let bytes = fs::read(&lock_path).map_err(|error| LoadError {
             path: lock_path,
             message: error.to_string(),
             metrics: Metrics::default(),
-        })
+        })?;
+        (bytes, lock.project().clone())
     } else {
         let configuration = ProjectConfig::load(root).map_err(|error| {
             let message = error.to_string();
@@ -284,7 +332,7 @@ fn project_configuration_bytes(root: &Path) -> Result<Vec<u8>, LoadError> {
                 metrics: Metrics::default(),
             }
         })?;
-        configuration
+        let bytes = configuration
             .source_fingerprint()
             .map(String::into_bytes)
             .map_err(|error| {
@@ -294,8 +342,40 @@ fn project_configuration_bytes(root: &Path) -> Result<Vec<u8>, LoadError> {
                     message,
                     metrics: Metrics::default(),
                 }
-            })
+            })?;
+        let project = configuration.resolve_all().map_err(|error| LoadError {
+            path: error.path,
+            message: error.message,
+            metrics: Metrics::default(),
+        })?;
+        (bytes, project)
+    };
+    let paths = project
+        .common
+        .extension_libraries
+        .values()
+        .chain(
+            project
+                .targets
+                .values()
+                .flat_map(|profile| profile.extension_libraries.values()),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in paths {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+        let content = fs::read(&path).map_err(|error| LoadError {
+            path: path.clone(),
+            message: format!("cannot read extension library: {error}"),
+            metrics: Metrics::default(),
+        })?;
+        bytes.extend_from_slice(path.to_string_lossy().as_bytes());
+        bytes.extend_from_slice(blake3::hash(&content).as_bytes());
     }
+    Ok(bytes)
 }
 
 /// Compiles a project using a host-provided synchronous source provider.
@@ -307,6 +387,7 @@ pub fn compile_project_with_provider(
     request: &ProjectRequest,
     provider: &dyn ModuleSourceProvider,
 ) -> Result<ProjectCompilation, LoadError> {
+    let native_registry = project_native_registry(request)?;
     let mut metrics = Metrics::default();
     let modules = metrics
         .measure(Stage::ModuleDiscovery, || provider.enumerate())
@@ -501,6 +582,7 @@ pub fn compile_project_with_provider(
             hir: None,
             mir: None,
             bytecode: None,
+            native_registry,
             diagnostics,
             metrics,
         });
@@ -529,7 +611,11 @@ pub fn compile_project_with_provider(
         collect_declaration_modules(&unit.ast, unit.module.id.as_str(), &mut declaration_modules);
     }
     let lowered_hir = metrics.measure(Stage::Hir, || {
-        lower_hir_with_modules(&linked_ast, &declaration_modules)
+        lower_with_native_functions(
+            &linked_ast,
+            &declaration_modules,
+            &native_registry.signatures(),
+        )
     });
     diagnostics.extend(lowered_hir.diagnostics.into_iter().map(|diagnostic| {
         ProjectDiagnostic {
@@ -551,6 +637,7 @@ pub fn compile_project_with_provider(
             hir: Some(hir),
             mir: None,
             bytecode: None,
+            native_registry,
             diagnostics,
             metrics,
         });
@@ -580,6 +667,7 @@ pub fn compile_project_with_provider(
         hir: Some(hir),
         mir: Some(mir),
         bytecode: diagnostics.is_empty().then_some(bytecode),
+        native_registry,
         diagnostics,
         metrics,
     })
@@ -798,6 +886,7 @@ pub fn load_frozen_project(
     request: &ProjectRequest,
     store: &Store,
 ) -> Result<PreparedProject, LoadError> {
+    let native_registry = project_native_registry(request)?;
     let configuration = project_configuration_bytes(&request.project_root)?;
     let expected_fingerprint = project_fingerprint(request, &configuration);
     let manifest = store
@@ -832,6 +921,13 @@ pub fn load_frozen_project(
         .to_owned(),
         metrics: Metrics::default(),
     })?;
+    native_registry
+        .verify(&bytecode.native_functions)
+        .map_err(|message| LoadError {
+            path: request.project_root.join("thp.toml"),
+            message,
+            metrics: Metrics::default(),
+        })?;
     let entry_path = if request.entry.is_absolute() {
         request.entry.clone()
     } else {
@@ -841,6 +937,7 @@ pub fn load_frozen_project(
     let entry_source = sources.add(SourceFile::new(entry_path, ""));
     Ok(PreparedProject {
         bytecode,
+        native_registry,
         sources,
         entry_source,
     })
@@ -1305,7 +1402,7 @@ mod tests {
         std::fs::write(
             directory.path().join("thp.lock"),
             format!(
-                "THP-LOCK 1\nfingerprint {}\nprofile common\n",
+                "THP-LOCK 2\nfingerprint {}\nprofile common\n",
                 "0".repeat(64)
             ),
         )

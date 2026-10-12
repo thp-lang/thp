@@ -109,6 +109,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -571,6 +573,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -586,6 +598,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -678,10 +700,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcre2"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e970b0fcce0c7ee6ef662744ff711f21ccd6f11b7cf03cd187a80e89797fc67"
+dependencies = [
+ "libc",
+ "log",
+ "pcre2-sys",
+]
+
+[[package]]
+name = "pcre2-sys"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18b9073c1a2549bd409bf4a32c94d903bb1a09bf845bc306ae148897fa0760a4"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "plotters"
@@ -994,19 +1044,20 @@ dependencies = [
 
 [[package]]
 name = "thp-abi"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "thp-compiler",
  "thp-diagnostics",
  "thp-embed",
  "thp-modules",
+ "thp-native",
  "thp-runtime",
  "thp-vm",
 ]
 
 [[package]]
 name = "thp-bytecode"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "thp-diagnostics",
  "thp-hir",
@@ -1016,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "thp-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "tempfile",
  "thp-bytecode",
@@ -1024,13 +1075,14 @@ dependencies = [
  "thp-config",
  "thp-jit",
  "thp-metrics",
+ "thp-native",
  "thp-opcache",
  "thp-vm",
 ]
 
 [[package]]
 name = "thp-compiler"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "tempfile",
@@ -1041,13 +1093,14 @@ dependencies = [
  "thp-metrics",
  "thp-mir",
  "thp-modules",
+ "thp-native",
  "thp-opcache",
  "thp-syntax",
 ]
 
 [[package]]
 name = "thp-config"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "criterion",
@@ -1059,11 +1112,11 @@ dependencies = [
 
 [[package]]
 name = "thp-diagnostics"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "thp-embed"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "thp-compiler",
  "thp-diagnostics",
@@ -1075,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "thp-hir"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "thp-diagnostics",
  "thp-syntax",
@@ -1083,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "thp-jit"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1120,11 +1173,11 @@ dependencies = [
 
 [[package]]
 name = "thp-metrics"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "thp-mir"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "thp-diagnostics",
  "thp-hir",
@@ -1133,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "thp-modules"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "tempfile",
@@ -1142,8 +1195,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "thp-native"
+version = "0.11.0"
+dependencies = [
+ "blake3",
+ "libloading",
+ "thp-bytecode",
+ "thp-config",
+ "thp-diagnostics",
+ "thp-hir",
+ "thp-runtime",
+ "thp-syntax",
+]
+
+[[package]]
 name = "thp-opcache"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "tempfile",
@@ -1156,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "thp-runtime"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "tempfile",
  "thp-diagnostics",
@@ -1165,14 +1232,14 @@ dependencies = [
 
 [[package]]
 name = "thp-syntax"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "thp-diagnostics",
 ]
 
 [[package]]
 name = "thp-test"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "regex",
  "tempfile",
@@ -1186,14 +1253,16 @@ dependencies = [
 
 [[package]]
 name = "thp-vm"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
+ "pcre2",
  "regex",
  "tempfile",
  "thp-bytecode",
  "thp-diagnostics",
  "thp-hir",
  "thp-mir",
+ "thp-native",
  "thp-runtime",
  "thp-syntax",
 ]
