@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libloading::Library;
 use thp_bytecode::Program;
@@ -332,6 +333,9 @@ impl Registry {
             .into_iter()
             .map(|value| frame.insert(value))
             .collect::<Vec<_>>();
+        if handles.iter().any(|handle| handle.is_null()) {
+            return Err("native value handle space exhausted".to_owned());
+        }
         let mut result = ptr::null();
         let previous = ACTIVE_CALL.with(|active| active.replace(&raw mut frame));
         // SAFETY: callback belongs to a retained library, and all borrowed handles
@@ -535,11 +539,17 @@ fn value_matches_type(value: &Value, ty: &Type, program: &Program) -> bool {
         Type::Union(types) => types
             .iter()
             .any(|ty| value_matches_type(value, ty, program)),
-        Type::Object(name) | Type::Nominal { name, .. } => value.class_id().is_some_and(|id| {
-            program
-                .classes
-                .get(id.0 as usize)
-                .is_some_and(|class| &class.name == name)
+        Type::Object(_) | Type::Nominal { .. } => value.class_id().is_some_and(|id| {
+            program.classes.get(id.0 as usize).is_some_and(|class| {
+                let actual = match value.type_arguments() {
+                    Some(arguments) if !arguments.is_empty() => Type::Nominal {
+                        name: class.name.clone(),
+                        arguments: arguments.to_vec(),
+                    },
+                    _ => Type::Object(class.name.clone()),
+                };
+                thp_bytecode::type_accepts(program, ty, &actual)
+            })
         }),
         Type::Callable(_, _) => value.closure_parts().is_some(),
         Type::Never | Type::Parameter { .. } => false,
@@ -547,9 +557,7 @@ fn value_matches_type(value: &Value, ty: &Type, program: &Program) -> bool {
 }
 
 struct CallFrame {
-    // Handles retain stable addresses while constructors append more values.
-    #[allow(clippy::vec_box)]
-    values: Vec<Box<Value>>,
+    values: Vec<(usize, Value)>,
     error: Option<String>,
     program: *const Program,
 }
@@ -560,19 +568,25 @@ impl CallFrame {
         unsafe { &*self.program }
     }
     fn insert(&mut self, value: Value) -> *const ThpValue {
-        let value = Box::new(value);
-        let handle = ptr::from_ref(value.as_ref()).cast();
-        self.values.push(value);
-        handle
+        let Ok(token) = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        }) else {
+            return ptr::null();
+        };
+        self.values.push((token, value));
+        // Opaque tokens never repeat, even when a later call reuses an allocation.
+        ptr::without_provenance(token)
     }
 
     fn get(&self, handle: *const ThpValue) -> Option<&Value> {
         self.values
             .iter()
-            .find(|value| ptr::eq(value.as_ref(), handle.cast()))
-            .map(Box::as_ref)
+            .find(|(token, _)| *token == handle.addr())
+            .map(|(_, value)| value)
     }
 }
+
+static NEXT_HANDLE: AtomicUsize = AtomicUsize::new(0x1_0000);
 
 thread_local! {
     static ACTIVE_CALL: Cell<*mut CallFrame> = const { Cell::new(ptr::null_mut()) };

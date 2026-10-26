@@ -18,32 +18,39 @@ fn compile_library(root: &Path, mode: &str) -> PathBuf {
 static ThpHost host;
 static int32_t add_one(void *data, ThpCall *call, const ThpValue *const *args, size_t count, const ThpValue **result) {{
     int64_t value;
-    if (count != 1 || host.value_get_int(call, args[0], &value) != 0) return -1;
+    if (count != 1 || ({integer_check} && host.value_get_int(call, args[0], &value) != 0)) return -1;
     {callback}
     return 0;
 }}
 static int32_t initialize(const ThpHost *provided) {{
     host = *provided;
-    static const uint8_t name[] = "add_one";
+    static const uint8_t name[] = "{function_name}";
     static const uint8_t int_type[] = "int";
+    static const uint8_t object_type[] = "Base";
     static const uint8_t bad_type[] = "vector<";
     ThpBorrowedBuffer parameters[] = {{{{ {parameter}, {parameter_length} }}}};
     ThpNativeFunction function = {{ sizeof(ThpNativeFunction),
         {{ name, sizeof(name) - 1 }}, parameters, 1,
-        {{ int_type, sizeof(int_type) - 1 }}, add_one, 0 }};
+        {{ {result_type}, {result_type_length} }}, add_one, 0 }};
     return host.register_function(host.user_data, &function);
 }}
 static const ThpExtension extension = {{ THP_ABI_VERSION, {descriptor_size}, "demo", initialize, 0 }};
 const ThpExtension *thp_extension_entry(void) {{ return &extension; }}
 "#,
             callback = match mode {
+                "subtype-result" => "*result = host.value_clone(call, args[0]);",
+                "expired-handle" => "static const ThpValue *saved; if (!saved) { saved = args[0]; *result = host.value_new_int(call, 1); } else { host.value_new_int(call, 2); *result = saved; }",
                 "wrong-result" => "static const uint8_t text[] = \"wrong\"; *result = host.value_new_bytes(call, (ThpBorrowedBuffer){ text, sizeof(text) - 1 });",
                 "invalid-handle" => "*result = (const ThpValue *)(uintptr_t)1;",
                 "cloned-result" => "const ThpValue *temporary = host.value_new_int(call, value + 1); *result = host.value_clone(call, temporary);",
                 _ => "*result = host.value_new_int(call, value + 1);",
             },
-            parameter = if mode == "bad-signature" { "bad_type" } else { "int_type" },
-            parameter_length = if mode == "bad-signature" { "sizeof(bad_type) - 1" } else { "sizeof(int_type) - 1" },
+            integer_check = mode != "subtype-result",
+            function_name = if mode == "subtype-result" { "identity_object" } else { "add_one" },
+            parameter = match mode { "bad-signature" => "bad_type", "subtype-result" => "object_type", _ => "int_type" },
+            parameter_length = match mode { "bad-signature" => "sizeof(bad_type) - 1", "subtype-result" => "sizeof(object_type) - 1", _ => "sizeof(int_type) - 1" },
+            result_type = if mode == "subtype-result" { "object_type" } else { "int_type" },
+            result_type_length = if mode == "subtype-result" { "sizeof(object_type) - 1" } else { "sizeof(int_type) - 1" },
             descriptor_size = if mode == "short-descriptor" { "sizeof(uint32_t)" } else { "sizeof(ThpExtension)" },
         ),
     )
@@ -63,6 +70,50 @@ const ThpExtension *thp_extension_entry(void) {{ return &extension; }}
         String::from_utf8_lossy(&output.stderr)
     );
     library
+}
+
+#[test]
+fn native_function_accepts_subclass_result_for_base_return_type() {
+    let root = tempfile::tempdir().expect("project");
+    compile_library(root.path(), "subtype-result");
+    fs::write(
+        root.path().join("thp.toml"),
+        "[extension_libraries]\ndemo = 'libdemo.so'\n",
+    )
+    .expect("write config");
+    fs::write(
+        root.path().join("main.thp"),
+        "<?thp\nclass Base {}\nclass Child extends Base {}\nidentity_object(new Child());\necho 'ok';\n",
+    )
+    .expect("write source");
+
+    let output = thp(root.path(), &["run", "--engine=vm", "main.thp"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ok");
+}
+
+#[test]
+fn native_value_handles_expire_between_calls() {
+    let root = tempfile::tempdir().expect("project");
+    compile_library(root.path(), "expired-handle");
+    fs::write(
+        root.path().join("thp.toml"),
+        "[extension_libraries]\ndemo = 'libdemo.so'\n",
+    )
+    .expect("write config");
+    fs::write(
+        root.path().join("main.thp"),
+        "<?thp\necho add_one(41);\necho add_one(99);\n",
+    )
+    .expect("write source");
+
+    let output = thp(root.path(), &["run", "--engine=vm", "main.thp"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value handle"));
 }
 
 fn thp(root: &Path, arguments: &[&str]) -> Output {
