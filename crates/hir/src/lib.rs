@@ -205,6 +205,29 @@ pub enum NominalKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Builtin {
     Native(u32),
+    SchedulerRegisterDefault,
+    SchedulerRegister,
+    SchedulerIsRegistered,
+    Async,
+    Await,
+    Suspend,
+    Delay,
+    Timeout,
+    CoroutineCancel,
+    CoroutineGetId,
+    CoroutineIsStarted,
+    CoroutineIsQueued,
+    CoroutineIsRunning,
+    CoroutineIsSuspended,
+    CoroutineIsCompleted,
+    CoroutineIsCancelled,
+    CoroutineSubscribe,
+    CoroutineResult,
+    TimeoutCancel,
+    TimeoutIsCompleted,
+    TimeoutIsCancelled,
+    TimeoutSubscribe,
+    TimeoutResult,
     PregMatch,
     PregReplace,
     PregSplit,
@@ -5185,6 +5208,99 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         span: Span,
         expected: Option<&Type>,
     ) -> Option<TypedExpr> {
+        if name == "async" {
+            return self.lower_async_call(arguments, span);
+        }
+        if name == "await" {
+            let parameters = [
+                native_parameter("target", Type::Mixed, None, span),
+                native_parameter("cancellation", Type::Mixed, Some(ExprKind::Null), span),
+            ];
+            let bound = self.bind_arguments(name, arguments, &parameters, span);
+            let target = bound
+                .explicit
+                .iter()
+                .find(|argument| argument.target == ArgumentTarget::Parameter(0))?;
+            let result = instantiated_ancestor(&target.value.ty, "Completable", self.classes)
+                .and_then(|ty| match ty {
+                    Type::Nominal { arguments, .. } => arguments.into_iter().next(),
+                    _ => None,
+                });
+            let Some(result) = result else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    target.value.span,
+                    format!(
+                        "`await` requires `Completable<T>`, found `{}`",
+                        target.value.ty
+                    ),
+                ));
+                return None;
+            };
+            if let Some(cancellation) = bound
+                .explicit
+                .iter()
+                .find(|argument| argument.target == ArgumentTarget::Parameter(1))
+                && cancellation.value.ty != Type::Null
+                && instantiated_ancestor(&cancellation.value.ty, "Completable", self.classes)
+                    .is_none()
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    cancellation.value.span,
+                    "`await` cancellation source must be `Completable<T>` or null",
+                ));
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(Builtin::Await),
+                    arguments: bound,
+                },
+                ty: result,
+                span,
+            });
+        }
+        let async_function = match name {
+            "scheduler_register_default" => {
+                Some((Builtin::SchedulerRegisterDefault, vec![], Type::Void))
+            }
+            "scheduler_register" => Some((
+                Builtin::SchedulerRegister,
+                vec![native_parameter(
+                    "scheduler",
+                    Type::Object("SchedulerInterface".to_owned()),
+                    None,
+                    span,
+                )],
+                Type::Void,
+            )),
+            "scheduler_is_registered" => Some((Builtin::SchedulerIsRegistered, vec![], Type::Bool)),
+            "suspend" => Some((Builtin::Suspend, vec![], Type::Void)),
+            "delay" => Some((
+                Builtin::Delay,
+                vec![native_parameter("milliseconds", Type::Int, None, span)],
+                Type::Void,
+            )),
+            "timeout" => Some((
+                Builtin::Timeout,
+                vec![native_parameter("milliseconds", Type::Int, None, span)],
+                Type::Object("Timeout".to_owned()),
+            )),
+            _ => None,
+        };
+        if let Some((builtin, parameters, ty)) = async_function {
+            let arguments = self.bind_arguments(name, arguments, &parameters, span);
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    arguments,
+                },
+                ty,
+                span,
+            });
+        }
         if matches!(name, "preg_match" | "preg_replace" | "preg_split") {
             let mut parameters = vec![
                 native_parameter("pattern", Type::String, None, span),
@@ -5492,6 +5608,98 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 arguments,
             },
             ty: signature.return_type.clone(),
+            span,
+        })
+    }
+
+    fn lower_async_call(&mut self, arguments: &[Argument], span: Span) -> Option<TypedExpr> {
+        let Some(function) = arguments.first() else {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0304",
+                span,
+                "missing callable for `async`",
+            ));
+            return None;
+        };
+        if let Some(name) = &function.name
+            && name != "function"
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0314",
+                function.name_span.unwrap_or(function.span),
+                format!("unknown named argument `{name}` for `async`"),
+            ));
+        }
+        let callback = self.lower_expression(&function.value, None)?;
+        let Type::Callable(parameters, result) = &callback.ty else {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0302",
+                callback.span,
+                "`async` requires a statically typed callable",
+            ));
+            return None;
+        };
+        let parameters = parameters.clone();
+        let result = result.as_ref().clone();
+        if arguments.len() - 1 != parameters.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0303",
+                span,
+                format!(
+                    "`async` callable expects {} arguments, found {}",
+                    parameters.len(),
+                    arguments.len() - 1
+                ),
+            ));
+        }
+        let mut explicit = vec![BoundArgument {
+            target: ArgumentTarget::Parameter(0),
+            value: callback,
+        }];
+        for (index, argument) in arguments.iter().enumerate().skip(1) {
+            if argument.name.is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0318",
+                    argument.name_span.unwrap_or(argument.span),
+                    "named arguments cannot target `async` callable arguments",
+                ));
+            } else if function.name.is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0313",
+                    argument.span,
+                    "positional arguments cannot follow named arguments",
+                ));
+            }
+            let value = self.lower_expression(&argument.value, parameters.get(index - 1))?;
+            if let Some(expected) = parameters.get(index - 1) {
+                self.expect_type(expected, &value.ty, value.span);
+            }
+            explicit.push(BoundArgument {
+                target: ArgumentTarget::Parameter(index),
+                value,
+            });
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::Call {
+                callee: Callee::Builtin(Builtin::Async),
+                arguments: BoundArguments {
+                    explicit,
+                    defaults: Vec::new(),
+                    parameter_count: arguments.len(),
+                    variadic_parameter: None,
+                    variadic_type: None,
+                },
+            },
+            ty: Type::Nominal {
+                name: "Coroutine".to_owned(),
+                arguments: vec![result],
+            },
             span,
         })
     }
@@ -7153,7 +7361,10 @@ fn resolve_type_with_bound_check(
                         return None;
                     }
                     for (index, argument) in resolved.iter().enumerate() {
-                        if type_contains_void(argument) {
+                        if type_contains_void(argument)
+                            && !(matches!(name.as_str(), "Awaitable" | "Completable" | "Coroutine")
+                                && *argument == Type::Void)
+                        {
                             diagnostics.push(Diagnostic::error(
                                 "typing",
                                 "T1005",
@@ -8180,6 +8391,71 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             false,
             true,
             None,
+            &[],
+        ),
+        ("Awaitable", NominalKind::Interface, true, false, None, &[]),
+        (
+            "Completable",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Awaitable"),
+            &[],
+        ),
+        (
+            "SchedulerInterface",
+            NominalKind::Interface,
+            true,
+            false,
+            None,
+            &[],
+        ),
+        (
+            "Coroutine",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Completable"],
+        ),
+        (
+            "Timeout",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Completable"],
+        ),
+        (
+            "CancellationException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "WaitCancelledException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "TimeoutException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "AsyncDeadlockException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
             &[],
         ),
     ];
@@ -11278,7 +11554,174 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         false,
     );
     add_reflection_api(&mut classes);
+    add_async_api(&mut classes);
     classes
+}
+
+fn add_async_api(classes: &mut BTreeMap<String, ClassSignature>) {
+    let span = Span::empty(0);
+    for name in ["Awaitable", "Completable", "Coroutine"] {
+        let class = classes.get_mut(name).expect("async nominal exists");
+        class.type_parameters.push(TypeParameter {
+            id: TypeParameterId {
+                owner: class.id,
+                index: 0,
+            },
+            name: "T".to_owned(),
+            bound: None,
+            span,
+        });
+    }
+    let complete_parameter = Type::Parameter {
+        id: classes["Completable"].type_parameters[0].id,
+        name: "T".to_owned(),
+    };
+    let coroutine_parameter = Type::Parameter {
+        id: classes["Coroutine"].type_parameters[0].id,
+        name: "T".to_owned(),
+    };
+    classes
+        .get_mut("Completable")
+        .expect("async nominal exists")
+        .parent_type = Some(Type::Nominal {
+        name: "Awaitable".to_owned(),
+        arguments: vec![complete_parameter.clone()],
+    });
+    classes
+        .get_mut("Coroutine")
+        .expect("async nominal exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Completable".to_owned(),
+        arguments: vec![coroutine_parameter.clone()],
+    }];
+    classes
+        .get_mut("Timeout")
+        .expect("async nominal exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Completable".to_owned(),
+        arguments: vec![Type::Mixed],
+    }];
+    let callback = Type::Callable(vec![], Box::new(Type::Void));
+    let notify = vec![native_parameter("notify", callback.clone(), None, span)];
+    for (name, result) in [
+        ("Completable", complete_parameter),
+        ("Coroutine", coroutine_parameter),
+        ("Timeout", Type::Mixed),
+    ] {
+        let abstract_method = name == "Completable";
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineCancel),
+            "Timeout" => Some(Builtin::TimeoutCancel),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "cancel",
+            operation,
+            false,
+            vec![],
+            Type::Void,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineIsCompleted),
+            "Timeout" => Some(Builtin::TimeoutIsCompleted),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "isCompleted",
+            operation,
+            false,
+            vec![],
+            Type::Bool,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineIsCancelled),
+            "Timeout" => Some(Builtin::TimeoutIsCancelled),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "isCancelled",
+            operation,
+            false,
+            vec![],
+            Type::Bool,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineSubscribe),
+            "Timeout" => Some(Builtin::TimeoutSubscribe),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "subscribe",
+            operation,
+            false,
+            notify.clone(),
+            callback.clone(),
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineResult),
+            "Timeout" => Some(Builtin::TimeoutResult),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "result",
+            operation,
+            false,
+            vec![],
+            result,
+            abstract_method,
+        );
+    }
+    for (method, builtin) in [
+        ("getId", Builtin::CoroutineGetId),
+        ("isStarted", Builtin::CoroutineIsStarted),
+        ("isQueued", Builtin::CoroutineIsQueued),
+        ("isRunning", Builtin::CoroutineIsRunning),
+        ("isSuspended", Builtin::CoroutineIsSuspended),
+    ] {
+        add_native_method(
+            classes,
+            "Coroutine",
+            method,
+            Some(builtin),
+            false,
+            vec![],
+            if method == "getId" {
+                Type::Int
+            } else {
+                Type::Bool
+            },
+            false,
+        );
+    }
+    add_native_method(
+        classes,
+        "SchedulerInterface",
+        "chooseNext",
+        None,
+        false,
+        vec![native_parameter(
+            "ready",
+            Type::Vector(Box::new(Type::Int)),
+            None,
+            span,
+        )],
+        Type::Int,
+        true,
+    );
 }
 
 fn add_reflection_api(classes: &mut BTreeMap<String, ClassSignature>) {

@@ -16,10 +16,7 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
 version: "0.1"
 owner: std.async.Coroutine
 visibility: public

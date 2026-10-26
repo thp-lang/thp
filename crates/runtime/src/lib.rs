@@ -17,6 +17,15 @@ use std::time::{Duration, Instant};
 use thp_diagnostics::Span;
 use thp_hir::{ClassId, FunctionId, PropertyId, Type};
 
+mod file_worker;
+pub use file_worker::{
+    DirectoryPending, DirectoryReadError, DirectoryStart, FileInfoPending, FileInfoStart,
+    FileInfoValue, OpenFileFlags, OpenFilePending, OpenFileStart, RecursiveDirectoryPending,
+    RecursiveDirectoryStart, StreamFileOperation, StreamFilePending, StreamFileResult,
+    StreamFileStart, file_info_host, file_info_uses_host, start_directory_read, start_file_info,
+    start_open_file, start_recursive_directory_read,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReflectionCallable {
     Function(FunctionId),
@@ -1052,6 +1061,7 @@ impl Value {
                 storage: StreamStorage::Memory(bytes),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: None,
                 capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle,
@@ -1066,6 +1076,7 @@ impl Value {
                 storage: StreamStorage::Memory(bytes),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: None,
                 capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle: None,
@@ -1084,6 +1095,7 @@ impl Value {
                 storage: StreamStorage::Memory(Vec::new()),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: Some(spill_threshold),
                 capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle,
@@ -1105,6 +1117,7 @@ impl Value {
                 storage: StreamStorage::Memory(Vec::new()),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold,
                 capabilities: stream_flags(readable, writable, append),
                 handle,
@@ -1119,6 +1132,7 @@ impl Value {
                 storage: StreamStorage::Memory(Vec::new()),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: Some(spill_threshold),
                 capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle: None,
@@ -1137,6 +1151,7 @@ impl Value {
                 storage: StreamStorage::Input(input),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: None,
                 capabilities: STREAM_READ,
                 handle,
@@ -1160,6 +1175,7 @@ impl Value {
                 storage: StreamStorage::File { file },
                 cursor: if append { length } else { 0 },
                 closed: false,
+                busy: false,
                 spill_threshold: None,
                 capabilities: stream_flags(readable, writable, append),
                 handle,
@@ -1900,6 +1916,11 @@ impl Value {
         let mut state = state.borrow_mut();
         if state.closed {
             return Ok(());
+        }
+        if state.busy {
+            return Err(RuntimeErrorKind::Io(
+                "stream has an outstanding file operation".to_owned(),
+            ));
         }
         if let StreamStorage::Input(input) = &state.storage {
             input.close();
@@ -2866,6 +2887,7 @@ struct StreamState {
     storage: StreamStorage,
     cursor: usize,
     closed: bool,
+    busy: bool,
     spill_threshold: Option<usize>,
     capabilities: u8,
     handle: Option<HandleLease>,
@@ -2975,6 +2997,10 @@ impl StreamState {
 fn ensure_stream_open(state: &StreamState) -> Result<(), RuntimeErrorKind> {
     if state.closed {
         Err(RuntimeErrorKind::Io("stream is closed".to_owned()))
+    } else if state.busy {
+        Err(RuntimeErrorKind::Io(
+            "stream has an outstanding file operation".to_owned(),
+        ))
     } else {
         Ok(())
     }
@@ -3081,6 +3107,7 @@ pub struct RuntimeError {
     pub kind: RuntimeErrorKind,
     pub span: Span,
     pub trace: Vec<StackFrame>,
+    pub suppressed: Vec<RuntimeErrorKind>,
 }
 
 impl RuntimeError {
@@ -3089,6 +3116,7 @@ impl RuntimeError {
             kind,
             span,
             trace: Vec::new(),
+            suppressed: Vec::new(),
         }
     }
 
@@ -3111,6 +3139,9 @@ impl fmt::Display for RuntimeError {
                 "\n  at {} (source bytes {}..{})",
                 frame.function, frame.span.start, frame.span.end
             )?;
+        }
+        for suppressed in &self.suppressed {
+            write!(formatter, "\n  suppressed: {suppressed}")?;
         }
         Ok(())
     }

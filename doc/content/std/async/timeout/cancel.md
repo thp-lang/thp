@@ -18,10 +18,7 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
 version: "0.1"
 owner: std.async.Timeout
 visibility: public
@@ -32,7 +29,8 @@ modifiers: []
 
 ## Behavior
 
-Cancels a pending timer and releases its scheduler resources. Calling the method after the timer has fired has no effect.
+Cancels a pending timer and releases its scheduler resources. Calling the method
+again or after the timer has fired has no effect.
 
 This operation may update receiver or resource state; the change is observable by later calls.
 

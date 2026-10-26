@@ -17,7 +17,7 @@ use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 10;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 11;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInfo {
@@ -1096,7 +1096,12 @@ fn verify_nominal_type(program: &Program, nominal: &NominalType) -> Result<(), V
     }
     for argument in &nominal.arguments {
         verify_encoded_type(program, argument)?;
-        if contains_void(argument) {
+        if contains_void(argument)
+            && !(matches!(
+                class.name.as_str(),
+                "Awaitable" | "Completable" | "Coroutine"
+            ) && *argument == Type::Void)
+        {
             return Err(global_error("generic type argument contains void"));
         }
     }
@@ -2926,6 +2931,139 @@ fn verify_builtin_call(
             .ok_or_else(|| format!("builtin requires a {expected} receiver"))
     };
     match builtin {
+        Builtin::SchedulerRegisterDefault | Builtin::SchedulerIsRegistered | Builtin::Suspend => {
+            check(
+                &[],
+                &if builtin == Builtin::SchedulerIsRegistered {
+                    Type::Bool
+                } else {
+                    Type::Void
+                },
+            )
+        }
+        Builtin::SchedulerRegister => {
+            if arguments.len() != 1
+                || !type_accepts(
+                    program,
+                    &Type::Object("SchedulerInterface".to_owned()),
+                    argument_type(0),
+                )
+                || result != Some(&Type::Void)
+            {
+                return Err("invalid scheduler registration signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Delay | Builtin::Timeout => check(
+            &[Type::Int],
+            &if builtin == Builtin::Delay {
+                Type::Void
+            } else {
+                Type::Object("Timeout".to_owned())
+            },
+        ),
+        Builtin::Async => {
+            if arguments.is_empty() {
+                return Err("async requires a callable".to_owned());
+            }
+            let Type::Callable(parameters, output) = argument_type(0) else {
+                return Err("async requires a typed callable".to_owned());
+            };
+            if arguments.len() != parameters.len() + 1
+                || parameters.iter().enumerate().any(|(index, parameter)| {
+                    !type_accepts(program, parameter, argument_type(index + 1))
+                })
+                || result
+                    != Some(&Type::Nominal {
+                        name: "Coroutine".to_owned(),
+                        arguments: vec![output.as_ref().clone()],
+                    })
+            {
+                return Err("async callable arguments or result do not match".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Await => {
+            if arguments.len() != 2 {
+                return Err("await requires a target and cancellation source".to_owned());
+            }
+            let target =
+                encoded_nominal_ancestor_arguments(program, argument_type(0), "Completable")
+                    .and_then(|mut arguments| (arguments.len() == 1).then(|| arguments.remove(0)))
+                    .ok_or_else(|| "await target is not Completable<T>".to_owned())?;
+            if argument_type(1) != &Type::Null
+                && encoded_nominal_ancestor_arguments(program, argument_type(1), "Completable")
+                    .is_none()
+            {
+                return Err("await cancellation source is not Completable<T>".to_owned());
+            }
+            if result != Some(&target) {
+                return Err("await result type does not match target".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::CoroutineCancel
+        | Builtin::CoroutineGetId
+        | Builtin::CoroutineIsStarted
+        | Builtin::CoroutineIsQueued
+        | Builtin::CoroutineIsRunning
+        | Builtin::CoroutineIsSuspended
+        | Builtin::CoroutineIsCompleted
+        | Builtin::CoroutineIsCancelled
+        | Builtin::CoroutineSubscribe
+        | Builtin::CoroutineResult => {
+            if arguments.is_empty() {
+                return Err("Coroutine method requires a receiver".to_owned());
+            }
+            let value = encoded_nominal_ancestor_arguments(program, argument_type(0), "Coroutine")
+                .and_then(|mut arguments| (arguments.len() == 1).then(|| arguments.remove(0)))
+                .ok_or_else(|| "Coroutine builtin has the wrong receiver".to_owned())?;
+            let callback = Type::Callable(vec![], Box::new(Type::Void));
+            let expected = match builtin {
+                Builtin::CoroutineCancel => Type::Void,
+                Builtin::CoroutineGetId => Type::Int,
+                Builtin::CoroutineIsStarted
+                | Builtin::CoroutineIsQueued
+                | Builtin::CoroutineIsRunning
+                | Builtin::CoroutineIsSuspended
+                | Builtin::CoroutineIsCompleted
+                | Builtin::CoroutineIsCancelled => Type::Bool,
+                Builtin::CoroutineSubscribe => callback.clone(),
+                Builtin::CoroutineResult => value,
+                _ => unreachable!(),
+            };
+            if result != Some(&expected)
+                || (builtin == Builtin::CoroutineSubscribe
+                    && (arguments.len() != 2 || argument_type(1) != &callback))
+                || (builtin != Builtin::CoroutineSubscribe && arguments.len() != 1)
+            {
+                return Err("invalid Coroutine builtin signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::TimeoutCancel
+        | Builtin::TimeoutIsCompleted
+        | Builtin::TimeoutIsCancelled
+        | Builtin::TimeoutSubscribe
+        | Builtin::TimeoutResult => {
+            object_receiver("Timeout")?;
+            let callback = Type::Callable(vec![], Box::new(Type::Void));
+            let expected = match builtin {
+                Builtin::TimeoutCancel => Type::Void,
+                Builtin::TimeoutIsCompleted | Builtin::TimeoutIsCancelled => Type::Bool,
+                Builtin::TimeoutSubscribe => callback.clone(),
+                Builtin::TimeoutResult => Type::Mixed,
+                _ => unreachable!(),
+            };
+            if result != Some(&expected)
+                || (builtin == Builtin::TimeoutSubscribe
+                    && (arguments.len() != 2 || argument_type(1) != &callback))
+                || (builtin != Builtin::TimeoutSubscribe && arguments.len() != 1)
+            {
+                return Err("invalid Timeout builtin signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::PregMatch | Builtin::PregSplit => {
             let count = if builtin == Builtin::PregMatch { 3 } else { 4 };
             if arguments.len() != count

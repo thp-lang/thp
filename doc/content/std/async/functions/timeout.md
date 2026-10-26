@@ -14,21 +14,15 @@ returns:
   type: Timeout
   description: A new Timeout registered with the active scheduler.
 errors:
-  - description:
-      A non-positive $milliseconds value is invalid. The call also fails when no
-      scheduler is registered or the active scheduler cannot allocate a timer. Concrete
-      error types are not yet finalized.
+  - description: A non-positive duration or missing registration throws Error.
 related: []
 status: experimental
-availability: proposed
-notice:
-  timeout() is proposed and is not implemented in this repository. Its concrete
-  failure type is not finalized.
+availability: implemented
 version: "0.1"
 module: async
 ---
 
-`timeout()` creates a timer that completes with a timeout failure after the
+`timeout()` creates a monotonic timer that completes with `TimeoutException` after the
 requested duration.
 
 ## Behavior
@@ -50,15 +44,14 @@ $request = async(fetchText(...), "/slow");
 
 try {
     echo await($request, timeout(1_000));
-} catch (Throwable $failure) {
+} catch (WaitCancelledException $failure) {
     $request->cancel();
     report($failure);
 }
 ```
 
 The explicit `cancel()` asks the underlying request to stop after the wait times
-out. Catching `Throwable` is temporary while the timeout failure class remains
-unsettled.
+out. The `WaitCancelledException` carries the timeout failure as its cause.
 
 ## See also
 

@@ -16,10 +16,7 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
 version: "0.1"
 owner: std.async.Completable
 visibility: public
@@ -30,7 +27,9 @@ modifiers: []
 
 ## Behavior
 
-Requests cancellation. Calling it after completion has no effect.
+Requests cancellation without suspending. Calling it after completion has no
+effect. Each implementation defines how its pending operation reaches a
+terminal state.
 
 This operation may update receiver or resource state; the change is observable by later calls.
 

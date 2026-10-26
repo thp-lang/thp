@@ -2,6 +2,7 @@
 
 #![allow(clippy::float_cmp, clippy::too_many_lines)]
 
+mod async_runtime;
 mod pcre;
 mod serialization;
 
@@ -11,6 +12,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use async_runtime::AsyncRuntime;
 use thp_bytecode::{
     Function, Instruction, InstructionKind, Method, Program, Property, Terminator,
     VerificationError, verify,
@@ -22,8 +24,9 @@ use thp_hir::{
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_runtime::{
-    GeneratorFrame, GeneratorState, GeneratorStatus, HeapStats, ReflectionCallable,
+    FileInfoValue, GeneratorFrame, GeneratorState, GeneratorStatus, HeapStats, ReflectionCallable,
     ReflectionValue, RequestHeap, RequestInput, RuntimeError, RuntimeErrorKind, StackFrame, Value,
+    file_info_host, file_info_uses_host,
 };
 use thp_syntax::{BinaryOp, UnaryOp, Visibility};
 
@@ -335,21 +338,47 @@ pub fn execute_to(
         call_stack: Vec::new(),
         active_functions: Vec::new(),
         started: Instant::now(),
+        async_runtime: AsyncRuntime::default(),
     };
-    let result = match state.execute_function(program.entry, Vec::new(), 1, None) {
+    let root_span = program.functions[program.entry.0 as usize].span;
+    let result = match state.execute_root() {
+        Ok(value) => state.drain_async(root_span).map(|()| value),
+        Err(error @ VmError::Thrown { .. }) => match state.drain_async(root_span) {
+            Ok(()) => Err(error),
+            Err(VmError::Thrown { value: failure, .. }) => {
+                let VmError::Thrown { value: primary, .. } = &error else {
+                    unreachable!()
+                };
+                match primary.add_suppressed(failure) {
+                    Ok(()) => Err(error),
+                    Err(kind) => Err(runtime(kind, root_span)),
+                }
+            }
+            Err(failure) => Err(failure),
+        },
+        Err(error) => Err(error),
+    };
+    let result = match result {
         Ok(result) => Ok(result),
         Err(VmError::Thrown { value, span, trace }) => {
-            let class = value
-                .class_id()
-                .and_then(|id| program.classes.get(id.0 as usize))
-                .map_or_else(|| "<non-exception>".to_owned(), |class| class.name.clone());
-            let message = value
-                .exception_message()
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default();
-            let mut error =
-                RuntimeError::new(RuntimeErrorKind::UncaughtException { class, message }, span);
+            let describe = |failure: &Value| RuntimeErrorKind::UncaughtException {
+                class: failure
+                    .class_id()
+                    .and_then(|id| program.classes.get(id.0 as usize))
+                    .map_or_else(|| "<non-exception>".to_owned(), |class| class.name.clone()),
+                message: failure
+                    .exception_message()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default(),
+            };
+            let mut error = RuntimeError::new(describe(&value), span);
             error.trace = trace;
+            error.suppressed = value
+                .exception_suppressed()
+                .unwrap_or_default()
+                .iter()
+                .map(describe)
+                .collect();
             Err(VmError::Runtime(error))
         }
         Err(error) => Err(error),
@@ -425,6 +454,7 @@ struct ExecutionState<'program, 'output> {
     call_stack: Vec<StackFrame>,
     active_functions: Vec<FunctionId>,
     started: Instant,
+    async_runtime: AsyncRuntime,
 }
 
 struct Frame {
@@ -433,6 +463,12 @@ struct Frame {
     current: BlockId,
     previous: Option<BlockId>,
     called_class: Option<ClassId>,
+    next_instruction: usize,
+}
+
+struct PreparedDynamicNew {
+    object: Value,
+    constructor: Option<(Callee, Vec<Value>, ClassId)>,
 }
 
 #[derive(Clone)]
@@ -489,6 +525,12 @@ enum FrameOutcome {
     Yield(Option<Value>, Value),
 }
 
+enum RecursiveChild {
+    Probe,
+    Missing,
+    Entries(Vec<String>),
+}
+
 impl Frame {
     fn into_generator(self) -> GeneratorFrame {
         GeneratorFrame {
@@ -507,6 +549,7 @@ impl Frame {
             current: BlockId(frame.current),
             previous: frame.previous.map(BlockId),
             called_class: frame.called_class,
+            next_instruction: 0,
         }
     }
 }
@@ -522,6 +565,34 @@ impl ExecutionState<'_, '_> {
         calling_function: &Function,
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
+        let prepared = self.prepare_dynamic_new(
+            target,
+            supplied_types,
+            arguments,
+            calling_function,
+            instruction,
+        )?;
+        if let Some((callee, call_arguments, class)) = prepared.constructor {
+            self.invoke_callee(
+                callee,
+                call_arguments,
+                depth,
+                Some(class),
+                calling_function,
+                instruction,
+            )?;
+        }
+        Ok(prepared.object)
+    }
+
+    fn prepare_dynamic_new(
+        &mut self,
+        target: &Value,
+        supplied_types: &[Type],
+        arguments: Vec<(Option<String>, Value, Type, Span)>,
+        calling_function: &Function,
+        instruction: &Instruction,
+    ) -> Result<PreparedDynamicNew, VmError> {
         let bytes = target.as_bytes().ok_or_else(|| {
             runtime(
                 RuntimeErrorKind::TypeError("dynamic class target is not string".to_owned()),
@@ -620,7 +691,10 @@ impl ExecutionState<'_, '_> {
             .find(|method| method.name == "__construct")
         else {
             if arguments.is_empty() {
-                return Ok(object);
+                return Ok(PreparedDynamicNew {
+                    object,
+                    constructor: None,
+                });
             }
             return Err(fail(format!("class `{name}` has no constructor arguments")));
         };
@@ -740,15 +814,10 @@ impl ExecutionState<'_, '_> {
         let mut call_arguments = Vec::with_capacity(bound.len() + 1);
         call_arguments.push(object.clone());
         call_arguments.extend(bound.into_iter().map(Option::unwrap));
-        self.invoke_callee(
-            callee,
-            call_arguments,
-            depth,
-            Some(class.id),
-            calling_function,
-            instruction,
-        )?;
-        Ok(object)
+        Ok(PreparedDynamicNew {
+            object,
+            constructor: Some((callee, call_arguments, class.id)),
+        })
     }
 
     fn execute_function(
@@ -785,6 +854,7 @@ impl ExecutionState<'_, '_> {
             current: function.entry,
             previous: None,
             called_class,
+            next_instruction: 0,
         };
         for (parameter, argument) in function.parameters.iter().zip(arguments) {
             frame.locals[parameter.0 as usize] = Some(argument);
@@ -1452,6 +1522,9 @@ impl ExecutionState<'_, '_> {
         let Some((target, captures)) = callback.closure_parts() else {
             return Err(runtime(RuntimeErrorKind::Unreachable, instruction.span));
         };
+        if let Some(result) = self.invoke_async_callback(target, captures) {
+            return result;
+        }
         let mut values = captures.to_vec();
         values.extend(arguments);
         self.invoke_callee(
@@ -2457,68 +2530,18 @@ impl ExecutionState<'_, '_> {
                     Value::NULL
                 };
                 if (matched != invert) || (recursive && !child.is_null()) {
-                    let transformed = self.regex_transform(
+                    self.regex_iterator_publish(
+                        wrapper,
+                        (&value, subject),
+                        child,
                         &regex,
-                        &value,
-                        subject,
-                        mode,
-                        flags,
-                        replacement.as_bytes().expect("verified replacement"),
+                        (
+                            mode,
+                            flags,
+                            replacement.as_bytes().expect("verified replacement"),
+                        ),
                         span,
                     )?;
-                    let output = if recursive {
-                        let children = if child.is_null() {
-                            Value::NULL
-                        } else {
-                            let class = wrapper.class_id().expect("recursive regex class");
-                            let nested = self.allocate_object(
-                                class,
-                                wrapper.type_arguments().unwrap_or_default().to_vec(),
-                                8,
-                                span,
-                            )?;
-                            nested
-                                .set_property(thp_hir::PropertyId(0), child)
-                                .map_err(|kind| runtime(kind, span))?;
-                            for slot in 1..=5 {
-                                nested
-                                    .set_property(
-                                        thp_hir::PropertyId(slot),
-                                        wrapper
-                                            .property(thp_hir::PropertyId(slot))
-                                            .map_err(|kind| runtime(kind, span))?,
-                                    )
-                                    .map_err(|kind| runtime(kind, span))?;
-                            }
-                            nested
-                                .set_property(thp_hir::PropertyId(6), Value::bool(false))
-                                .map_err(|kind| runtime(kind, span))?;
-                            nested
-                                .set_property(thp_hir::PropertyId(7), Value::NULL)
-                                .map_err(|kind| runtime(kind, span))?;
-                            nested
-                        };
-                        let args = wrapper.type_arguments().unwrap_or_default();
-                        let node = self.allocate_object(
-                            self.classes_by_name["RecursiveEntry"],
-                            vec![args[0].clone(), args[2].clone()],
-                            2,
-                            span,
-                        )?;
-                        node.set_property(thp_hir::PropertyId(0), transformed)
-                            .map_err(|kind| runtime(kind, span))?;
-                        node.set_property(thp_hir::PropertyId(1), children)
-                            .map_err(|kind| runtime(kind, span))?;
-                        node
-                    } else {
-                        transformed
-                    };
-                    wrapper
-                        .set_property(thp_hir::PropertyId(7), output)
-                        .map_err(|kind| runtime(kind, span))?;
-                    wrapper
-                        .set_property(thp_hir::PropertyId(6), Value::bool(true))
-                        .map_err(|kind| runtime(kind, span))?;
                     break;
                 }
                 self.iterator_call(&inner, "advance", depth, calling_function, instruction)?;
@@ -2538,6 +2561,77 @@ impl ExecutionState<'_, '_> {
                 span,
             )),
         }
+    }
+
+    fn regex_iterator_publish(
+        &mut self,
+        wrapper: &Value,
+        content: (&Value, &[u8]),
+        child: Value,
+        regex: &pcre2::bytes::Regex,
+        options: (i64, i64, &[u8]),
+        span: Span,
+    ) -> Result<(), VmError> {
+        let (value, subject) = content;
+        let (mode, flags, replacement) = options;
+        let transformed =
+            self.regex_transform(regex, value, subject, mode, flags, replacement, span)?;
+        let recursive = wrapper
+            .class_id()
+            .is_some_and(|id| self.program.classes[id.0 as usize].name == "RecursiveRegexIterator");
+        let output = if recursive {
+            let children = if child.is_null() {
+                Value::NULL
+            } else {
+                let class = wrapper.class_id().expect("recursive regex class");
+                let nested = self.allocate_object(
+                    class,
+                    wrapper.type_arguments().unwrap_or_default().to_vec(),
+                    8,
+                    span,
+                )?;
+                nested
+                    .set_property(thp_hir::PropertyId(0), child)
+                    .map_err(|kind| runtime(kind, span))?;
+                for slot in 1..=5 {
+                    nested
+                        .set_property(
+                            thp_hir::PropertyId(slot),
+                            wrapper
+                                .property(thp_hir::PropertyId(slot))
+                                .map_err(|kind| runtime(kind, span))?,
+                        )
+                        .map_err(|kind| runtime(kind, span))?;
+                }
+                nested
+                    .set_property(thp_hir::PropertyId(6), Value::bool(false))
+                    .map_err(|kind| runtime(kind, span))?;
+                nested
+                    .set_property(thp_hir::PropertyId(7), Value::NULL)
+                    .map_err(|kind| runtime(kind, span))?;
+                nested
+            };
+            let args = wrapper.type_arguments().unwrap_or_default();
+            let node = self.allocate_object(
+                self.classes_by_name["RecursiveEntry"],
+                vec![args[0].clone(), args[2].clone()],
+                2,
+                span,
+            )?;
+            node.set_property(thp_hir::PropertyId(0), transformed)
+                .map_err(|kind| runtime(kind, span))?;
+            node.set_property(thp_hir::PropertyId(1), children)
+                .map_err(|kind| runtime(kind, span))?;
+            node
+        } else {
+            transformed
+        };
+        wrapper
+            .set_property(thp_hir::PropertyId(7), output)
+            .map_err(|kind| runtime(kind, span))?;
+        wrapper
+            .set_property(thp_hir::PropertyId(6), Value::bool(true))
+            .map_err(|kind| runtime(kind, span))
     }
 
     fn infinite_next_iterator(
@@ -2756,6 +2850,10 @@ impl ExecutionState<'_, '_> {
                 instruction,
             )?;
         }
+        Self::caching_commit_current(wrapper, flags, span)
+    }
+
+    fn caching_commit_current(wrapper: &Value, flags: i64, span: Span) -> Result<(), VmError> {
         let count = wrapper
             .property(thp_hir::PropertyId(9))
             .map_err(|kind| runtime(kind, span))?
@@ -3325,6 +3423,17 @@ impl ExecutionState<'_, '_> {
         if child.is_null() {
             return Ok(entry.clone());
         }
+        let child_wrapper = self.recursive_filter_child_wrapper(wrapper, child, span)?;
+        let value = self.iterator_call(entry, "value", depth, calling_function, instruction)?;
+        self.recursive_filter_node(wrapper, value, child_wrapper, span)
+    }
+
+    fn recursive_filter_child_wrapper(
+        &mut self,
+        wrapper: &Value,
+        child: Value,
+        span: Span,
+    ) -> Result<Value, VmError> {
         let class = wrapper.class_id().expect("recursive filter class");
         let class_info = &self.program.classes[class.0 as usize];
         let copied = class_info.properties.len().max(
@@ -3359,7 +3468,16 @@ impl ExecutionState<'_, '_> {
         child_wrapper
             .set_property(thp_hir::PropertyId(1), Value::bool(false))
             .map_err(|kind| runtime(kind, span))?;
-        let value = self.iterator_call(entry, "value", depth, calling_function, instruction)?;
+        Ok(child_wrapper)
+    }
+
+    fn recursive_filter_node(
+        &mut self,
+        wrapper: &Value,
+        value: Value,
+        child_wrapper: Value,
+        span: Span,
+    ) -> Result<Value, VmError> {
         let node = self.allocate_object(
             self.classes_by_name["RecursiveEntry"],
             wrapper.type_arguments().unwrap_or_default().to_vec(),
@@ -4286,6 +4404,31 @@ impl ExecutionState<'_, '_> {
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
         match builtin {
+            Builtin::SchedulerRegisterDefault
+            | Builtin::SchedulerRegister
+            | Builtin::SchedulerIsRegistered
+            | Builtin::Async
+            | Builtin::Await
+            | Builtin::Suspend
+            | Builtin::Delay
+            | Builtin::Timeout
+            | Builtin::CoroutineCancel
+            | Builtin::CoroutineGetId
+            | Builtin::CoroutineIsStarted
+            | Builtin::CoroutineIsQueued
+            | Builtin::CoroutineIsRunning
+            | Builtin::CoroutineIsSuspended
+            | Builtin::CoroutineIsCompleted
+            | Builtin::CoroutineIsCancelled
+            | Builtin::CoroutineSubscribe
+            | Builtin::CoroutineResult
+            | Builtin::TimeoutCancel
+            | Builtin::TimeoutIsCompleted
+            | Builtin::TimeoutIsCancelled
+            | Builtin::TimeoutSubscribe
+            | Builtin::TimeoutResult => {
+                self.async_builtin(builtin, &arguments, depth, calling_function, instruction)
+            }
             Builtin::PregMatch => {
                 let regex = pcre::compile(arguments[0].as_bytes().expect("verified regex pattern"))
                     .map_err(|message| {
@@ -6711,7 +6854,31 @@ impl ExecutionState<'_, '_> {
         calling_function: &Function,
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
-        let span = instruction.span;
+        let (callee, bound, called_class, return_type) =
+            self.prepare_reflection_invoke(operation, arguments, instruction.span)?;
+        let result = self.invoke_callee(
+            callee,
+            bound,
+            depth,
+            called_class,
+            calling_function,
+            instruction,
+        )?;
+        if return_type != Type::Void && !value_matches(self.program, &result, &return_type) {
+            return Err(self.reflection_error(
+                "invoked callable returned a value of the wrong type",
+                instruction.span,
+            ));
+        }
+        Ok(result)
+    }
+
+    fn prepare_reflection_invoke(
+        &self,
+        operation: ReflectionBuiltin,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<(Callee, Vec<Value>, Option<ClassId>, Type), VmError> {
         let callable = self.reflected_callable(&arguments[0], span)?;
         let metadata = self.callable_metadata(&callable, span)?;
         let supplied = if operation == ReflectionBuiltin::FunctionInvokeArgs {
@@ -6752,22 +6919,7 @@ impl ExecutionState<'_, '_> {
                 }
             }
         };
-        let result = self.invoke_callee(
-            callee,
-            bound,
-            depth,
-            called_class,
-            calling_function,
-            instruction,
-        )?;
-        if metadata.return_type != Type::Void
-            && !value_matches(self.program, &result, &metadata.return_type)
-        {
-            return Err(
-                self.reflection_error("invoked callable returned a value of the wrong type", span)
-            );
-        }
-        Ok(result)
+        Ok((callee, bound, called_class, metadata.return_type))
     }
 
     fn reflection_new_instance(
@@ -6777,7 +6929,24 @@ impl ExecutionState<'_, '_> {
         calling_function: &Function,
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
-        let span = instruction.span;
+        let (object, callee, bound, class) =
+            self.prepare_reflection_new_instance(arguments, instruction.span)?;
+        self.invoke_callee(
+            callee,
+            bound,
+            depth,
+            Some(class),
+            calling_function,
+            instruction,
+        )?;
+        Ok(object)
+    }
+
+    fn prepare_reflection_new_instance(
+        &self,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<(Value, Callee, Vec<Value>, ClassId), VmError> {
         let (class_id, reflected_type) = self.reflected_class(&arguments[0], span)?;
         let class = self.program.classes[class_id.0 as usize].clone();
         let type_arguments = descriptor_type_arguments(reflected_type.as_ref());
@@ -6827,15 +6996,7 @@ impl ExecutionState<'_, '_> {
             }
         }
         bound.insert(0, object.clone());
-        self.invoke_callee(
-            callee,
-            bound,
-            depth,
-            Some(class.id),
-            calling_function,
-            instruction,
-        )?;
-        Ok(object)
+        Ok((object, callee, bound, class.id))
     }
 
     fn bind_reflection_arguments(
@@ -7117,29 +7278,8 @@ impl ExecutionState<'_, '_> {
         class: ClassId,
         span: Span,
     ) -> Result<Value, VmError> {
-        let path_text = std::str::from_utf8(path).map_err(|_| {
-            self.native_exception(
-                "InvalidStreamUriException",
-                b"file path must be UTF-8".to_vec(),
-                Some(path.to_vec()),
-                0,
-                span,
-            )
-        })?;
-        if path_text.is_empty() || path_text.contains('\0') {
-            return Err(self.native_exception(
-                "InvalidStreamUriException",
-                b"invalid file path".to_vec(),
-                Some(path.to_vec()),
-                0,
-                span,
-            ));
-        }
-        let resolved = if Path::new(path_text).is_relative() {
-            self.filesystem_base.join(path_text)
-        } else {
-            PathBuf::from(path_text)
-        };
+        let resolved = self.resolve_local_stream_path(path, span)?;
+        let path_text = std::str::from_utf8(path).expect("resolved path is UTF-8");
         let (readable, writable, append, truncate, create, exclusive) = flags;
         let mut options = std::fs::OpenOptions::new();
         options
@@ -7161,17 +7301,45 @@ impl ExecutionState<'_, '_> {
                     ))
                 }
             })
-            .map_err(|error| {
-                self.native_exception(
-                    "OpenStreamException",
-                    format!("cannot open `{path_text}`: {error}").into_bytes(),
-                    Some(path.to_vec()),
-                    i64::from(error.raw_os_error().unwrap_or(-1)),
-                    span,
-                )
-            })?;
+            .map_err(|error| self.open_stream_error(path_text, &error, span))?;
         Value::try_file_stream(class, file, readable, writable, append)
             .map_err(|kind| runtime(kind, span))
+    }
+
+    fn resolve_local_stream_path(&self, path: &[u8], span: Span) -> Result<PathBuf, VmError> {
+        let path_text = std::str::from_utf8(path).map_err(|_| {
+            self.native_exception(
+                "InvalidStreamUriException",
+                b"file path must be UTF-8".to_vec(),
+                Some(path.to_vec()),
+                0,
+                span,
+            )
+        })?;
+        if path_text.is_empty() || path_text.contains('\0') {
+            return Err(self.native_exception(
+                "InvalidStreamUriException",
+                b"invalid file path".to_vec(),
+                Some(path.to_vec()),
+                0,
+                span,
+            ));
+        }
+        Ok(if Path::new(path_text).is_relative() {
+            self.filesystem_base.join(path_text)
+        } else {
+            PathBuf::from(path_text)
+        })
+    }
+
+    fn open_stream_error(&self, path: &str, error: &io::Error, span: Span) -> VmError {
+        self.native_exception(
+            "OpenStreamException",
+            format!("cannot open `{path}`: {error}").into_bytes(),
+            Some(path.as_bytes().to_vec()),
+            i64::from(error.raw_os_error().unwrap_or(-1)),
+            span,
+        )
     }
 
     fn file_info_builtin(
@@ -7209,7 +7377,9 @@ impl ExecutionState<'_, '_> {
         } else {
             path.to_path_buf()
         };
-        let false_value = || Value::bool(false);
+        if file_info_uses_host(operation) {
+            return self.file_info_value(Ok(file_info_host(&resolved, operation)), span);
+        }
         match operation {
             FileInfoBuiltin::Pathname | FileInfoBuiltin::ToString => self.bytes(original, span),
             FileInfoBuiltin::Path => {
@@ -7250,112 +7420,23 @@ impl ExecutionState<'_, '_> {
                     .unwrap_or(""),
                 span,
             ),
-            FileInfoBuiltin::RealPath => match std::fs::canonicalize(&resolved)
-                .ok()
-                .and_then(|path| path.to_str().map(str::to_owned))
-            {
-                Some(path) => self.bytes(path, span),
-                None => Ok(false_value()),
-            },
-            FileInfoBuiltin::LinkTarget => match std::fs::read_link(&resolved)
-                .ok()
-                .and_then(|path| path.to_str().map(str::to_owned))
-            {
-                Some(path) => self.bytes(path, span),
-                None => Ok(false_value()),
-            },
-            FileInfoBuiltin::Type => {
-                let value = std::fs::symlink_metadata(&resolved).ok().map(|metadata| {
-                    let ty = metadata.file_type();
-                    if ty.is_symlink() {
-                        "link"
-                    } else if ty.is_dir() {
-                        "dir"
-                    } else if ty.is_file() {
-                        "file"
-                    } else {
-                        "unknown"
-                    }
-                });
-                match value {
-                    Some(value) => self.bytes(value, span),
-                    None => Ok(false_value()),
-                }
+            _ => unreachable!("host metadata handled above"),
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn file_info_value(
+        &self,
+        result: Result<FileInfoValue, RuntimeErrorKind>,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        match result.map_err(|kind| runtime(kind, span))? {
+            FileInfoValue::Bytes(bytes) => {
+                Value::try_bytes(bytes).map_err(|kind| runtime(kind, span))
             }
-            FileInfoBuiltin::IsFile => Ok(Value::bool(resolved.is_file())),
-            FileInfoBuiltin::IsDir => Ok(Value::bool(resolved.is_dir())),
-            FileInfoBuiltin::IsLink => Ok(Value::bool(resolved.is_symlink())),
-            FileInfoBuiltin::IsReadable => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    Ok(Value::bool(std::fs::metadata(&resolved).is_ok_and(
-                        |metadata| metadata.permissions().mode() & 0o444 != 0,
-                    )))
-                }
-                #[cfg(not(unix))]
-                {
-                    Ok(Value::bool(std::fs::metadata(&resolved).is_ok()))
-                }
-            }
-            FileInfoBuiltin::IsWritable => Ok(Value::bool(
-                std::fs::metadata(&resolved)
-                    .is_ok_and(|metadata| !metadata.permissions().readonly()),
-            )),
-            FileInfoBuiltin::IsExecutable => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    Ok(Value::bool(std::fs::metadata(&resolved).is_ok_and(
-                        |metadata| metadata.permissions().mode() & 0o111 != 0,
-                    )))
-                }
-                #[cfg(not(unix))]
-                {
-                    Ok(false_value())
-                }
-            }
-            FileInfoBuiltin::Size
-            | FileInfoBuiltin::ATime
-            | FileInfoBuiltin::MTime
-            | FileInfoBuiltin::CTime
-            | FileInfoBuiltin::Perms
-            | FileInfoBuiltin::Owner
-            | FileInfoBuiltin::Group
-            | FileInfoBuiltin::Inode => {
-                let value =
-                    std::fs::metadata(&resolved)
-                        .ok()
-                        .and_then(|metadata| match operation {
-                            FileInfoBuiltin::Size => i64::try_from(metadata.len()).ok(),
-                            FileInfoBuiltin::ATime => metadata
-                                .accessed()
-                                .ok()
-                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                                .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
-                            FileInfoBuiltin::MTime => metadata
-                                .modified()
-                                .ok()
-                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                                .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
-                            #[cfg(unix)]
-                            _ => {
-                                use std::os::unix::fs::MetadataExt;
-                                match operation {
-                                    FileInfoBuiltin::CTime => Some(metadata.ctime()),
-                                    FileInfoBuiltin::Perms => Some(i64::from(metadata.mode())),
-                                    FileInfoBuiltin::Owner => Some(i64::from(metadata.uid())),
-                                    FileInfoBuiltin::Group => Some(i64::from(metadata.gid())),
-                                    FileInfoBuiltin::Inode => i64::try_from(metadata.ino()).ok(),
-                                    _ => None,
-                                }
-                            }
-                            #[cfg(not(unix))]
-                            _ => None,
-                        });
-                Ok(value.map_or_else(false_value, Value::integer))
-            }
-            FileInfoBuiltin::Construct => unreachable!(),
+            FileInfoValue::Integer(value) => Ok(Value::integer(value)),
+            FileInfoValue::Bool(value) => Ok(Value::bool(value)),
+            FileInfoValue::False => Ok(Value::bool(false)),
         }
     }
 
@@ -7565,6 +7646,16 @@ impl ExecutionState<'_, '_> {
         arguments: &[Value],
         instruction: &Instruction,
     ) -> Result<Value, VmError> {
+        self.directory_builtin_with_entries(operation, arguments, instruction, None)
+    }
+
+    fn directory_builtin_with_entries(
+        &self,
+        operation: DirectoryBuiltin,
+        arguments: &[Value],
+        instruction: &Instruction,
+        supplied_entries: Option<Vec<String>>,
+    ) -> Result<Value, VmError> {
         let span = instruction.span;
         let object = &arguments[0];
         let entries_slot = thp_hir::PropertyId(0);
@@ -7665,15 +7756,44 @@ impl ExecutionState<'_, '_> {
             } else {
                 PathBuf::from(directory)
             };
-            let entries = std::fs::read_dir(resolved).map_err(|error| {
-                self.native_exception(
-                    "OpenStreamException",
-                    format!("cannot open directory `{directory}`: {error}").into_bytes(),
-                    Some(bytes.to_vec()),
-                    i64::from(error.raw_os_error().unwrap_or(-1)),
-                    span,
-                )
-            })?;
+            let names = if let Some(entries) = supplied_entries {
+                entries
+            } else {
+                std::fs::read_dir(resolved)
+                    .map_err(|error| {
+                        self.native_exception(
+                            "OpenStreamException",
+                            format!("cannot open directory `{directory}`: {error}").into_bytes(),
+                            Some(bytes.to_vec()),
+                            i64::from(error.raw_os_error().unwrap_or(-1)),
+                            span,
+                        )
+                    })?
+                    .map(|entry| {
+                        entry
+                            .map_err(|error| {
+                                self.native_exception(
+                                    "IoException",
+                                    error.to_string().into_bytes(),
+                                    None,
+                                    0,
+                                    span,
+                                )
+                            })?
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| {
+                                self.native_exception(
+                                    "IoException",
+                                    b"non-UTF-8 directory entry".to_vec(),
+                                    None,
+                                    0,
+                                    span,
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, VmError>>()?
+            };
             let info_class = self.class_named("SplFileInfo", span)?;
             let mut values = Vec::new();
             let mut add_entry = |name: &str| -> Result<(), VmError> {
@@ -7705,31 +7825,12 @@ impl ExecutionState<'_, '_> {
                 add_entry(".")?;
                 add_entry("..")?;
             }
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    self.native_exception(
-                        "IoException",
-                        error.to_string().into_bytes(),
-                        None,
-                        0,
-                        span,
-                    )
-                })?;
-                let name = entry.file_name();
-                let name = name.to_str().ok_or_else(|| {
-                    self.native_exception(
-                        "IoException",
-                        b"non-UTF-8 directory entry".to_vec(),
-                        None,
-                        0,
-                        span,
-                    )
-                })?;
+            for name in names {
                 if matcher
                     .as_ref()
-                    .is_none_or(|matcher| matcher.is_match(name))
+                    .is_none_or(|matcher| matcher.is_match(&name))
                 {
-                    add_entry(name)?;
+                    add_entry(&name)?;
                 }
             }
             object
@@ -7839,97 +7940,7 @@ impl ExecutionState<'_, '_> {
                 )
             }),
             DirectoryBuiltin::RecursiveValue => {
-                let info = current.cloned().ok_or_else(|| {
-                    self.native_exception(
-                        "OutOfBoundsException",
-                        b"directory iterator is not valid".to_vec(),
-                        None,
-                        0,
-                        span,
-                    )
-                })?;
-                let path_value = info
-                    .property(thp_hir::PropertyId(0))
-                    .map_err(|kind| runtime(kind, span))?;
-                let path_text = std::str::from_utf8(path_value.as_bytes().expect("file info path"))
-                    .expect("UTF-8 directory path");
-                let filename = directory_entry_name(path_text);
-                let resolved = if Path::new(path_text).is_relative() {
-                    self.filesystem_base.join(path_text)
-                } else {
-                    PathBuf::from(path_text)
-                };
-                let follow = object
-                    .property(thp_hir::PropertyId(3))
-                    .map_err(|kind| runtime(kind, span))?
-                    .as_bool()
-                    == Some(true);
-                let child = if !matches!(filename, "." | "..")
-                    && resolved.is_dir()
-                    && (follow || !resolved.is_symlink())
-                {
-                    let class = self.class_named("RecursiveDirectoryIterator", span)?;
-                    let child = self.allocate_object(class, Vec::new(), 7, span)?;
-                    self.directory_builtin(
-                        DirectoryBuiltin::ConstructRecursive,
-                        &[
-                            child.clone(),
-                            path_value.clone(),
-                            object
-                                .property(thp_hir::PropertyId(2))
-                                .map_err(|kind| runtime(kind, span))?,
-                            object
-                                .property(thp_hir::PropertyId(3))
-                                .map_err(|kind| runtime(kind, span))?,
-                            object
-                                .property(thp_hir::PropertyId(4))
-                                .map_err(|kind| runtime(kind, span))?,
-                        ],
-                        instruction,
-                    )?;
-                    child
-                        .set_property(
-                            thp_hir::PropertyId(5),
-                            object
-                                .property(thp_hir::PropertyId(5))
-                                .map_err(|kind| runtime(kind, span))?,
-                        )
-                        .map_err(|kind| runtime(kind, span))?;
-                    let subpath = object
-                        .property(thp_hir::PropertyId(6))
-                        .map_err(|kind| runtime(kind, span))?;
-                    let subpath = std::str::from_utf8(subpath.as_bytes().expect("subpath string"))
-                        .expect("UTF-8 subpath");
-                    child
-                        .set_property(
-                            thp_hir::PropertyId(6),
-                            Value::try_bytes(
-                                Path::new(subpath)
-                                    .join(filename)
-                                    .to_string_lossy()
-                                    .into_owned()
-                                    .into_bytes(),
-                            )
-                            .map_err(|kind| runtime(kind, span))?,
-                        )
-                        .map_err(|kind| runtime(kind, span))?;
-                    child
-                } else {
-                    Value::NULL
-                };
-                let entry = self.allocate_object(
-                    self.class_named("RecursiveEntry", span)?,
-                    vec![Type::String, Type::Object("SplFileInfo".to_owned())],
-                    2,
-                    span,
-                )?;
-                entry
-                    .set_property(thp_hir::PropertyId(0), info)
-                    .map_err(|kind| runtime(kind, span))?;
-                entry
-                    .set_property(thp_hir::PropertyId(1), child)
-                    .map_err(|kind| runtime(kind, span))?;
-                Ok(entry)
+                self.recursive_directory_value(object, current, instruction, RecursiveChild::Probe)
             }
             DirectoryBuiltin::GetSubPath => object
                 .property(thp_hir::PropertyId(6))
@@ -8005,6 +8016,115 @@ impl ExecutionState<'_, '_> {
             | DirectoryBuiltin::ConstructRecursive
             | DirectoryBuiltin::ConstructGlob => unreachable!(),
         }
+    }
+
+    fn recursive_directory_value(
+        &self,
+        object: &Value,
+        current: Option<&Value>,
+        instruction: &Instruction,
+        child: RecursiveChild,
+    ) -> Result<Value, VmError> {
+        let span = instruction.span;
+        let info = current.cloned().ok_or_else(|| {
+            self.native_exception(
+                "OutOfBoundsException",
+                b"directory iterator is not valid".to_vec(),
+                None,
+                0,
+                span,
+            )
+        })?;
+        let path_value = info
+            .property(thp_hir::PropertyId(0))
+            .map_err(|kind| runtime(kind, span))?;
+        let path_text = std::str::from_utf8(path_value.as_bytes().expect("file info path"))
+            .expect("UTF-8 directory path");
+        let filename = directory_entry_name(path_text);
+        let child_entries = match child {
+            RecursiveChild::Probe => {
+                let resolved = if Path::new(path_text).is_relative() {
+                    self.filesystem_base.join(path_text)
+                } else {
+                    PathBuf::from(path_text)
+                };
+                let follow = object
+                    .property(thp_hir::PropertyId(3))
+                    .map_err(|kind| runtime(kind, span))?
+                    .as_bool()
+                    == Some(true);
+                (!matches!(filename, "." | "..")
+                    && resolved.is_dir()
+                    && (follow || !resolved.is_symlink()))
+                .then_some(None)
+            }
+            RecursiveChild::Missing => None,
+            RecursiveChild::Entries(entries) => Some(Some(entries)),
+        };
+        let child = if let Some(entries) = child_entries {
+            let class = self.class_named("RecursiveDirectoryIterator", span)?;
+            let child = self.allocate_object(class, Vec::new(), 7, span)?;
+            self.directory_builtin_with_entries(
+                DirectoryBuiltin::ConstructRecursive,
+                &[
+                    child.clone(),
+                    path_value.clone(),
+                    object
+                        .property(thp_hir::PropertyId(2))
+                        .map_err(|kind| runtime(kind, span))?,
+                    object
+                        .property(thp_hir::PropertyId(3))
+                        .map_err(|kind| runtime(kind, span))?,
+                    object
+                        .property(thp_hir::PropertyId(4))
+                        .map_err(|kind| runtime(kind, span))?,
+                ],
+                instruction,
+                entries,
+            )?;
+            child
+                .set_property(
+                    thp_hir::PropertyId(5),
+                    object
+                        .property(thp_hir::PropertyId(5))
+                        .map_err(|kind| runtime(kind, span))?,
+                )
+                .map_err(|kind| runtime(kind, span))?;
+            let subpath = object
+                .property(thp_hir::PropertyId(6))
+                .map_err(|kind| runtime(kind, span))?;
+            let subpath = std::str::from_utf8(subpath.as_bytes().expect("subpath string"))
+                .expect("UTF-8 subpath");
+            child
+                .set_property(
+                    thp_hir::PropertyId(6),
+                    Value::try_bytes(
+                        Path::new(subpath)
+                            .join(filename)
+                            .to_string_lossy()
+                            .into_owned()
+                            .into_bytes(),
+                    )
+                    .map_err(|kind| runtime(kind, span))?,
+                )
+                .map_err(|kind| runtime(kind, span))?;
+            child
+        } else {
+            Value::NULL
+        };
+        let entry = self.allocate_object(
+            self.class_named("RecursiveEntry", span)?,
+            vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+            2,
+            span,
+        )?;
+        entry
+            .set_property(thp_hir::PropertyId(0), info)
+            .map_err(|kind| runtime(kind, span))?;
+        entry
+            .set_property(thp_hir::PropertyId(1), child)
+            .map_err(|kind| runtime(kind, span))?;
+        Ok(entry)
     }
 
     fn nonnegative_stream_value(
@@ -8911,6 +9031,335 @@ while ($index < 3) {
     }
 
     #[test]
+    fn async_registration_and_queued_result_are_request_local() {
+        for _ in 0..2 {
+            let execution = run(r"<?thp
+echo scheduler_is_registered();
+scheduler_register_default();
+echo scheduler_is_registered();
+$job: Coroutine<int> = async(fn(): int => 7);
+echo $job->isQueued();
+echo await($job);
+echo $job->isCompleted();
+")
+            .unwrap();
+            assert_eq!(execution.output, b"falsetruetrue7true");
+        }
+    }
+
+    #[test]
+    fn custom_scheduler_selects_a_supplied_ready_id() {
+        let execution = run(r#"<?thp
+class Reverse implements SchedulerInterface {
+    public function chooseNext(vector<int> $ready): int {
+        return $ready[count($ready) - 1];
+    }
+}
+scheduler_register(new Reverse());
+$first = async(function (): int { echo "A"; return 1; });
+$second = async(function (): int { echo "B"; return 2; });
+echo await($first);
+echo await($second);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"BA12");
+    }
+
+    #[test]
+    fn nested_async_calls_resume_in_fifo_order() {
+        let execution = run(r#"<?thp
+function first_part(): int { echo "A"; suspend(); echo "a"; return 1; }
+function second_part(): int { echo "B"; delay(0); echo "b"; return 2; }
+scheduler_register_default();
+$first = async(function (): int { return first_part(); });
+$second = async(function (): int { return second_part(); });
+await($first);
+await($second);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"ABab");
+    }
+
+    #[test]
+    fn generator_suspension_in_a_coroutine_keeps_iteration_state() {
+        let execution = run(r"<?thp
+function values(): Generator<int, int> {
+    yield 1;
+    suspend();
+    yield 2;
+}
+scheduler_register_default();
+$job = async(function (): int {
+    $sum = 0;
+    foreach (values() as $value) { $sum = $sum + $value; }
+    return $sum;
+});
+echo await($job);
+")
+        .unwrap();
+        assert_eq!(execution.output, b"3");
+    }
+
+    #[test]
+    fn async_failure_keeps_nested_call_trace_when_awaited() {
+        let execution = run(r#"<?thp
+function nested(): int { throw new Exception("boom"); }
+scheduler_register_default();
+$job = async(function (): int { return nested(); });
+try { await($job); }
+catch (Exception $error) { echo $error->getTrace()[0]->function; }
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"nested");
+    }
+
+    #[test]
+    fn async_void_callable_can_be_awaited() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$job = async(function (): void { echo "done"; });
+await($job);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"done");
+    }
+
+    #[test]
+    fn async_cancellation_runs_finally_and_can_be_caught() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$job = async(function (): int {
+    try {
+        suspend();
+        echo "wrong";
+        return 1;
+    } catch (CancellationException $error) {
+        echo "caught";
+        return 9;
+    } finally {
+        echo "cleanup";
+    }
+});
+suspend();
+$job->cancel();
+echo await($job);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"caughtcleanup9");
+    }
+
+    #[test]
+    fn timeout_cancels_wait_and_leaves_target_running() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$job = async(function (): int { delay(10); echo "target"; return 7; });
+try {
+    await($job, timeout(1));
+} catch (WaitCancelledException $error) {
+    echo "timeout";
+}
+echo await($job);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"timeouttarget7");
+    }
+
+    #[test]
+    fn user_completion_wakes_pending_await() {
+        let execution = run(r#"<?thp
+class Manual implements Completable<int> {
+    private bool $done = false;
+    private callable<void> $notify;
+    public function cancel(): void {}
+    public function isCompleted(): bool { return $this->done; }
+    public function isCancelled(): bool { return false; }
+    public function subscribe(callable<void> $notify): callable<void> {
+        $this->notify = $notify;
+        return function (): void {};
+    }
+    public function result(): int {
+        if (!$this->done) { throw new Error("pending"); }
+        return 42;
+    }
+    public function complete(): void {
+        $this->done = true;
+        ($this->notify)();
+    }
+}
+scheduler_register_default();
+$manual = new Manual();
+$producer = async(function (Manual $manual): int {
+    $manual->complete();
+    return 1;
+}, $manual);
+echo await($manual);
+echo await($producer);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"421");
+    }
+
+    #[test]
+    fn async_rejects_duplicate_registration_and_queued_cancellation() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+try { scheduler_register_default(); } catch (Error $error) { echo "duplicate"; }
+$job = async(function (): int { echo "wrong"; return 1; });
+$job->cancel();
+$job->cancel();
+echo $job->isStarted();
+echo $job->isCancelled();
+try { await($job); } catch (CancellationException $error) { echo "cancelled"; }
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"duplicatefalsetruecancelled");
+    }
+
+    #[test]
+    fn invalid_scheduler_choice_fails_the_request() {
+        let error = run(r"<?thp
+class Bad implements SchedulerInterface {
+    public function chooseNext(vector<int> $ready): int { return 0; }
+}
+scheduler_register(new Bad());
+$job = async(fn(): int => 1);
+await($job);
+")
+        .unwrap_err();
+        assert!(matches!(&error, VmError::Runtime(RuntimeError {
+            kind: RuntimeErrorKind::UncaughtException { class, .. }, ..
+        }) if class == "Error"));
+    }
+
+    #[test]
+    fn unobserved_async_failure_fails_the_request() {
+        let error = run(r#"<?thp
+scheduler_register_default();
+async(function (): int { throw new Exception("first"); });
+async(function (): int { throw new Exception("second"); });
+"#)
+        .unwrap_err();
+        assert!(matches!(&error, VmError::Runtime(RuntimeError {
+            kind: RuntimeErrorKind::UncaughtException { class, message }, ..
+        }) if class == "Exception" && message == "first"));
+        let VmError::Runtime(error) = error else {
+            unreachable!()
+        };
+        assert!(matches!(error.suppressed.as_slice(),
+            [RuntimeErrorKind::UncaughtException { class, message }]
+                if class == "Exception" && message == "second"));
+    }
+
+    #[test]
+    fn root_failure_drains_and_suppresses_spawned_failure() {
+        let error = run(r#"<?thp
+scheduler_register_default();
+async(function (): void { throw new Exception("child"); });
+throw new Exception("root");
+"#)
+        .unwrap_err();
+        let VmError::Runtime(error) = error else {
+            unreachable!()
+        };
+        assert!(matches!(error.kind,
+            RuntimeErrorKind::UncaughtException { class, message }
+                if class == "Exception" && message == "root"));
+        assert!(matches!(error.suppressed.as_slice(),
+            [RuntimeErrorKind::UncaughtException { class, message }]
+                if class == "Exception" && message == "child"));
+    }
+
+    #[test]
+    fn pending_completion_without_wakeup_deadlocks() {
+        let error = run(r#"<?thp
+class Stalled implements Completable<int> {
+    public function cancel(): void {}
+    public function isCompleted(): bool { return false; }
+    public function isCancelled(): bool { return false; }
+    public function subscribe(callable<void> $notify): callable<void> {
+        return function (): void {};
+    }
+    public function result(): int { throw new Error("pending"); }
+}
+scheduler_register_default();
+await(new Stalled());
+"#)
+        .unwrap_err();
+        assert!(matches!(error, VmError::Runtime(RuntimeError {
+            kind: RuntimeErrorKind::UncaughtException { class, .. }, ..
+        }) if class == "AsyncDeadlockException"));
+    }
+
+    #[test]
+    fn root_can_catch_deadlock_and_continue() {
+        let execution = run(r#"<?thp
+class Stalled implements Completable<int> {
+    public function cancel(): void {}
+    public function isCompleted(): bool { return false; }
+    public function isCancelled(): bool { return false; }
+    public function subscribe(callable<void> $notify): callable<void> {
+        return function (): void {};
+    }
+    public function result(): int { throw new Error("pending"); }
+}
+scheduler_register_default();
+try { await(new Stalled()); }
+catch (AsyncDeadlockException $error) { echo "caught"; }
+echo " after";
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"caught after");
+    }
+
+    #[test]
+    fn completed_subscription_notifies_immediately_and_unsubscribe_is_idempotent() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$job = async(fn(): int => 7);
+$unsubscribe = $job->subscribe(function (): void { echo "early"; });
+$unsubscribe();
+$unsubscribe();
+echo await($job);
+$job->subscribe(function (): void { echo "late"; });
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"7late");
+    }
+
+    #[test]
+    fn async_can_run_a_subscription_unsubscribe_callable() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$target = async(function (): int { suspend(); return 7; });
+$unsubscribe = $target->subscribe(function (): void { echo "wrong"; });
+$job = async($unsubscribe);
+await($job);
+echo await($target);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"7");
+    }
+
+    #[test]
+    fn completed_user_result_needs_no_scheduler() {
+        let execution = run(r"<?thp
+class Ready implements Completable<int> {
+    public function cancel(): void {}
+    public function isCompleted(): bool { return true; }
+    public function isCancelled(): bool { return false; }
+    public function subscribe(callable<void> $notify): callable<void> {
+        $notify();
+        return function (): void {};
+    }
+    public function result(): int { return 23; }
+}
+echo await(new Ready());
+")
+        .unwrap();
+        assert_eq!(execution.output, b"23");
+    }
+
+    #[test]
     fn dynamically_constructs_after_direct_narrowing() {
         let execution = run(r#"<?thp
 class Greeter {
@@ -8986,6 +9435,33 @@ var_dump($child instanceof ChildBox);
             execution.output,
             b"target\nargument\n?2\nbool(true)\nbool(true)\nbool(true)\n"
         );
+    }
+
+    #[test]
+    fn dynamic_constructor_suspends_on_the_coroutine_frame_stack() {
+        let execution = run(r#"<?thp
+class Build {
+    public int $value = 0;
+    public function __construct() {
+        echo "A";
+        suspend();
+        $this->value = 7;
+        echo "a";
+    }
+}
+scheduler_register_default();
+$class: string = "Build";
+$job = async(function () use ($class): int {
+    $value = new $class();
+    if ($value instanceof Build) { return $value->value; }
+    return 0;
+});
+$other = async(function (): void { echo "B"; });
+echo await($job);
+await($other);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"ABa7");
     }
 
     #[test]
@@ -9395,6 +9871,146 @@ $editor->close();
         );
         run(&source).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"basemXre");
+    }
+
+    #[test]
+    fn file_worker_allows_other_coroutines_and_serializes_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("async.txt");
+        std::fs::write(&path, b"").unwrap();
+        let source = format!(
+            r#"<?thp
+scheduler_register_default();
+$stream = Files::openReadWrite("{}");
+$first = async(function () use ($stream): void {{
+    echo "A";
+    $stream->writeAll("A");
+    echo "a";
+}});
+$second = async(function () use ($stream): void {{
+    echo "B";
+    $stream->writeAll("B");
+    echo "b";
+}});
+await($first);
+await($second);
+$stream->seek(0);
+echo $stream->readAll();
+"#,
+            path.display()
+        );
+        let execution = run(&source).unwrap();
+        assert!(
+            execution.output.starts_with(b"AB"),
+            "{:?}",
+            execution.output
+        );
+        assert!(execution.output.ends_with(b"AB"), "{:?}", execution.output);
+        assert_eq!(std::fs::read(path).unwrap(), b"AB");
+    }
+
+    #[test]
+    fn temporary_stream_spill_keeps_cursor_and_yields() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$stream = TempStream::open(0);
+$writer = async(function () use ($stream): void {
+    echo "A";
+    $stream->writeAll("first");
+    echo "a";
+});
+$other = async(function (): void { echo "B"; });
+await($writer);
+await($other);
+echo $stream->tell();
+$stream->seek(0);
+echo $stream->readAll();
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"ABa5first");
+    }
+
+    #[test]
+    fn cancelling_an_issued_file_write_preserves_its_effect() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$stream = TempStream::open(0);
+$job = async(function () use ($stream): int {
+    try { $stream->writeAll("x"); }
+    catch (CancellationException $error) { echo "cancel"; return 1; }
+    return 2;
+});
+suspend();
+$job->cancel();
+echo await($job);
+$stream->seek(0);
+echo $stream->readAll();
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"cancel1x");
+    }
+
+    #[test]
+    fn direct_file_line_read_yields_to_other_coroutines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lines.txt");
+        std::fs::write(&path, b"first\nsecond\n").unwrap();
+        let source = format!(
+            r#"<?thp
+scheduler_register_default();
+$file = new SplFileObject("{}");
+$reader = async(function () use ($file): void {{
+    echo "A";
+    echo $file->fgets();
+    echo "a";
+}});
+$other = async(function (): void {{ echo "B"; }});
+await($reader);
+await($other);
+echo $file->fgets();
+"#,
+            path.display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"ABfirst\nasecond\n");
+    }
+
+    #[test]
+    fn using_cleanup_runs_after_file_suspend() {
+        let execution = run(r#"<?thp
+scheduler_register_default();
+$job = async(function (): void {
+    $alias = TempStream::open(0);
+    using ($stream = $alias) {
+        $stream->writeAll("x");
+        echo $stream->tell();
+    }
+    echo $alias->isClosed();
+});
+await($job);
+"#)
+        .unwrap();
+        assert_eq!(execution.output, b"1true");
+    }
+
+    #[test]
+    fn failed_file_read_releases_alias_and_keeps_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("limit.txt");
+        std::fs::write(&path, b"12345").unwrap();
+        let source = format!(
+            r#"<?thp
+scheduler_register_default();
+$stream = Files::openRead("{}");
+try {{ $stream->readAll(4); }}
+catch (IoException $error) {{ echo "limit"; }}
+echo $stream->tell();
+echo $stream->readAll();
+"#,
+            path.display()
+        );
+        let execution = run(&source).unwrap();
+        assert_eq!(execution.output, b"limit012345");
     }
 
     #[test]
@@ -10011,6 +10627,76 @@ $second = MemoryStream::open();
         ));
         assert_eq!(handle_failure.heap.open_handles, 0);
         assert_eq!(handle_failure.heap.live_cells, 0);
+    }
+
+    #[test]
+    fn explicit_frames_keep_stack_limit_and_depth_metrics() {
+        let program = bytecode("<?thp\nfunction child(): int { return 7; } echo child();");
+        let execution = execute_captured(
+            &program,
+            &ExecutionContext {
+                limits: Limits {
+                    max_stack_depth: Some(1),
+                    ..Limits::default()
+                },
+                ..ExecutionContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(execution.maximum_call_depth, 1);
+        assert_eq!(execution.output_bytes, 1);
+
+        let failure = execute_captured(
+            &program,
+            &ExecutionContext {
+                limits: Limits {
+                    max_stack_depth: Some(0),
+                    ..Limits::default()
+                },
+                ..ExecutionContext::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            VmError::StackDepthLimit { limit: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn async_coroutines_share_the_request_instruction_limit() {
+        let program = bytecode(
+            r"<?thp
+function countUp(): int {
+    $value = 0;
+    for ($index = 0; $index < 20; $index = $index + 1) {
+        $value = $value + 1;
+    }
+    return $value;
+}
+scheduler_register_default();
+$first = async(fn(): int => countUp());
+$second = async(fn(): int => countUp());
+echo await($first) + await($second);
+",
+        );
+        let complete = execute_captured(&program, &ExecutionContext::default()).unwrap();
+        assert_eq!(complete.output, b"40");
+        let limit = complete.instructions - 1;
+        let failure = execute_captured(
+            &program,
+            &ExecutionContext {
+                limits: Limits {
+                    max_instructions: Some(limit),
+                    ..Limits::default()
+                },
+                ..ExecutionContext::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failure.error, VmError::InstructionLimit { limit: reached, .. } if reached == limit)
+        );
     }
 
     struct RejectSecondWrite {

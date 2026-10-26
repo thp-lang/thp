@@ -5,7 +5,34 @@ import { renderPage } from "../../src/view/pages.js";
 
 const root = path.resolve(import.meta.dirname, "../..");
 
-describe("0.2.0 contract availability", () => {
+describe("contract availability", () => {
+  it("marks the running Async API implemented", async () => {
+    const model = await createModel({ root });
+    const asyncPages = model.pages.filter((page) =>
+      page.source.data.id.startsWith("std.async"),
+    );
+    expect(
+      asyncPages.every(
+        (page) => page.source.data.availability === "implemented",
+      ),
+    ).toBe(true);
+    expect(
+      model.types
+        .get("std.async.SchedulerInterface")!
+        .members.map((member) => member.source.data.name),
+    ).toEqual(["chooseNext"]);
+    expect(
+      model.types
+        .get("std.async.Completable")!
+        .members.map((member) => member.source.data.name),
+    ).toContain("subscribe");
+    expect(
+      model.types
+        .get("std.async.Completable")!
+        .members.map((member) => member.source.data.name),
+    ).toContain("result");
+  });
+
   it("maps every stream symbol to its executable availability", async () => {
     const model = await createModel({ root });
     const actual = new Map(

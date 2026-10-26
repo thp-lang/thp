@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "thp-abi"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "thp-compiler",
  "thp-diagnostics",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "thp-bytecode"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "thp-diagnostics",
  "thp-hir",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "thp-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "thp-bytecode",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "thp-compiler"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "tempfile",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "thp-config"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "criterion",
@@ -1112,11 +1112,11 @@ dependencies = [
 
 [[package]]
 name = "thp-diagnostics"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "thp-embed"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "thp-compiler",
  "thp-diagnostics",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "thp-hir"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "thp-diagnostics",
  "thp-syntax",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "thp-jit"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1173,11 +1173,11 @@ dependencies = [
 
 [[package]]
 name = "thp-metrics"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "thp-mir"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "thp-diagnostics",
  "thp-hir",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "thp-modules"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "tempfile",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "thp-native"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "libloading",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "thp-opcache"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "tempfile",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "thp-runtime"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "tempfile",
  "thp-diagnostics",
@@ -1232,14 +1232,14 @@ dependencies = [
 
 [[package]]
 name = "thp-syntax"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "thp-diagnostics",
 ]
 
 [[package]]
 name = "thp-test"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "regex",
  "tempfile",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "thp-vm"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "pcre2",
  "regex",

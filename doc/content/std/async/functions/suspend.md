@@ -13,16 +13,11 @@ returns:
     This function does not return a value. The current callable continues after
     the scheduler resumes its coroutine.
 errors:
-  - description:
-      Calling suspend() when no scheduler is registered, or from an execution
-      context the scheduler cannot suspend, fails. The concrete error types are not yet
-      finalized.
+  - description: Invalid context throws Error at this call site.
+  - description: Pending cancellation throws CancellationException at this checkpoint.
 related: []
 status: experimental
-availability: proposed
-notice:
-  suspend() is proposed and is not implemented in this repository. Its exact
-  scheduling priority and cancellation failure type are not finalized.
+availability: implemented
 version: "0.1"
 module: async
 ---
@@ -32,12 +27,12 @@ work.
 
 ## Behavior
 
-The current coroutine moves from running to suspended, and control returns to
-the scheduler. The scheduler makes it eligible to run again on a later turn.
+The current coroutine yields and is requeued at the back of the ready queue.
+The scheduler makes it eligible to run again on a later turn.
 No parallel execution is introduced.
 
 `suspend()` is a cancellation checkpoint. If cancellation has been requested,
-the coroutine receives the Async cancellation failure instead of continuing
+the coroutine receives `CancellationException` instead of continuing
 past the call.
 
 Supported I/O functions suspend automatically while waiting, so application

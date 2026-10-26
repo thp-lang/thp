@@ -33,6 +33,11 @@ cells and payload capacity, buffers possible cycle roots, and uses trial
 deletion to reclaim unreachable vector, map, object, and exception cycles.
 Stream cells own logical handle leases and release native storage on explicit
 close, last-reference cleanup, or request teardown.
+Coroutine queues, timers, and VM frames belong to one request. File jobs use
+four process-wide workers and a 64-job queue; only owned path bytes, file
+handles, byte buffers, and operation data cross threads. Completed jobs return
+to the request VM thread, which applies stream cursor changes and preserves
+operation order for aliases.
 
 VM requests carry instruction, execution-time, managed-heap, request-input,
 logical-stack, and open-handle limits plus a request-local filesystem base.
