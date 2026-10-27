@@ -671,7 +671,7 @@ macro_rules! scalar_getter {
                 };
                 // SAFETY: the C caller provides a writable output slot.
                 unsafe {
-                    *out = value as $type;
+                    *out = <$type>::from(value);
                 }
                 0
             })
