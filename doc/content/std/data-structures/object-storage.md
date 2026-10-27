@@ -23,19 +23,47 @@ notice: This experimental native object storage is implemented. Object keys are
 version: "0.1"
 ---
 
-`ObjectStorage<T>` associates one `T` value with each object identity.
-`attach(mixed $object, T $data): void` replaces data for an existing object
-without moving it. `get(mixed $object): ?T`, `contains(mixed $object): bool`,
-and `detach(mixed $object): bool` use identity rather than object properties.
-Non-object keys throw `TypeError`. `count(): int` returns the number of objects.
+`ObjectStorage<T>` is an optional object-only identity association whose
+iteration yields attached objects. Native object-keyed maps already associate
+values by object identity: prefer `map<Box, T>` when typed keys and native map
+value semantics fit. Choose this wrapper when shared object mutation, runtime
+rejection of every non-object key, and iteration over objects are useful.
+THP currently has no top-level object type constraint, so key parameters are
+`mixed` and validated at runtime.
 
-`getIterator(): Traversable<int, mixed>` returns an insertion-order snapshot of
-attached objects. `foreach` uses the normal `IteratorAggregate` protocol.
+[`__construct()`](thp:std.dataStructures.ObjectStorage::__construct) starts empty.
+[`attach()`](thp:std.dataStructures.ObjectStorage::attach) requires both an object
+and its data; reattaching replaces data without moving the object.
+[`get()`](thp:std.dataStructures.ObjectStorage::get) returns null for absence;
+[`contains()`](thp:std.dataStructures.ObjectStorage::contains) distinguishes an
+absent object from one with null data. [`detach()`](thp:std.dataStructures.ObjectStorage::detach)
+returns whether an object was removed. All four key operations reject non-objects
+with `TypeError`, even for lookups or removals. Matching uses identity, never
+object properties. [`count()`](thp:std.dataStructures.ObjectStorage::count) counts
+attached identities.
+
+The storage strongly retains both attached objects and data. Detaching releases
+its references; other references can keep either alive. This is not weak-key
+storage. [`getIterator()`](thp:std.dataStructures.ObjectStorage::getIterator)
+returns a fresh insertion-order `VectorIterator` snapshot of the objects, with
+dense integer keys. It does not yield attached data. Snapshots retain their
+objects after detachment and share their identity and property mutations.
+`foreach` uses `IteratorAggregate`.
 
 ```thp
+<?thp
 class Box {}
 $box = new Box();
+$alias = $box;
+$other = new Box();
 $storage = new ObjectStorage<string>();
 $storage->attach($box, "ready");
-echo $storage->contains($box);
+echo $storage->contains($alias); // true: same identity.
+echo $storage->contains($other); // false: distinct identity.
 ```
+
+Current implementation detail: an object wrapper owns a vector of object/data
+records. Key operations scan identities linearly, and attachments and detachments
+copy the record sequence. Counting reads the stored length; capturing iteration
+allocates a vector of object references and a cursor. These costs are not API
+guarantees or measured advantages over object-keyed maps.

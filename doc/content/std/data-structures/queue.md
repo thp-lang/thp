@@ -23,13 +23,18 @@ version: "0.1"
 ---
 
 `Queue<T>` inherits the double-ended operations of `LinkedList<T>` and adds
-`enqueue(T): void` and `dequeue(): T`. Enqueue appends; dequeue removes the
+[`enqueue(T): void`](thp:std.dataStructures.Queue::enqueue) and [`dequeue(): T`](thp:std.dataStructures.Queue::dequeue). Enqueue appends; dequeue removes the
 oldest value and throws `UnderflowException` when empty. `foreach` yields a
 snapshot in FIFO order through `IteratorAggregate<int, T>`.
 
 ```thp
+<?thp
 $queue = new Queue<string>();
 $queue->enqueue("first");
 $queue->enqueue("second");
 echo $queue->dequeue();
 ```
+
+This adapter uses the same vector-backed storage and copying mutations as
+[`LinkedList`](thp:std.dataStructures.LinkedList); it does not provide a separate
+constant-time deque implementation.

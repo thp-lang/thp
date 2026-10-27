@@ -28,28 +28,54 @@ notice:
 version: "0.1"
 ---
 
-`FixedSequence<T>` stores zero-based slots with a size chosen at construction.
-New slots contain `null`. `setSize()` grows with null slots or discards slots
-beyond the new length. `count()` and `getSize()` both return the current length.
+`FixedSequence<T>` provides explicitly sized, resizable nullable slots. Choose
+it when clearing a value must preserve its position and the length must remain
+explicit. Prefer a native `vector<T>` when those slot semantics are unnecessary.
+This wrapper does not imply a speed or memory advantage over vectors.
 
-| Method                                     | Result                                                                    |
-| ------------------------------------------ | ------------------------------------------------------------------------- |
-| `__construct(int $size = 0)`               | Creates the sequence; negative sizes throw `ValueError`.                  |
-| `setSize(int $size): void`                 | Resizes; negative sizes throw `ValueError`.                               |
-| `offsetExists(int $offset): bool`          | True for a non-null in-range slot.                                        |
-| `offsetGet(int $offset): ?T`               | Reads a slot; out-of-range indices throw `OutOfBoundsException`.          |
-| `offsetSet(?int $offset, ?T $value): void` | Writes an in-range slot; `null` offsets throw `ValueError`.               |
-| `offsetUnset(int $offset): void`           | Clears a slot to null; out-of-range indices throw `OutOfBoundsException`. |
-| `getIterator(): Traversable<int, ?T>`      | Creates a `VectorIterator` snapshot of the current slots.                 |
+[`__construct()`](thp:std.dataStructures.FixedSequence::__construct) creates
+zero-based slots filled with `null` (default size zero).
+[`setSize()`](thp:std.dataStructures.FixedSequence::setSize) grows with null slots
+or discards slots beyond the new length. Negative sizes throw `ValueError`.
+[`count()`](thp:std.dataStructures.FixedSequence::count) and
+[`getSize()`](thp:std.dataStructures.FixedSequence::getSize) count all slots,
+including null ones.
 
-The generic argument is explicit when the constructor has no value from which
-to infer `T`. The object uses `IteratorAggregate`, so `foreach` follows the
-common iterator protocol and obtains one fresh cursor per traversal.
+[`offsetSet()`](thp:std.dataStructures.FixedSequence::offsetSet) writes or clears
+an existing slot; a null offset throws `ValueError` rather than appending.
+[`offsetUnset()`](thp:std.dataStructures.FixedSequence::offsetUnset) clears to
+null without shifting positions. These operations and
+[`offsetGet()`](thp:std.dataStructures.FixedSequence::offsetGet) throw
+`OutOfBoundsException` for negative or out-of-range indices.
+[`offsetExists()`](thp:std.dataStructures.FixedSequence::offsetExists) instead
+returns false for invalid indices or null slots.
+
+[`getIterator()`](thp:std.dataStructures.FixedSequence::getIterator) creates a
+fresh `VectorIterator` snapshot of every slot, including null slots. Later
+mutation does not change the captured slots. `foreach` uses `IteratorAggregate`.
+Specify `T` explicitly when context cannot infer it. Use the offset methods
+directly; object bracket access is not implemented.
 
 ```thp
-$slots = new FixedSequence<string>(2);
+<?thp
+$slots = new FixedSequence<string>(3);
 $slots->offsetSet(0, "left");
-foreach ($slots as $index => $value) {
-    echo $index;
-}
+$slots->offsetSet(2, "right");
+$slots->offsetUnset(0);
+echo $slots->getSize(); // 3: clearing preserves positions.
+echo $slots->offsetGet(2); // right
 ```
+
+## Current implementation costs
+
+These are implementation details, not API guarantees. Storage is a native
+vector of nullable values plus an object wrapper. Indexed reads are constant
+time. Every write and clear copies the full slot sequence, even without an
+iterator snapshot. Resizing allocates a new vector and copies retained slots;
+the current resize path also copies the old slot sequence first. Copies retain
+object identities rather than cloning objects. Capturing an iterator adds a
+cursor object sharing the current vector snapshot.
+
+Comparative speed or memory remains unmeasured. Any claim against native vectors
+requires reproducible measurements of equivalent sizing, clearing, copying,
+and traversal workloads.
