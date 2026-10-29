@@ -52,10 +52,8 @@ types and declarations retained in the verified linked program.
 
 ## Bundled extensions
 
-[Bundled extensions](thp:std.extensions) reserves reference routes for the
-optional extensions shipped in PHP's source distribution. Every entry is
-currently a design placeholder rather than an implemented compatibility
-promise.
+[Bundled extensions](thp:std.extensions) includes the implemented PCRE2 regex
+functions and reserves routes for other proposed optional extensions.
 
 ## Base
 

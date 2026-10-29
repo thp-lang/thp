@@ -29,15 +29,16 @@ status: experimental
 availability: proposed
 notice:
   This PHP migration-analysis placeholder is not an accepted THP-native API and
-  is not implemented. A native replacement must distinguish vector and map
+  is not implemented. The proposed RecursiveCollectionIterator preserves vector and map
   children explicitly.
 version: "0.1"
 ---
 
 `RecursiveArrayIterator` records PHP migration behavior and is not a THP-native
-name. THP's replacement is provisionally called
-`RecursiveCollectionIterator` and must preserve whether each child is a
-`vector<T>` or `map<K, V>`.
+name. The proposed native replacement,
+[`RecursiveCollectionIterator`](thp:std.spl.RecursiveCollectionIterator),
+preserves vector/map shape and treats objects as leaves. Its initial
+non-generic contract exposes `RecursiveIterator<mixed, mixed>`.
 
 ## Construction
 

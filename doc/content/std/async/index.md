@@ -6,32 +6,35 @@ summary: Concurrency primitives and cooperatively scheduled operations.
 module: async
 order: 10
 status: experimental
-availability: proposed
-notice:
-  This section proposes an API that is not implemented in this repository. Names,
-  signatures, cancellation, and failure behavior may change.
+availability: implemented
 ---
 
-THP's proposed Async API runs ordinary callables in cooperatively scheduled
-coroutines. A scheduler must be registered before starting asynchronous work.
+THP's Async API runs ordinary callables in cooperatively scheduled coroutines.
+A scheduler must be registered before starting asynchronous work.
 Applications can select the built-in scheduler or provide an implementation of
 [`SchedulerInterface`](thp:std.async.SchedulerInterface).
 
-The proposal follows True Async's transparent-asynchrony model: a blocking I/O
-operation inside a coroutine suspends that coroutine, while the same operation
-outside a coroutine retains its ordinary blocking behavior. This lets libraries
-use one callable API instead of maintaining separate synchronous and
-asynchronous variants.
+Memory-stream operations complete immediately. Direct file-backed opens,
+reads, writes, seeks, EOF checks, flushes, `SplFileObject` line methods,
+metadata queries, directory construction and child discovery, and temporary-file spill suspend
+while a standard-library worker pool performs host I/O. The
+pool has four process-wide workers and a 64-job queue; operations on aliased
+handles are serialized per stream to preserve cursor order. Native iterator
+adapters resume callbacks and file operations through coroutine frames.
+`thp:/input` remains usable, but its synchronous host reader can block the
+request thread. Host output and ABI-v1 native callbacks can also block all
+coroutines.
 
 ## Types
 
-| Type                                                     | Description                                      |
-| -------------------------------------------------------- | ------------------------------------------------ |
-| [`Awaitable<T>`](thp:std.async.Awaitable)                | Marks a value whose readiness can be observed.   |
-| [`Completable<T>`](thp:std.async.Completable)            | Defines a one-shot awaitable result.             |
-| [`Coroutine<T>`](thp:std.async.Coroutine)                | Represents a scheduled callable and its result.  |
-| [`Timeout`](thp:std.async.Timeout)                       | Represents a one-shot timer used to limit waits. |
-| [`SchedulerInterface`](thp:std.async.SchedulerInterface) | Defines the scheduler integration contract.      |
+| Type                                                                                                                                                                                                                                                     | Description                                      |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| [`Awaitable<T>`](thp:std.async.Awaitable)                                                                                                                                                                                                                | Marks a value whose readiness can be observed.   |
+| [`Completable<T>`](thp:std.async.Completable)                                                                                                                                                                                                            | Defines a one-shot awaitable result.             |
+| [`Coroutine<T>`](thp:std.async.Coroutine)                                                                                                                                                                                                                | Represents a scheduled callable and its result.  |
+| [`Timeout`](thp:std.async.Timeout)                                                                                                                                                                                                                       | Represents a one-shot timer used to limit waits. |
+| [`SchedulerInterface`](thp:std.async.SchedulerInterface)                                                                                                                                                                                                 | Defines the scheduler integration contract.      |
+| [`CancellationException`](thp:std.async.CancellationException), [`WaitCancelledException`](thp:std.async.WaitCancelledException), [`TimeoutException`](thp:std.async.TimeoutException), [`AsyncDeadlockException`](thp:std.async.AsyncDeadlockException) | Report the four Async failures.                  |
 
 ## Functions
 
@@ -73,20 +76,30 @@ limits only its corresponding wait.
 - Scheduling is cooperative. A coroutine gives other work an opportunity to run
   when it suspends, awaits another coroutine, or performs supported non-blocking
   I/O.
-- `async()` is a normal function, not a function modifier. THP does not divide
-  the language into colored synchronous and asynchronous functions.
+- `async()` and `await()` are ordinary function calls. There is no `async`
+  function modifier or `await` expression syntax. Incompatible arguments to
+  `async()` are compile errors at their argument spans; invalid API use throws
+  `Error` at the call site.
 - Cancellation is cooperative. It is observed when a coroutine next suspends;
   it cannot interrupt arbitrary CPU-bound code.
 - A long computation with no suspension point blocks every other coroutine on
   the same scheduler thread.
+- Scheduler and completion callbacks cannot suspend. The runtime owns the ready
+  queue, timers, I/O readiness, cancellation, and VM switching.
+- Registration, coroutine IDs, and pending work belong to one request. The main
+  script is the root coroutine after registration. THP drains spawned work when
+  the main script ends, including after an uncaught exception.
+- No runnable work and no possible timer or I/O wakeup is a deadlock. At drain, an
+  unobserved failed coroutine fails the request; the earliest coroutine ID is
+  primary and later failures are suppressed.
 
 ## Runtime integration boundary
 
-This proposal does not import True Async's list of coroutine-aware PHP
-functions as a THP compatibility promise. No I/O operation in this checkout is
-implemented as an Async suspension point. Each THP runtime adapter must document
-the operations it supports; calling an unsupported blocking operation inside a
-coroutine blocks the scheduler thread.
+This contract does not import True Async's coroutine-aware PHP functions as a
+THP compatibility promise. An issued OS file write can finish after its
+coroutine is cancelled. Hard request limits keep their existing policy-failure
+behavior; instruction and heap budgets cover every coroutine in the request.
+The public C ABI remains version 1.
 
 ## Design background
 
@@ -96,6 +109,6 @@ contract, and cooperative cancellation are adapted from
 adds generic result types and retains an explicit scheduler-registration API so
 applications can choose the runtime before creating work.
 
-This proposal covers the core execution model. Structured concurrency,
+This contract covers the core execution model. Structured concurrency,
 channels, futures, context propagation, and parallel worker APIs remain future
 design work rather than implied parts of this contract.

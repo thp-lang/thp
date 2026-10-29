@@ -9,22 +9,38 @@ typeParameters:
   - name: K
     description: The key type preserved from the wrapped iterator.
   - name: TIn
-    description: The TIn type parameter.
+    description: Input node value type.
   - name: TOut
-    description: The TOut type parameter.
+    description: Output node value type fixed by mode and flags.
 interfaces:
   - id: std.spl.RecursiveIterator
     arguments:
       - K
       - TOut
-constants: []
+constants:
+  - name: MATCH
+    type: int
+    description: Filters matching values.
+  - name: GET_MATCH
+    type: int
+    description: Yields first capture maps.
+  - name: ALL_MATCHES
+    type: int
+    description: Yields all capture maps.
+  - name: SPLIT
+    type: int
+    description: Yields split parts.
+  - name: REPLACE
+    type: int
+    description: Yields replacement results.
+  - name: USE_KEY
+    type: int
+    description: Filters by string keys.
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: The VM applies the same constant modes and flags as RegexIterator to recursive entries.
+version: "0.11"
 ---
 
 `RecursiveRegexIterator` applies a regular-expression filter throughout a recursive iterator.
@@ -37,17 +53,22 @@ version: "0.1"
 
 ## Behavior
 
-The regular expression and immutable mode are applied consistently to parent
-and child iterators. Invalid patterns fail during construction.
+The regular expression and immutable mode are applied to each node value and
+all child iterators. A parent with children remains available for traversal
+even when its own value does not match; leaf filters still apply. Result nodes
+carry `RecursiveEntry<K, TOut>` values and wrapped child iterators. Modes,
+flags, and output types follow [`RegexIterator`](thp:std.spl.RegexIterator).
+Invalid patterns fail during construction.
 
 ## Errors
 
-Construction validates the parameters shown above. Cursor operations propagate failures from the wrapped iterator, callback, pattern engine, or filesystem when that dependency is present; each member page identifies the applicable source. Concrete THP error classes remain unsettled.
+Cursor operations propagate failures from the wrapped iterator or PCRE2
+engine at the cursor call site.
 
 ## Example
 
 ```thp
-$matches = new RecursiveRegexIterator<int, string, string>($tree, "/\.thp$/");
+$matches = new RecursiveRegexIterator($tree, '/[.]thp$/');
 ```
 
 The recursive view keeps values that match the THP filename suffix.

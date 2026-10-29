@@ -12,31 +12,40 @@ notice:
   classes remain migration-analysis contracts or proposals.
 ---
 
-| Class                                                    | Purpose                                          |
-| -------------------------------------------------------- | ------------------------------------------------ |
-| [`SplDoublyLinkedList`](thp:std.spl.SplDoublyLinkedList) | Indexed double-ended linked sequence.            |
-| [`SplStack`](thp:std.spl.SplStack)                       | Last-in, first-out stack.                        |
-| [`SplQueue`](thp:std.spl.SplQueue)                       | First-in, first-out queue.                       |
-| [`SplHeap`](thp:std.spl.SplHeap)                         | Base class for value-ordered heaps.              |
-| [`SplMaxHeap`](thp:std.spl.SplMaxHeap)                   | Heap that extracts the greatest value first.     |
-| [`SplMinHeap`](thp:std.spl.SplMinHeap)                   | Heap that extracts the smallest value first.     |
-| [`SplPriorityQueue`](thp:std.spl.SplPriorityQueue)       | Heap ordered by explicit priorities.             |
-| [`SplFixedArray`](thp:std.spl.SplFixedArray)             | Contiguous storage with an explicit size.        |
-| [`FixedSequence`](thp:std.dataStructures.FixedSequence)  | Native indexed nullable sequence.                |
-| [`LinkedList`](thp:std.dataStructures.LinkedList)        | Native double-ended sequence.                    |
-| [`Queue`](thp:std.dataStructures.Queue)                  | Native FIFO sequence.                            |
-| [`Stack`](thp:std.dataStructures.Stack)                  | Native LIFO sequence.                            |
-| [`MaxHeap`](thp:std.dataStructures.MaxHeap)              | Greatest-first value queue.                      |
-| [`MinHeap`](thp:std.dataStructures.MinHeap)              | Least-first value queue.                         |
-| [`PriorityQueue`](thp:std.dataStructures.PriorityQueue)  | Integer-priority value queue.                    |
-| [`TypedMap`](thp:std.dataStructures.TypedMap)            | Mutable typed map wrapper.                       |
-| [`ObjectStorage`](thp:std.dataStructures.ObjectStorage)  | Object-identity data association.                |
-| [`ArrayObject`](thp:std.spl.ArrayObject)                 | Object wrapper around array-like storage.        |
-| [`SplObjectStorage`](thp:std.spl.SplObjectStorage)       | Object-identity set with optional attached data. |
+| Class                                                    | Purpose                                                |
+| -------------------------------------------------------- | ------------------------------------------------------ |
+| [`SplDoublyLinkedList`](thp:std.spl.SplDoublyLinkedList) | Indexed double-ended linked sequence.                  |
+| [`SplStack`](thp:std.spl.SplStack)                       | Last-in, first-out stack.                              |
+| [`SplQueue`](thp:std.spl.SplQueue)                       | First-in, first-out queue.                             |
+| [`SplHeap`](thp:std.spl.SplHeap)                         | Base class for value-ordered heaps.                    |
+| [`SplMaxHeap`](thp:std.spl.SplMaxHeap)                   | Heap that extracts the greatest value first.           |
+| [`SplMinHeap`](thp:std.spl.SplMinHeap)                   | Heap that extracts the smallest value first.           |
+| [`SplPriorityQueue`](thp:std.spl.SplPriorityQueue)       | Heap ordered by explicit priorities.                   |
+| [`SplFixedArray`](thp:std.spl.SplFixedArray)             | Contiguous storage with an explicit size.              |
+| [`FixedSequence`](thp:std.dataStructures.FixedSequence)  | Explicitly sized, resizable nullable slots.            |
+| [`LinkedList`](thp:std.dataStructures.LinkedList)        | Native double-ended sequence.                          |
+| [`Queue`](thp:std.dataStructures.Queue)                  | Native FIFO sequence.                                  |
+| [`Stack`](thp:std.dataStructures.Stack)                  | Native LIFO sequence.                                  |
+| [`MaxHeap`](thp:std.dataStructures.MaxHeap)              | Greatest-first value queue.                            |
+| [`MinHeap`](thp:std.dataStructures.MinHeap)              | Least-first value queue.                               |
+| [`PriorityQueue`](thp:std.dataStructures.PriorityQueue)  | Integer-priority value queue.                          |
+| [`TypedMap`](thp:std.dataStructures.TypedMap)            | Shared mutable object around a typed map.              |
+| [`ObjectStorage`](thp:std.dataStructures.ObjectStorage)  | Object-only identity association and object iteration. |
+| [`ArrayObject`](thp:std.spl.ArrayObject)                 | Object wrapper around array-like storage.              |
+| [`SplObjectStorage`](thp:std.spl.SplObjectStorage)       | Object-identity set with optional attached data.       |
 
 `SplFixedArray` and `ArrayObject` are retained only as PHP migration-analysis
 placeholders. THP uses `FixedSequence<T>` for a sequence with an explicit size
 and `TypedMap<K, V>` for a mutable map wrapper.
+
+Choose a native vector unless explicitly sized nullable slots and clearing without
+shifting positions are required; see [`FixedSequence`](thp:std.dataStructures.FixedSequence).
+Native maps are already typed copy-on-write values.
+[`TypedMap`](thp:std.dataStructures.TypedMap) adds shared object mutation, while
+[`ObjectStorage`](thp:std.dataStructures.ObjectStorage) overlaps with object-keyed
+maps and adds object-only runtime validation and object iteration. It strongly
+retains attached objects and data. None of these wrappers implies lower memory
+use or faster execution; their type pages describe current implementation costs.
 
 ## See also
 

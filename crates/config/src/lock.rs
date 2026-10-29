@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub const LOCK_FILE_NAME: &str = "thp.lock";
-pub const LOCK_VERSION: u32 = 1;
+pub const LOCK_VERSION: u32 = 2;
 const HEADER: &str = "THP-LOCK";
 
 /// The result of generating a lock file.
@@ -125,6 +125,7 @@ pub struct ParsedExtension<'a> {
 pub struct ParsedProfile<'a> {
     pub target: Option<&'a str>,
     pub runtime: RuntimeConfig,
+    pub extension_libraries: Vec<(&'a str, &'a str)>,
     pub extensions: Vec<ParsedExtension<'a>>,
 }
 
@@ -161,6 +162,16 @@ impl ParsedLock<'_> {
                 .collect();
             ResolvedProfile {
                 runtime: value.runtime,
+                extension_libraries: value
+                    .extension_libraries
+                    .into_iter()
+                    .map(|(name, path)| {
+                        (
+                            ExtensionName::new(name).expect("lock parser validated library name"),
+                            PathBuf::from(path),
+                        )
+                    })
+                    .collect(),
                 extensions,
             }
         }
@@ -578,6 +589,22 @@ fn encode_profile(output: &mut Vec<u8>, target: Option<&str>, profile: &Resolved
         profile.runtime.max_execution
     )
     .expect("writing to Vec cannot fail");
+    writeln!(
+        output,
+        "extension-libraries {}",
+        profile.extension_libraries.len()
+    )
+    .expect("writing to Vec cannot fail");
+    for (name, path) in &profile.extension_libraries {
+        writeln!(
+            output,
+            "extension-library {name} {}",
+            path.to_string_lossy().len()
+        )
+        .expect("writing to Vec cannot fail");
+        output.extend_from_slice(path.to_string_lossy().as_bytes());
+        output.push(b'\n');
+    }
     for (name, extension) in &profile.extensions {
         let payload = extension.raw_toml().as_bytes();
         writeln!(output, "extension {name} {}", payload.len()).expect("writing to Vec cannot fail");
@@ -776,6 +803,40 @@ fn parse_profile<'a>(
     let max_open_handles = parse_count_record(cursor, "request.max_open_handles")?;
     let max_input = parse_time_record(cursor, "time.max_input")?;
     let max_execution = parse_time_record(cursor, "time.max_execution")?;
+    let count = count_header(cursor.line("extension libraries")?, "extension-libraries")
+        .ok_or_else(|| cursor.error(None, "invalid extension-libraries record"))?;
+    let mut extension_libraries = Vec::new();
+    let mut previous_library: Option<&str> = None;
+    for _ in 0..count {
+        let offset = cursor.position;
+        let header = cursor.line("extension library")?;
+        let fields = header.split(' ').collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0] != "extension-library" {
+            return Err(cursor.error_at(offset, None, "invalid extension-library record"));
+        }
+        let name = fields[1];
+        ExtensionName::new(name).map_err(|message| {
+            cursor.error_at(offset, Some(format!("extension_libraries.{name}")), message)
+        })?;
+        if previous_library.is_some_and(|previous| previous >= name) {
+            return Err(cursor.error_at(
+                offset,
+                Some(format!("extension_libraries.{name}")),
+                "extension libraries must be unique and lexicographically ordered",
+            ));
+        }
+        let length = parse_canonical_u64(fields[2])
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                cursor.error_at(offset, None, "invalid extension library path length")
+            })?;
+        let path = cursor.payload(length, "extension library path")?;
+        if path.is_empty() {
+            return Err(cursor.error_at(offset, None, "extension library path must not be empty"));
+        }
+        previous_library = Some(name);
+        extension_libraries.push((name, path));
+    }
     let mut extensions = Vec::new();
     let mut previous_extension: Option<&str> = None;
     loop {
@@ -822,6 +883,7 @@ fn parse_profile<'a>(
             max_input,
             max_execution,
         },
+        extension_libraries,
         extensions,
     })
 }

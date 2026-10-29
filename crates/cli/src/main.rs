@@ -157,7 +157,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
             let opcache = option_value(&arguments, "--opcache").unwrap_or("off");
             let frozen = arguments.iter().any(|argument| argument == "--frozen");
             let project_mode = project_root.join("thp.toml").is_file();
-            let (source, bytecode, mut metrics) = if frozen {
+            let (source, bytecode, mut metrics, native_registry) = if frozen {
                 if !project_mode {
                     return Err("`run --frozen` requires a project `thp.toml`".to_owned());
                 }
@@ -174,7 +174,12 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                     .get(prepared.entry_source)
                     .expect("prepared entry source exists")
                     .clone();
-                (source, prepared.bytecode, Metrics::default())
+                (
+                    source,
+                    prepared.bytecode,
+                    Metrics::default(),
+                    Some(prepared.native_registry),
+                )
             } else if project_mode {
                 let request = ProjectRequest::new(&project_root, &path);
                 let compilation = if opcache == "off" {
@@ -198,6 +203,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                         .bytecode
                         .expect("successful compilation has bytecode"),
                     compilation.metrics,
+                    Some(compilation.native_registry),
                 )
             } else if opcache == "off" {
                 let compilation = load_compilation(path)?;
@@ -208,6 +214,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                         .bytecode
                         .expect("successful compilation has bytecode"),
                     compilation.metrics,
+                    None,
                 )
             } else {
                 let cached = compile_path_cached(path, &Store::new(opcache), b"")
@@ -221,10 +228,18 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                         .bytecode
                         .expect("successful cached compilation has bytecode"),
                     cached.metrics,
+                    None,
                 )
             };
+            if engine == "jit" && !bytecode.native_functions.is_empty() {
+                return Err("native extension calls require the VM engine".to_owned());
+            }
+            let _native_scope = native_registry.as_ref().map(thp_native::Registry::activate);
             let use_jit = engine == "jit"
-                || (engine == "auto" && max_instructions.is_none() && thp_jit::supports(&bytecode));
+                || (engine == "auto"
+                    && max_instructions.is_none()
+                    && bytecode.native_functions.is_empty()
+                    && thp_jit::supports(&bytecode));
             let stdout = io::stdout();
             let mut output = stdout.lock();
             if use_jit {

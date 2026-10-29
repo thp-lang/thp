@@ -5,13 +5,18 @@ use thp_config::parse_lock;
 fn lock_with_unparsed_extension() -> Vec<u8> {
     let payload = "[".repeat(64 * 1024);
     format!(
-        "THP-LOCK 1\n\
+        "THP-LOCK 2\n\
          fingerprint {}\n\
+         package-roots 0\n\
+         autoload 0\n\
          profile common\n\
          memory.limit 134217728\n\
          request.post_max_size 8388608\n\
+         request.max_stack_depth 512\n\
+         request.max_open_handles 256\n\
          time.max_input 60\n\
          time.max_execution 30\n\
+         extension-libraries 0\n\
          extension example {}\n\
          {}\n\
          end-profile\n\

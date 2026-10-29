@@ -15,10 +15,7 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  Coroutine is a proposed runtime class and is not implemented in this repository.
-  State transitions and cancellation failure types may change.
+availability: implemented
 version: "0.1"
 ---
 
@@ -30,8 +27,8 @@ lifecycle of one scheduled callable and implements the one-shot
 
 ## Construction
 
-`Coroutine` has no public constructor. [`async()`](thp:std.async.async) asks the active
-scheduler to create and enqueue it.
+`Coroutine` has no public constructor. [`async()`](thp:std.async.async) enqueues
+it in the request-owned runtime before its body starts.
 
 ## Lifecycle
 
@@ -51,12 +48,17 @@ and suspended many times.
 ## Errors
 
 The callable's throwable is stored as the coroutine's failed outcome and is
-re-thrown by [`await()`](thp:std.async.await). Cancellation produces a distinct failure,
-but its concrete type is not yet established.
+re-thrown by [`await()`](thp:std.async.await). Uncaught cancellation stores
+`CancellationException`; catching it and returning stores the returned value.
 
-Dropping the last handle to a failed, unobserved coroutine must report the
-failure through a runtime-level unhandled-coroutine mechanism. The exact
-reporting hook remains part of the runtime design.
+When the main script ends, including after an uncaught exception, THP drains
+spawned work. An unobserved failed
+coroutine fails the request at drain. The lowest coroutine ID supplies the
+primary failure; subsequent failures are attached as suppressed errors. Calling
+`await()` or `result()` observes the failure even when it throws. State queries
+and completion notifications alone do not observe it.
+When a failed coroutine wins as an `await()` cancellation source, its failure
+is observed through the resulting `WaitCancelledException` cause.
 
 ## Example
 

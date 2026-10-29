@@ -2,7 +2,7 @@
 kind: function
 id: std.async.await
 title: await
-summary: Waits for a coroutine and returns its result.
+summary: Waits for a one-shot completion and returns its result.
 name: await
 order: 11
 typeParameters:
@@ -22,21 +22,14 @@ returns:
     The operation's successful value of type T. For a Coroutine, this is the
     value returned by the callable passed to async().
 errors:
-  - description:
-      If $awaitable failed, await() rethrows its stored failure in the awaiting
-      context. A cancelled $awaitable produces the Async cancellation failure.
-      Completion of $cancellation produces a distinct wait-cancelled failure, with the
-      source failure available as its cause. Concrete failure types are not yet
-      finalized.
-  - description:
-      The call also fails if pending work cannot be driven because no scheduler
-      is registered.
+  - description: A failed target rethrows its stored Throwable; cancellation of
+      the target throws CancellationException.
+  - description: If the cancellation source wins, WaitCancelledException carries
+      its stored failure as the cause when it failed and leaves the target running.
+  - description: A pending target without registration throws Error at this call site.
 related: []
 status: experimental
-availability: proposed
-notice:
-  await() is proposed and is not implemented in this repository. Cancellation and
-  concrete error types are not finalized.
+availability: implemented
 version: "0.1"
 module: async
 ---
@@ -46,24 +39,27 @@ result.
 
 ## Behavior
 
-If `$awaitable` is still pending, `await()` suspends the current coroutine so
-the scheduler can run other work. Execution resumes when `$awaitable`
-completes. Awaiting an already completed operation returns its stored result
-immediately.
+If `$awaitable` is still pending, `await()` requires registration, subscribes
+to the target and optional cancellation source, and suspends the current
+coroutine. The first terminal notification processed wins. THP removes the
+losing subscription before resuming. An already completed result can be read
+without registration.
 
-At top level, where there is no calling coroutine to suspend, `await()` gives
-control to the registered scheduler until the requested operation completes.
+After registration the main script is the root coroutine; its `await()` yields
+to the scheduler just like a spawned coroutine.
 
 A completed operation may be awaited more than once. Each call observes the
 same result or failure.
 
-If `$cancellation` completes first, the current call stops waiting. This does
-not automatically cancel `$awaitable`; call its `cancel()` method when the
-underlying operation should also be asked to stop.
+If `$cancellation` completes first, this call throws `WaitCancelledException`
+with the source failure as its cause. It does not cancel `$awaitable`.
+The winning source's failure counts as observed for request-end error reporting.
 
 ## Example
 
 ```thp
+<?thp
+
 scheduler_register_default();
 
 $answer = async(calculateAnswer(...));

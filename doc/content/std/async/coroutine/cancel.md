@@ -2,10 +2,7 @@
 kind: method
 id: std.async.Coroutine::cancel
 title: Coroutine::cancel
-summary:
-  Requests cancellation. A running coroutine receives the cancellation failure at
-  its next suspension point, and its finally blocks still execute. Calling cancel()
-  after terminal completion has no effect.
+summary: Idempotently requests cancellation without skipping cleanup.
 name: cancel
 order: 8
 typeParameters: []
@@ -19,21 +16,21 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
 version: "0.1"
 owner: std.async.Coroutine
 visibility: public
 modifiers: []
 ---
 
-[`Coroutine`](thp:std.async.Coroutine)`::cancel()` requests cancellation. A running coroutine receives the cancellation failure at its next suspension point, and its finally blocks still execute. Calling cancel() after terminal completion has no effect.
+[`Coroutine`](thp:std.async.Coroutine)`::cancel()` requests cancellation idempotently.
 
 ## Behavior
 
-Requests cancellation. A running coroutine receives the cancellation failure at its next suspension point, and its finally blocks still execute. Calling cancel() after terminal completion has no effect.
+If queued, the body never starts. If running or suspended, the coroutine receives
+`CancellationException` at its next suspension checkpoint. `finally` and `using`
+cleanup execute. If the exception is caught and the body returns, the coroutine
+completes successfully. Cancelling an already terminal coroutine has no effect.
 
 This operation may update receiver or resource state; the change is observable by later calls.
 

@@ -204,6 +204,40 @@ pub enum NominalKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Builtin {
+    Native(u32),
+    SchedulerRegisterDefault,
+    SchedulerRegister,
+    SchedulerIsRegistered,
+    Async,
+    Await,
+    Suspend,
+    Delay,
+    Timeout,
+    CoroutineCancel,
+    CoroutineGetId,
+    CoroutineIsStarted,
+    CoroutineIsQueued,
+    CoroutineIsRunning,
+    CoroutineIsSuspended,
+    CoroutineIsCompleted,
+    CoroutineIsCancelled,
+    CoroutineSubscribe,
+    CoroutineResult,
+    TimeoutCancel,
+    TimeoutIsCompleted,
+    TimeoutIsCancelled,
+    TimeoutSubscribe,
+    TimeoutResult,
+    PregMatch,
+    PregReplace,
+    PregSplit,
+    RegexCaptureText,
+    RegexCaptureOffset,
+    RegexIteratorConstruct,
+    RegexIteratorGetInner,
+    RegexIteratorGetRegex,
+    RegexIteratorGetMode,
+    RegexIteratorGetPregFlags,
     Count,
     IteratorFromCollection,
     IteratorConstruct,
@@ -677,7 +711,17 @@ pub enum Callee {
 pub struct Module {
     pub functions: Vec<Function>,
     pub classes: Vec<Class>,
+    pub native_functions: Vec<NativeSignature>,
     pub entry: FunctionId,
+}
+
+/// A fixed native callable signature retained in verified bytecode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSignature {
+    pub name: String,
+    pub parameters: Vec<Type>,
+    pub return_type: Type,
+    pub library_digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1056,6 +1100,7 @@ pub struct LowerOutput {
 #[derive(Clone, Debug, PartialEq)]
 struct Signature {
     id: FunctionId,
+    native_index: Option<u32>,
     parameters: Vec<ParameterSignature>,
     return_type: Type,
     span: Span,
@@ -1135,7 +1180,15 @@ pub fn lower_with_modules(
     program: &Program,
     declaration_modules: &BTreeMap<String, String>,
 ) -> LowerOutput {
-    TypeChecker::new(program, declaration_modules).lower(program)
+    lower_with_native_functions(program, declaration_modules, &[])
+}
+
+pub fn lower_with_native_functions(
+    program: &Program,
+    declaration_modules: &BTreeMap<String, String>,
+    native_functions: &[NativeSignature],
+) -> LowerOutput {
+    TypeChecker::new(program, declaration_modules, native_functions).lower(program)
 }
 
 /// Lowers a linked project whose syntax spans already carry their [`SourceId`]
@@ -1156,19 +1209,55 @@ struct TypeChecker {
     method_slots: BTreeMap<String, MethodSlot>,
     declaration_modules: BTreeMap<String, String>,
     closures: Rc<RefCell<Vec<Option<Function>>>>,
+    native_functions: Vec<NativeSignature>,
 }
 
 impl TypeChecker {
-    fn new(_program: &Program, declaration_modules: &BTreeMap<String, String>) -> Self {
+    fn new(
+        _program: &Program,
+        declaration_modules: &BTreeMap<String, String>,
+        native_functions: &[NativeSignature],
+    ) -> Self {
+        let signatures = native_functions
+            .iter()
+            .enumerate()
+            .map(|(index, function)| {
+                (
+                    function.name.clone(),
+                    Signature {
+                        id: FunctionId(0),
+                        native_index: Some(
+                            u32::try_from(index).expect("native function index fits u32"),
+                        ),
+                        parameters: function
+                            .parameters
+                            .iter()
+                            .enumerate()
+                            .map(|(index, ty)| {
+                                native_parameter(
+                                    &format!("arg{index}"),
+                                    ty.clone(),
+                                    None,
+                                    Span::default(),
+                                )
+                            })
+                            .collect(),
+                        return_type: function.return_type.clone(),
+                        span: Span::default(),
+                    },
+                )
+            })
+            .collect();
         Self {
             diagnostics: Vec::new(),
-            signatures: BTreeMap::new(),
+            signatures,
             classes: native_nominals(),
             functions: vec![None],
             pending_methods: Vec::new(),
             method_slots: BTreeMap::new(),
             declaration_modules: declaration_modules.clone(),
             closures: Rc::new(RefCell::new(Vec::new())),
+            native_functions: native_functions.to_vec(),
         }
     }
 
@@ -1381,6 +1470,7 @@ impl TypeChecker {
             module: Module {
                 functions,
                 classes,
+                native_functions: self.native_functions,
                 entry,
             },
             diagnostics: self.diagnostics,
@@ -1724,6 +1814,7 @@ impl TypeChecker {
                 declaration.name.clone(),
                 Signature {
                     id,
+                    native_index: None,
                     parameters,
                     return_type,
                     span: declaration.name_span,
@@ -1866,6 +1957,7 @@ impl TypeChecker {
                 };
                 let signature = Signature {
                     id,
+                    native_index: None,
                     parameters,
                     return_type,
                     span: method.function.name_span,
@@ -3673,6 +3765,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             }
             ExprKind::Name(name) => {
                 if let Some(signature) = self.signatures.get(name)
+                    && signature.native_index.is_none()
                     && signature
                         .parameters
                         .iter()
@@ -4072,6 +4165,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             | "ParentIterator"
                             | "RecursiveCallbackFilterIterator"
                             | "CallbackFilterIterator"
+                            | "RegexIterator"
+                            | "RecursiveRegexIterator"
                             | "TraceLine"
                             | "SplFileInfo"
                             | "SplFileObject"
@@ -4159,6 +4254,42 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 } else {
                     self.bind_arguments("__construct", arguments, &[], expression.span)
                 };
+                if matches!(
+                    class.name.as_str(),
+                    "RegexIterator" | "RecursiveRegexIterator"
+                ) {
+                    let constant = |index| {
+                        arguments
+                            .explicit
+                            .iter()
+                            .chain(&arguments.defaults)
+                            .find(|argument| argument.target == ArgumentTarget::Parameter(index))
+                            .and_then(|argument| match argument.value.kind {
+                                TypedExprKind::Integer(value) => Some(value),
+                                _ => None,
+                            })
+                    };
+                    let mode = constant(2);
+                    let flags = constant(4);
+                    let valid = if let (
+                        Type::Nominal {
+                            arguments: types, ..
+                        },
+                        Some(mode),
+                        Some(flags),
+                    ) = (&instance_type, mode, flags)
+                    {
+                        types.len() == 3
+                            && regex_output_type(mode, flags, &types[1]).as_ref() == Some(&types[2])
+                            && (mode != 5 || types[0] == Type::String)
+                    } else {
+                        false
+                    };
+                    if !valid {
+                        self.diagnostics.push(Diagnostic::error("typing", "T1020", expression.span,
+                            "regex iterator requires constant mode and flags with matching input and output types"));
+                    }
+                }
                 (
                     TypedExprKind::New {
                         class: class.id,
@@ -4557,25 +4688,32 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_CURRENT") => 8,
                     ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_INNER") => 16,
                     ("CachingIterator" | "RecursiveCachingIterator", "FULL_CACHE") => 256,
-                    ("OpenMode", "Read")
+                    ("RegexIterator" | "RecursiveRegexIterator", "MATCH")
+                    | ("OpenMode", "Read")
                     | ("WriteMode", "OpenExisting")
                     | ("SeekFrom", "Start")
                     | ("RecursiveIteratorIterator", "LEAVES_ONLY") => 0,
-                    ("OpenMode", "Write")
+                    ("RegexIterator" | "RecursiveRegexIterator", "GET_MATCH")
+                    | ("OpenMode", "Write")
                     | ("WriteMode", "Truncate")
                     | ("SeekFrom", "Current")
                     | ("CachingIterator" | "RecursiveCachingIterator", "CALL_TOSTRING")
                     | ("RecursiveIteratorIterator", "SELF_FIRST") => 1,
-                    ("OpenMode", "ReadWrite")
+                    ("RegexIterator" | "RecursiveRegexIterator", "ALL_MATCHES")
+                    | ("OpenMode", "ReadWrite")
                     | ("WriteMode", "Append")
                     | ("SeekFrom", "End")
                     | ("CachingIterator" | "RecursiveCachingIterator", "CATCH_GET_CHILD")
                     | ("RecursiveIteratorIterator", "CHILD_FIRST") => 2,
-                    ("OpenMode", "Append") | ("WriteMode", "Create") => 3,
-                    ("OpenMode", "ReadWriteTruncate")
+                    ("RegexIterator" | "RecursiveRegexIterator", "SPLIT")
+                    | ("OpenMode", "Append")
+                    | ("WriteMode", "Create") => 3,
+                    ("RegexIterator" | "RecursiveRegexIterator", "REPLACE")
+                    | ("OpenMode", "ReadWriteTruncate")
                     | ("WriteMode", "CreateExclusive")
                     | ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_KEY") => 4,
-                    ("OpenMode", "ReadWriteAppend") => 5,
+                    ("RegexIterator" | "RecursiveRegexIterator", "USE_KEY")
+                    | ("OpenMode", "ReadWriteAppend") => 5,
                     ("OpenMode", "CreateExclusive") => 6,
                     _ => {
                         self.diagnostics.push(Diagnostic::error(
@@ -4595,6 +4733,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         | "CachingIterator"
                         | "RecursiveCachingIterator"
                         | "RecursiveIteratorIterator"
+                        | "RegexIterator"
+                        | "RecursiveRegexIterator"
                 ) {
                     self.diagnostics.push(Diagnostic::error(
                         "name_resolution",
@@ -5068,6 +5208,213 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         span: Span,
         expected: Option<&Type>,
     ) -> Option<TypedExpr> {
+        if name == "async" {
+            return self.lower_async_call(arguments, span);
+        }
+        if name == "await" {
+            let parameters = [
+                native_parameter("target", Type::Mixed, None, span),
+                native_parameter("cancellation", Type::Mixed, Some(ExprKind::Null), span),
+            ];
+            let bound = self.bind_arguments(name, arguments, &parameters, span);
+            let target = bound
+                .explicit
+                .iter()
+                .find(|argument| argument.target == ArgumentTarget::Parameter(0))?;
+            let result = instantiated_ancestor(&target.value.ty, "Completable", self.classes)
+                .and_then(|ty| match ty {
+                    Type::Nominal { arguments, .. } => arguments.into_iter().next(),
+                    _ => None,
+                });
+            let Some(result) = result else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    target.value.span,
+                    format!(
+                        "`await` requires `Completable<T>`, found `{}`",
+                        target.value.ty
+                    ),
+                ));
+                return None;
+            };
+            if let Some(cancellation) = bound
+                .explicit
+                .iter()
+                .find(|argument| argument.target == ArgumentTarget::Parameter(1))
+                && cancellation.value.ty != Type::Null
+                && instantiated_ancestor(&cancellation.value.ty, "Completable", self.classes)
+                    .is_none()
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    cancellation.value.span,
+                    "`await` cancellation source must be `Completable<T>` or null",
+                ));
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(Builtin::Await),
+                    arguments: bound,
+                },
+                ty: result,
+                span,
+            });
+        }
+        let async_function = match name {
+            "scheduler_register_default" => {
+                Some((Builtin::SchedulerRegisterDefault, vec![], Type::Void))
+            }
+            "scheduler_register" => Some((
+                Builtin::SchedulerRegister,
+                vec![native_parameter(
+                    "scheduler",
+                    Type::Object("SchedulerInterface".to_owned()),
+                    None,
+                    span,
+                )],
+                Type::Void,
+            )),
+            "scheduler_is_registered" => Some((Builtin::SchedulerIsRegistered, vec![], Type::Bool)),
+            "suspend" => Some((Builtin::Suspend, vec![], Type::Void)),
+            "delay" => Some((
+                Builtin::Delay,
+                vec![native_parameter("milliseconds", Type::Int, None, span)],
+                Type::Void,
+            )),
+            "timeout" => Some((
+                Builtin::Timeout,
+                vec![native_parameter("milliseconds", Type::Int, None, span)],
+                Type::Object("Timeout".to_owned()),
+            )),
+            _ => None,
+        };
+        if let Some((builtin, parameters, ty)) = async_function {
+            let arguments = self.bind_arguments(name, arguments, &parameters, span);
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    arguments,
+                },
+                ty,
+                span,
+            });
+        }
+        if matches!(name, "preg_match" | "preg_replace" | "preg_split") {
+            let mut parameters = vec![
+                native_parameter("pattern", Type::String, None, span),
+                native_parameter(
+                    if name == "preg_replace" {
+                        "replacement"
+                    } else {
+                        "subject"
+                    },
+                    Type::String,
+                    None,
+                    span,
+                ),
+            ];
+            if name == "preg_replace" {
+                parameters.push(native_parameter("subject", Type::String, None, span));
+                parameters.push(native_parameter(
+                    "limit",
+                    Type::Int,
+                    Some(ExprKind::Integer(-1)),
+                    span,
+                ));
+            } else if name == "preg_split" {
+                parameters.push(native_parameter(
+                    "limit",
+                    Type::Int,
+                    Some(ExprKind::Integer(-1)),
+                    span,
+                ));
+                parameters.push(native_parameter(
+                    "flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    span,
+                ));
+            } else {
+                parameters.push(native_parameter(
+                    "flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    span,
+                ));
+            }
+            let bound = self.bind_arguments(name, arguments, &parameters, span);
+            let flags = if name == "preg_replace" {
+                0
+            } else {
+                let index = if name == "preg_match" { 2 } else { 3 };
+                let value = bound
+                    .explicit
+                    .iter()
+                    .chain(&bound.defaults)
+                    .find(|argument| argument.target == ArgumentTarget::Parameter(index));
+                match value.map(|argument| &argument.value.kind) {
+                    Some(TypedExprKind::Integer(value)) if *value >= 0 => *value,
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0319",
+                            span,
+                            "regex flags must be a non-negative integer constant",
+                        ));
+                        0
+                    }
+                }
+            };
+            let allowed = if name == "preg_match" {
+                256 | 512
+            } else {
+                1 | 2 | 4
+            };
+            if name != "preg_replace" && flags & !allowed != 0 {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0319",
+                    span,
+                    format!("unsupported regex flags {flags}"),
+                ));
+            }
+            let result = match name {
+                "preg_match" => {
+                    let capture = if flags & 256 != 0 {
+                        Type::Object("RegexCapture".to_owned())
+                    } else if flags & 512 != 0 {
+                        normalize_union(vec![Type::String, Type::Null])
+                    } else {
+                        Type::String
+                    };
+                    normalize_union(vec![
+                        Type::Map(Box::new(Type::String), Box::new(capture)),
+                        Type::Null,
+                    ])
+                }
+                "preg_split" => Type::Vector(Box::new(if flags & 4 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else {
+                    Type::String
+                })),
+                _ => Type::String,
+            };
+            let builtin = match name {
+                "preg_match" => Builtin::PregMatch,
+                "preg_split" => Builtin::PregSplit,
+                _ => Builtin::PregReplace,
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    arguments: bound,
+                },
+                ty: result,
+                span,
+            });
+        }
         if matches!(name, "serialize" | "unserialize") {
             let parameter_type = if name == "serialize" {
                 Type::Mixed
@@ -5253,10 +5600,106 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         let arguments = self.bind_arguments(name, arguments, &signature.parameters, span);
         Some(TypedExpr {
             kind: TypedExprKind::Call {
-                callee: Callee::Function(signature.id),
+                callee: signature
+                    .native_index
+                    .map_or(Callee::Function(signature.id), |index| {
+                        Callee::Builtin(Builtin::Native(index))
+                    }),
                 arguments,
             },
             ty: signature.return_type.clone(),
+            span,
+        })
+    }
+
+    fn lower_async_call(&mut self, arguments: &[Argument], span: Span) -> Option<TypedExpr> {
+        let Some(function) = arguments.first() else {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0304",
+                span,
+                "missing callable for `async`",
+            ));
+            return None;
+        };
+        if let Some(name) = &function.name
+            && name != "function"
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0314",
+                function.name_span.unwrap_or(function.span),
+                format!("unknown named argument `{name}` for `async`"),
+            ));
+        }
+        let callback = self.lower_expression(&function.value, None)?;
+        let Type::Callable(parameters, result) = &callback.ty else {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0302",
+                callback.span,
+                "`async` requires a statically typed callable",
+            ));
+            return None;
+        };
+        let parameters = parameters.clone();
+        let result = result.as_ref().clone();
+        if arguments.len() - 1 != parameters.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0303",
+                span,
+                format!(
+                    "`async` callable expects {} arguments, found {}",
+                    parameters.len(),
+                    arguments.len() - 1
+                ),
+            ));
+        }
+        let mut explicit = vec![BoundArgument {
+            target: ArgumentTarget::Parameter(0),
+            value: callback,
+        }];
+        for (index, argument) in arguments.iter().enumerate().skip(1) {
+            if argument.name.is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0318",
+                    argument.name_span.unwrap_or(argument.span),
+                    "named arguments cannot target `async` callable arguments",
+                ));
+            } else if function.name.is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0313",
+                    argument.span,
+                    "positional arguments cannot follow named arguments",
+                ));
+            }
+            let value = self.lower_expression(&argument.value, parameters.get(index - 1))?;
+            if let Some(expected) = parameters.get(index - 1) {
+                self.expect_type(expected, &value.ty, value.span);
+            }
+            explicit.push(BoundArgument {
+                target: ArgumentTarget::Parameter(index),
+                value,
+            });
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::Call {
+                callee: Callee::Builtin(Builtin::Async),
+                arguments: BoundArguments {
+                    explicit,
+                    defaults: Vec::new(),
+                    parameter_count: arguments.len(),
+                    variadic_parameter: None,
+                    variadic_type: None,
+                },
+            },
+            ty: Type::Nominal {
+                name: "Coroutine".to_owned(),
+                arguments: vec![result],
+            },
             span,
         })
     }
@@ -5551,6 +5994,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         let mut next = 0;
         let mut occupied = vec![false; parameters.len()];
         let mut inferred = BTreeMap::<TypeParameterId, Type>::new();
+        let mut regex_mode = Some(0);
+        let mut regex_flags = Some(0);
         let class_parameters = class
             .type_parameters
             .iter()
@@ -5594,9 +6039,27 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             let Some(value) = self.lower_expression(&argument.value, None) else {
                 continue;
             };
+            if matches!(
+                class.name.as_str(),
+                "RegexIterator" | "RecursiveRegexIterator"
+            ) {
+                if target == ArgumentTarget::Parameter(2) {
+                    regex_mode = match value.kind {
+                        TypedExprKind::Integer(mode) => Some(mode),
+                        _ => None,
+                    };
+                } else if target == ArgumentTarget::Parameter(4) {
+                    regex_flags = match value.kind {
+                        TypedExprKind::Integer(flags) => Some(flags),
+                        _ => None,
+                    };
+                }
+            }
             let actual = if matches!(
                 class.name.as_str(),
-                "RecursiveIteratorIterator" | "RecursiveCallbackFilterIterator"
+                "RecursiveIteratorIterator"
+                    | "RecursiveCallbackFilterIterator"
+                    | "RecursiveRegexIterator"
             ) && target == ArgumentTarget::Parameter(0)
             {
                 instantiated_ancestor(&value.ty, "RecursiveIterator", self.classes)
@@ -5612,6 +6075,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     | "CachingIterator"
                     | "FilterIterator"
                     | "CallbackFilterIterator"
+                    | "RegexIterator"
             ) && target == ArgumentTarget::Parameter(0)
             {
                 iterator_types(&value.ty, self.classes)
@@ -5625,6 +6089,26 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             };
             if !unify_inference(pattern, &actual, &class_parameters, &mut inferred) {
                 conflict = true;
+            }
+        }
+        if matches!(
+            class.name.as_str(),
+            "RegexIterator" | "RecursiveRegexIterator"
+        ) {
+            let mode = regex_mode.and_then(|mode| {
+                regex_flags.and_then(|flags| {
+                    regex_output_type(mode, flags, inferred.get(&class.type_parameters[1].id)?)
+                })
+            });
+            if let Some(output) = mode {
+                inferred.insert(class.type_parameters[2].id, output);
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1020",
+                    span,
+                    "regex iterator mode and flags must be supported integer constants",
+                ));
             }
         }
         let missing = class
@@ -6877,7 +7361,10 @@ fn resolve_type_with_bound_check(
                         return None;
                     }
                     for (index, argument) in resolved.iter().enumerate() {
-                        if type_contains_void(argument) {
+                        if type_contains_void(argument)
+                            && !(matches!(name.as_str(), "Awaitable" | "Completable" | "Coroutine")
+                                && *argument == Type::Void)
+                        {
                             diagnostics.push(Diagnostic::error(
                                 "typing",
                                 "T1005",
@@ -7429,6 +7916,23 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             None,
             &["OuterIterator"],
         ),
+        ("RegexCapture", NominalKind::Class, false, true, None, &[]),
+        (
+            "RegexIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "RecursiveRegexIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["RecursiveIterator"],
+        ),
         (
             "CallbackFilterIterator",
             NominalKind::Class,
@@ -7889,6 +8393,71 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             None,
             &[],
         ),
+        ("Awaitable", NominalKind::Interface, true, false, None, &[]),
+        (
+            "Completable",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Awaitable"),
+            &[],
+        ),
+        (
+            "SchedulerInterface",
+            NominalKind::Interface,
+            true,
+            false,
+            None,
+            &[],
+        ),
+        (
+            "Coroutine",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Completable"],
+        ),
+        (
+            "Timeout",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Completable"],
+        ),
+        (
+            "CancellationException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "WaitCancelledException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "TimeoutException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "AsyncDeadlockException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
     ];
     let mut classes = specs
         .iter()
@@ -7939,6 +8508,51 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         )
         .collect::<BTreeMap<_, _>>();
 
+    {
+        let class = classes
+            .get_mut("RegexCapture")
+            .expect("native RegexCapture exists");
+        for (index, (name, ty)) in [
+            ("__text", normalize_union(vec![Type::String, Type::Null])),
+            ("__offset", Type::Int),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            class.declared_properties.push(Property {
+                id: PropertyId(u32::try_from(index).expect("capture property index fits")),
+                name: name.to_owned(),
+                ty,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
+    }
+    add_native_method(
+        &mut classes,
+        "RegexCapture",
+        "text",
+        Some(Builtin::RegexCaptureText),
+        false,
+        vec![],
+        normalize_union(vec![Type::String, Type::Null]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RegexCapture",
+        "offset",
+        Some(Builtin::RegexCaptureOffset),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+
     for name in [
         "Traversable",
         "Iterator",
@@ -7964,6 +8578,8 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         "RecursiveFilterIterator",
         "ParentIterator",
         "RecursiveCallbackFilterIterator",
+        "RegexIterator",
+        "RecursiveRegexIterator",
         "Option",
         "FixedSequence",
         "LinkedList",
@@ -7979,7 +8595,9 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         let class = classes
             .get_mut(name)
             .expect("iterator prelude nominal exists");
-        let parameters: &[&str] = if matches!(
+        let parameters: &[&str] = if matches!(name, "RegexIterator" | "RecursiveRegexIterator") {
+            &["K", "TIn", "TOut"]
+        } else if matches!(
             name,
             "VectorIterator"
                 | "Option"
@@ -8062,6 +8680,166 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                 arguments
             },
         });
+    }
+
+    for name in ["RegexIterator", "RecursiveRegexIterator"] {
+        let recursive = name == "RecursiveRegexIterator";
+        let class = classes.get_mut(name).expect("native regex iterator exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|parameter| Type::Parameter {
+                id: parameter.id,
+                name: parameter.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.interface_types = vec![Type::Nominal {
+            name: if recursive {
+                "RecursiveIterator"
+            } else {
+                "Iterator"
+            }
+            .to_owned(),
+            arguments: vec![params[0].clone(), params[2].clone()],
+        }];
+        for (index, (property, ty)) in [
+            (
+                "__inner",
+                Type::Nominal {
+                    name: if recursive {
+                        "RecursiveIterator"
+                    } else {
+                        "Iterator"
+                    }
+                    .to_owned(),
+                    arguments: vec![params[0].clone(), params[1].clone()],
+                },
+            ),
+            ("__pattern", Type::String),
+            ("__mode", Type::Int),
+            ("__invert", Type::Bool),
+            ("__preg_flags", Type::Int),
+            ("__replacement", Type::String),
+            ("__ready", Type::Bool),
+            ("__current", Type::Mixed),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            class.declared_properties.push(Property {
+                id: PropertyId(u32::try_from(index).expect("regex property index fits")),
+                name: property.to_owned(),
+                ty,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
+        let inner = Type::Nominal {
+            name: if recursive {
+                "RecursiveIterator"
+            } else {
+                "Iterator"
+            }
+            .to_owned(),
+            arguments: vec![params[0].clone(), params[1].clone()],
+        };
+        let output = if recursive {
+            Type::Nominal {
+                name: "RecursiveEntry".to_owned(),
+                arguments: vec![params[0].clone(), params[2].clone()],
+            }
+        } else {
+            params[2].clone()
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(Builtin::RegexIteratorConstruct),
+            false,
+            vec![
+                native_parameter("iterator", inner.clone(), None, Span::empty(0)),
+                native_parameter("pattern", Type::String, None, Span::empty(0)),
+                native_parameter(
+                    "mode",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "invert",
+                    Type::Bool,
+                    Some(ExprKind::Bool(false)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "preg_flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "replacement",
+                    Type::String,
+                    Some(ExprKind::String(Vec::new())),
+                    Span::empty(0),
+                ),
+            ],
+            Type::Void,
+            false,
+        );
+        for (method, builtin, ty) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            ("key", Builtin::IteratorKey, params[0].clone()),
+            ("value", Builtin::IteratorValue, output),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                ty,
+                false,
+            );
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "getInnerIterator",
+            Some(Builtin::RegexIteratorGetInner),
+            false,
+            vec![],
+            inner,
+            false,
+        );
+        for (method, builtin, ty) in [
+            ("getRegex", Builtin::RegexIteratorGetRegex, Type::String),
+            ("getMode", Builtin::RegexIteratorGetMode, Type::Int),
+            (
+                "getPregFlags",
+                Builtin::RegexIteratorGetPregFlags,
+                Type::Int,
+            ),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                ty,
+                false,
+            );
+        }
     }
 
     for name in [
@@ -10776,7 +11554,174 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         false,
     );
     add_reflection_api(&mut classes);
+    add_async_api(&mut classes);
     classes
+}
+
+fn add_async_api(classes: &mut BTreeMap<String, ClassSignature>) {
+    let span = Span::empty(0);
+    for name in ["Awaitable", "Completable", "Coroutine"] {
+        let class = classes.get_mut(name).expect("async nominal exists");
+        class.type_parameters.push(TypeParameter {
+            id: TypeParameterId {
+                owner: class.id,
+                index: 0,
+            },
+            name: "T".to_owned(),
+            bound: None,
+            span,
+        });
+    }
+    let complete_parameter = Type::Parameter {
+        id: classes["Completable"].type_parameters[0].id,
+        name: "T".to_owned(),
+    };
+    let coroutine_parameter = Type::Parameter {
+        id: classes["Coroutine"].type_parameters[0].id,
+        name: "T".to_owned(),
+    };
+    classes
+        .get_mut("Completable")
+        .expect("async nominal exists")
+        .parent_type = Some(Type::Nominal {
+        name: "Awaitable".to_owned(),
+        arguments: vec![complete_parameter.clone()],
+    });
+    classes
+        .get_mut("Coroutine")
+        .expect("async nominal exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Completable".to_owned(),
+        arguments: vec![coroutine_parameter.clone()],
+    }];
+    classes
+        .get_mut("Timeout")
+        .expect("async nominal exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Completable".to_owned(),
+        arguments: vec![Type::Mixed],
+    }];
+    let callback = Type::Callable(vec![], Box::new(Type::Void));
+    let notify = vec![native_parameter("notify", callback.clone(), None, span)];
+    for (name, result) in [
+        ("Completable", complete_parameter),
+        ("Coroutine", coroutine_parameter),
+        ("Timeout", Type::Mixed),
+    ] {
+        let abstract_method = name == "Completable";
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineCancel),
+            "Timeout" => Some(Builtin::TimeoutCancel),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "cancel",
+            operation,
+            false,
+            vec![],
+            Type::Void,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineIsCompleted),
+            "Timeout" => Some(Builtin::TimeoutIsCompleted),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "isCompleted",
+            operation,
+            false,
+            vec![],
+            Type::Bool,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineIsCancelled),
+            "Timeout" => Some(Builtin::TimeoutIsCancelled),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "isCancelled",
+            operation,
+            false,
+            vec![],
+            Type::Bool,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineSubscribe),
+            "Timeout" => Some(Builtin::TimeoutSubscribe),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "subscribe",
+            operation,
+            false,
+            notify.clone(),
+            callback.clone(),
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineResult),
+            "Timeout" => Some(Builtin::TimeoutResult),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "result",
+            operation,
+            false,
+            vec![],
+            result,
+            abstract_method,
+        );
+    }
+    for (method, builtin) in [
+        ("getId", Builtin::CoroutineGetId),
+        ("isStarted", Builtin::CoroutineIsStarted),
+        ("isQueued", Builtin::CoroutineIsQueued),
+        ("isRunning", Builtin::CoroutineIsRunning),
+        ("isSuspended", Builtin::CoroutineIsSuspended),
+    ] {
+        add_native_method(
+            classes,
+            "Coroutine",
+            method,
+            Some(builtin),
+            false,
+            vec![],
+            if method == "getId" {
+                Type::Int
+            } else {
+                Type::Bool
+            },
+            false,
+        );
+    }
+    add_native_method(
+        classes,
+        "SchedulerInterface",
+        "chooseNext",
+        None,
+        false,
+        vec![native_parameter(
+            "ready",
+            Type::Vector(Box::new(Type::Int)),
+            None,
+            span,
+        )],
+        Type::Int,
+        true,
+    );
 }
 
 fn add_reflection_api(classes: &mut BTreeMap<String, ClassSignature>) {
@@ -11186,6 +12131,7 @@ fn add_native_method(
         MethodSignature {
             signature: Signature {
                 id: FunctionId(u32::MAX),
+                native_index: None,
                 parameters,
                 return_type,
                 span,
@@ -11362,6 +12308,45 @@ fn normalize_union(members: Vec<Type>) -> Type {
         [single] => single.clone(),
         _ => Type::Union(flat),
     }
+}
+
+fn regex_output_type(mode: i64, flags: i64, input: &Type) -> Option<Type> {
+    let allowed = match mode {
+        0 | 4 | 5 => 0,
+        1 | 2 => 256 | 512,
+        3 => 1 | 2 | 4,
+        _ => return None,
+    };
+    if flags < 0 || flags & !allowed != 0 {
+        return None;
+    }
+    if mode != 5 && input != &Type::String {
+        return None;
+    }
+    let captures = || {
+        Type::Map(
+            Box::new(Type::String),
+            Box::new(if flags & 256 != 0 {
+                Type::Object("RegexCapture".to_owned())
+            } else if flags & 512 != 0 {
+                normalize_union(vec![Type::Null, Type::String])
+            } else {
+                Type::String
+            }),
+        )
+    };
+    Some(match mode {
+        0 | 5 => input.clone(),
+        1 => captures(),
+        2 => Type::Vector(Box::new(captures())),
+        3 => Type::Vector(Box::new(if flags & 4 != 0 {
+            Type::Object("RegexCapture".to_owned())
+        } else {
+            Type::String
+        })),
+        4 => Type::String,
+        _ => return None,
+    })
 }
 
 fn count_expressions(statements: &[Statement]) -> usize {
@@ -11607,7 +12592,7 @@ mod tests {
             }
         }
         let mut checker =
-            super::TypeChecker::new(&parsed.program, &std::collections::BTreeMap::new());
+            super::TypeChecker::new(&parsed.program, &std::collections::BTreeMap::new(), &[]);
         checker.collect_nominal_names(&parsed.program);
         checker.collect_signatures(&parsed.program);
         (

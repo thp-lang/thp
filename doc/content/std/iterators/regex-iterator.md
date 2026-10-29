@@ -9,9 +9,9 @@ typeParameters:
   - name: K
     description: The key type preserved from the wrapped iterator.
   - name: TIn
-    description: The TIn type parameter.
+    description: Input value type; string is required except in USE_KEY mode.
   - name: TOut
-    description: The TOut type parameter.
+    description: Output value type fixed by the constant mode and flags.
 interfaces:
   - id: std.baseTypes.Iterator
     arguments:
@@ -33,13 +33,14 @@ constants:
   - name: REPLACE
     type: int
     description: Yields replacement results.
+  - name: USE_KEY
+    type: int
+    description: Filters on string keys while preserving input values.
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: The VM implements fixed modes and flags. The class is not a PHP inheritance or behavior compatibility promise.
+version: "0.11"
 ---
 
 `RegexIterator<K, TIn, TOut>` filters or transforms iterator values using a
@@ -53,28 +54,41 @@ regular expression.
 
 ## Behavior
 
-Mode controls whether matching preserves `TIn` values or produces a declared
-capture, split, or replacement `TOut`. The mode is immutable because changing
-it could invalidate the iterator's output type. The `$invert` constructor
-argument selects non-matching inputs without overloading the mode. The output
-preserves the input iterator's `K` keys. `USE_KEY` applies the pattern to each
-current key while preserving both key and output types.
+The constructor takes `Iterator<K, TIn>`, a delimited PCRE2 pattern, constant
+mode, optional inversion, constant flags, and an optional replacement template.
+Construction validates the pattern. The iterator searches lazily, preserves
+keys, and compiles results to `Iterator<K, TOut>`.
+
+| Mode                | Value type `TOut`                                    | Behavior                                          |
+| ------------------- | ---------------------------------------------------- | ------------------------------------------------- |
+| `MATCH` (`0`)       | `TIn`                                                | Keep matching string values.                      |
+| `GET_MATCH` (`1`)   | `map<string, string>` or offset capture map          | Yield first capture map.                          |
+| `ALL_MATCHES` (`2`) | `vector<map<string, string>>` or offset capture maps | Yield all capture maps.                           |
+| `SPLIT` (`3`)       | `vector<string>` or `vector<RegexCapture>`           | Split each selected value.                        |
+| `REPLACE` (`4`)     | `string`                                             | Replace matches using the constructor's template. |
+| `USE_KEY` (`5`)     | `TIn`                                                | Match string keys and preserve values.            |
+
+Modes other than `USE_KEY` require `TIn = string`. `USE_KEY` requires `K =
+string`. The mode and flags must be integer constants because they fix `TOut`.
+`GET_MATCH` and `ALL_MATCHES` accept match flags `256` and `512`; `SPLIT`
+accepts split flags `1`, `2`, and `4`. `MATCH`, `REPLACE`, and `USE_KEY` accept
+zero flags. `$invert` selects inputs that do not match. An inverted capture
+mode yields an empty capture result for a selected nonmatch.
 
 ## Differences from PHP
 
-PHP selects inverted matching with `INVERT_MATCH` and key matching with an
-integer mode. THP exposes `$invert` as a boolean and key matching as the
-explicit `RegexIterator::USE_KEY` mode while preserving the generic result
-type.
+THP selects inverted matching with a boolean and checks mode and flags at
+compile time. Its output types and mode values are defined by this contract.
 
 ## Errors
 
-Construction validates the parameters shown above. Cursor operations propagate failures from the wrapped iterator, callback, pattern engine, or filesystem when that dependency is present; each member page identifies the applicable source. Concrete THP error classes remain unsettled.
+Invalid patterns fail at construction. Cursor operations propagate failures
+from the wrapped iterator or PCRE2 engine at the cursor call site.
 
 ## Example
 
 ```thp
-$thpFiles = new RegexIterator<int, string, string>($paths, "/\.thp$/");
+$thpFiles = new RegexIterator(new VectorIterator(['a.thp', 'b.txt']), '/[.]thp$/');
 ```
 
 Only matching path strings are yielded in the default mode.

@@ -51,6 +51,16 @@ pub fn encode(program: &Program) -> Vec<u8> {
             encoder.u32(*start);
         }
     }
+    encoder.len(program.native_functions.len());
+    for function in &program.native_functions {
+        encoder.string(&function.name);
+        encoder.string(&function.library_digest);
+        encoder.len(function.parameters.len());
+        for parameter in &function.parameters {
+            encoder.ty(parameter);
+        }
+        encoder.ty(&function.return_type);
+    }
     encoder.len(program.classes.len());
     for class in &program.classes {
         encoder.class(class);
@@ -86,6 +96,18 @@ pub fn decode(bytes: &[u8]) -> Result<Program, DecodeError> {
         let line_starts = decoder.vector(Decoder::u32)?;
         Ok(SourceInfo { path, line_starts })
     })?;
+    let native_functions = decoder.vector(|decoder| {
+        let name = decoder.string()?;
+        let library_digest = decoder.string()?;
+        let parameters = decoder.vector(|decoder| decoder.ty(0))?;
+        let return_type = decoder.ty(0)?;
+        Ok(thp_hir::NativeSignature {
+            name,
+            library_digest,
+            parameters,
+            return_type,
+        })
+    })?;
     let classes = decoder.vector(Decoder::class)?;
     let count = decoder.len()?;
     let mut functions = Vec::with_capacity(count);
@@ -100,6 +122,7 @@ pub fn decode(bytes: &[u8]) -> Result<Program, DecodeError> {
         sources,
         functions,
         classes,
+        native_functions,
         entry,
     };
     verify(&program).map_err(|error| Decoder::error_at(0, error.to_string()))?;
@@ -889,6 +912,43 @@ impl Encoder {
                 self.u8(145);
                 self.u8(operation as u8);
             }
+            Callee::Builtin(Builtin::Native(index)) => {
+                self.u8(146);
+                self.u32(index);
+            }
+            Callee::Builtin(Builtin::PregMatch) => self.u8(147),
+            Callee::Builtin(Builtin::PregReplace) => self.u8(148),
+            Callee::Builtin(Builtin::PregSplit) => self.u8(149),
+            Callee::Builtin(Builtin::RegexCaptureText) => self.u8(150),
+            Callee::Builtin(Builtin::RegexCaptureOffset) => self.u8(151),
+            Callee::Builtin(Builtin::RegexIteratorConstruct) => self.u8(152),
+            Callee::Builtin(Builtin::RegexIteratorGetInner) => self.u8(153),
+            Callee::Builtin(Builtin::RegexIteratorGetRegex) => self.u8(154),
+            Callee::Builtin(Builtin::RegexIteratorGetMode) => self.u8(155),
+            Callee::Builtin(Builtin::RegexIteratorGetPregFlags) => self.u8(156),
+            Callee::Builtin(Builtin::SchedulerRegisterDefault) => self.u8(157),
+            Callee::Builtin(Builtin::SchedulerRegister) => self.u8(158),
+            Callee::Builtin(Builtin::SchedulerIsRegistered) => self.u8(159),
+            Callee::Builtin(Builtin::Async) => self.u8(160),
+            Callee::Builtin(Builtin::Await) => self.u8(161),
+            Callee::Builtin(Builtin::Suspend) => self.u8(162),
+            Callee::Builtin(Builtin::Delay) => self.u8(163),
+            Callee::Builtin(Builtin::Timeout) => self.u8(164),
+            Callee::Builtin(Builtin::CoroutineCancel) => self.u8(165),
+            Callee::Builtin(Builtin::CoroutineGetId) => self.u8(166),
+            Callee::Builtin(Builtin::CoroutineIsStarted) => self.u8(167),
+            Callee::Builtin(Builtin::CoroutineIsQueued) => self.u8(168),
+            Callee::Builtin(Builtin::CoroutineIsRunning) => self.u8(169),
+            Callee::Builtin(Builtin::CoroutineIsSuspended) => self.u8(170),
+            Callee::Builtin(Builtin::CoroutineIsCompleted) => self.u8(171),
+            Callee::Builtin(Builtin::CoroutineIsCancelled) => self.u8(172),
+            Callee::Builtin(Builtin::CoroutineSubscribe) => self.u8(173),
+            Callee::Builtin(Builtin::CoroutineResult) => self.u8(174),
+            Callee::Builtin(Builtin::TimeoutCancel) => self.u8(175),
+            Callee::Builtin(Builtin::TimeoutIsCompleted) => self.u8(176),
+            Callee::Builtin(Builtin::TimeoutIsCancelled) => self.u8(177),
+            Callee::Builtin(Builtin::TimeoutSubscribe) => self.u8(178),
+            Callee::Builtin(Builtin::TimeoutResult) => self.u8(179),
         }
     }
 
@@ -1494,6 +1554,40 @@ impl Decoder<'_> {
 
     fn callee(&mut self) -> Result<Callee, DecodeError> {
         match self.u8()? {
+            146 => Ok(Callee::Builtin(Builtin::Native(self.u32()?))),
+            147 => Ok(Callee::Builtin(Builtin::PregMatch)),
+            148 => Ok(Callee::Builtin(Builtin::PregReplace)),
+            149 => Ok(Callee::Builtin(Builtin::PregSplit)),
+            150 => Ok(Callee::Builtin(Builtin::RegexCaptureText)),
+            151 => Ok(Callee::Builtin(Builtin::RegexCaptureOffset)),
+            152 => Ok(Callee::Builtin(Builtin::RegexIteratorConstruct)),
+            153 => Ok(Callee::Builtin(Builtin::RegexIteratorGetInner)),
+            154 => Ok(Callee::Builtin(Builtin::RegexIteratorGetRegex)),
+            155 => Ok(Callee::Builtin(Builtin::RegexIteratorGetMode)),
+            156 => Ok(Callee::Builtin(Builtin::RegexIteratorGetPregFlags)),
+            157 => Ok(Callee::Builtin(Builtin::SchedulerRegisterDefault)),
+            158 => Ok(Callee::Builtin(Builtin::SchedulerRegister)),
+            159 => Ok(Callee::Builtin(Builtin::SchedulerIsRegistered)),
+            160 => Ok(Callee::Builtin(Builtin::Async)),
+            161 => Ok(Callee::Builtin(Builtin::Await)),
+            162 => Ok(Callee::Builtin(Builtin::Suspend)),
+            163 => Ok(Callee::Builtin(Builtin::Delay)),
+            164 => Ok(Callee::Builtin(Builtin::Timeout)),
+            165 => Ok(Callee::Builtin(Builtin::CoroutineCancel)),
+            166 => Ok(Callee::Builtin(Builtin::CoroutineGetId)),
+            167 => Ok(Callee::Builtin(Builtin::CoroutineIsStarted)),
+            168 => Ok(Callee::Builtin(Builtin::CoroutineIsQueued)),
+            169 => Ok(Callee::Builtin(Builtin::CoroutineIsRunning)),
+            170 => Ok(Callee::Builtin(Builtin::CoroutineIsSuspended)),
+            171 => Ok(Callee::Builtin(Builtin::CoroutineIsCompleted)),
+            172 => Ok(Callee::Builtin(Builtin::CoroutineIsCancelled)),
+            173 => Ok(Callee::Builtin(Builtin::CoroutineSubscribe)),
+            174 => Ok(Callee::Builtin(Builtin::CoroutineResult)),
+            175 => Ok(Callee::Builtin(Builtin::TimeoutCancel)),
+            176 => Ok(Callee::Builtin(Builtin::TimeoutIsCompleted)),
+            177 => Ok(Callee::Builtin(Builtin::TimeoutIsCancelled)),
+            178 => Ok(Callee::Builtin(Builtin::TimeoutSubscribe)),
+            179 => Ok(Callee::Builtin(Builtin::TimeoutResult)),
             0 => Ok(Callee::Function(FunctionId(self.u32()?))),
             1 => Ok(Callee::Builtin(Builtin::Count)),
             2 => Ok(Callee::Builtin(Builtin::VarDump)),

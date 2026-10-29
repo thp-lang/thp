@@ -7,6 +7,35 @@ remain marked as prereleases while THP is experimental.
 
 ## [Unreleased]
 
+## [0.12.0] - Unreleased
+
+### Added
+
+- runtime: Add request-local coroutine scheduling, typed `async()` and `await()`, custom scheduler choice, one-shot completions, cancellation, timers, deadlock detection, and draining of spawned work.
+- runtime: Resume nested calls, generators, iterator adapters, and reflected calls through explicit coroutine frames, preserving cleanup and exception traces.
+- std: Run file-backed stream and filesystem operations, including temporary-file spill, on a bounded four-worker pool while preserving aliased stream cursor order.
+
+### Changed
+
+- docs: Mark the Async API implemented and document synchronous host input, output, and ABI-v1 callback boundaries.
+- runtime: Advance the bytecode schema to version 11 for Async calls and nominal metadata; regenerate older cache and frozen artifacts.
+
+## [0.11.0] - 2026-10-12
+
+### Added
+
+- runtime: Load named native libraries from `[extension_libraries]` before project compilation, register fixed typed functions through the ABI-v1 host table, and dispatch calls through checked, call-scoped value handles.
+- std: Bundle PCRE2-backed `preg_match`, `preg_replace`, `preg_split`, `RegexCapture`, `RegexIterator`, and `RecursiveRegexIterator` without project configuration.
+
+### Changed
+
+- runtime: Advance the lock layout to version 2 and bytecode schema to version 10. Native library bytes and signatures now contribute to cache and frozen-project identity; regenerate old lock, cache, and frozen artifacts.
+- tooling: Native calls use the VM; automatic JIT selection falls back to the VM for projects with registered native functions.
+
+### Deferred
+
+- Async scheduling and runtime autoload callbacks remain proposed.
+
 ## [0.10.0] - 2026-10-12
 
 ### Added
