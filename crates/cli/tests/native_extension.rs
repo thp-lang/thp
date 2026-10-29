@@ -14,6 +14,7 @@ fn compile_library(root: &Path, mode: &str) -> PathBuf {
         &source,
         format!(
             r#"#include "thp.h"
+#include <stdbool.h>
 #include <string.h>
 static ThpHost host;
 static int32_t add_one(void *data, ThpCall *call, const ThpValue *const *args, size_t count, const ThpValue **result) {{
@@ -57,7 +58,7 @@ const ThpExtension *thp_extension_entry(void) {{ return &extension; }}
     .expect("write C extension");
     let library = root.join("libdemo.so");
     let output = Command::new("cc")
-        .args(["-shared", "-fPIC", "-I"])
+        .args(["-std=c11", "-shared", "-fPIC", "-I"])
         .arg(header)
         .arg(&source)
         .arg("-o")
