@@ -1923,11 +1923,11 @@ impl ExecutionState<'_, '_> {
                     self.async_runtime.ready.push_back(id);
                 }
                 let wake = match &self.async_runtime.sources[id - 1].waiting {
-                    Some(Wait::Await {
-                        target,
-                        cancellation,
-                        ..
-                    }) if self.async_runtime.sources[*target - 1].result.is_some() => Some(true),
+                    Some(Wait::Await { target, .. })
+                        if self.async_runtime.sources[*target - 1].result.is_some() =>
+                    {
+                        Some(true)
+                    }
                     Some(Wait::Await {
                         cancellation: Some(cancel),
                         ..
