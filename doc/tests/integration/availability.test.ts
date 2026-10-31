@@ -1,0 +1,205 @@
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import { createModel } from "../../src/build.js";
+import { renderPage } from "../../src/view/pages.js";
+
+const root = path.resolve(import.meta.dirname, "../..");
+
+describe("contract availability", () => {
+  it("marks the running Async API implemented", async () => {
+    const model = await createModel({ root });
+    const asyncPages = model.pages.filter((page) =>
+      page.source.data.id.startsWith("std.async"),
+    );
+    expect(
+      asyncPages.every(
+        (page) => page.source.data.availability === "implemented",
+      ),
+    ).toBe(true);
+    expect(
+      model.types
+        .get("std.async.SchedulerInterface")!
+        .members.map((member) => member.source.data.name),
+    ).toEqual(["chooseNext"]);
+    expect(
+      model.types
+        .get("std.async.Completable")!
+        .members.map((member) => member.source.data.name),
+    ).toContain("subscribe");
+    expect(
+      model.types
+        .get("std.async.Completable")!
+        .members.map((member) => member.source.data.name),
+    ).toContain("result");
+  });
+
+  it("maps every stream symbol to its executable availability", async () => {
+    const model = await createModel({ root });
+    const actual = new Map(
+      model.pages
+        .filter((page) => page.source.data.id.startsWith("std.streams"))
+        .map((page) => [page.source.data.id, page.source.data.availability]),
+    );
+
+    expect(actual).toEqual(
+      new Map([
+        ["std.streams", "partial"],
+        ["std.streams.Closeable", "implemented"],
+        ["std.streams.Closeable::close", "implemented"],
+        ["std.streams.Closeable::isClosed", "implemented"],
+        ["std.streams.ClosedStreamException", "implemented"],
+        ["std.streams.Files", "implemented"],
+        ["std.streams.Files::openRead", "implemented"],
+        ["std.streams.Files::openReadWrite", "implemented"],
+        ["std.streams.Files::openWrite", "implemented"],
+        ["std.streams.InvalidStreamUriException", "implemented"],
+        ["std.streams.IoException", "implemented"],
+        ["std.streams.MemoryStream", "implemented"],
+        ["std.streams.MemoryStream::open", "implemented"],
+        ["std.streams.OpenMode", "implemented"],
+        ["std.streams.OpenStreamException", "implemented"],
+        ["std.streams.OpenStreamException::__construct", "partial"],
+        ["std.streams.OpenStreamException::getSystemCode", "implemented"],
+        ["std.streams.OpenStreamException::getTarget", "implemented"],
+        ["std.streams.ReadWriteFileStream", "implemented"],
+        ["std.streams.ReadableFileStream", "implemented"],
+        ["std.streams.ReadableStream", "implemented"],
+        ["std.streams.ReadableStream::eof", "implemented"],
+        ["std.streams.ReadableStream::read", "implemented"],
+        ["std.streams.ReadableStream::readAll", "implemented"],
+        ["std.streams.SeekFrom", "implemented"],
+        ["std.streams.SeekableStream", "implemented"],
+        ["std.streams.SeekableStream::seek", "implemented"],
+        ["std.streams.SeekableStream::tell", "implemented"],
+        ["std.streams.Stream", "implemented"],
+        ["std.streams.Stream::isReadable", "implemented"],
+        ["std.streams.Stream::isSeekable", "implemented"],
+        ["std.streams.Stream::isWritable", "implemented"],
+        ["std.streams.Streams", "implemented"],
+        ["std.streams.Streams::open", "implemented"],
+        ["std.streams.TempStream", "implemented"],
+        ["std.streams.TempStream::open", "implemented"],
+        ["std.streams.UnsupportedStreamOperationException", "implemented"],
+        ["std.streams.WritableFileStream", "implemented"],
+        ["std.streams.WritableStream", "implemented"],
+        ["std.streams.WritableStream::flush", "implemented"],
+        ["std.streams.WritableStream::write", "implemented"],
+        ["std.streams.WritableStream::writeAll", "implemented"],
+        ["std.streams.WriteMode", "implemented"],
+      ]),
+    );
+  });
+
+  it("keeps broad class availability partial", async () => {
+    const model = await createModel({ root });
+    const classes = model.pages.find(
+      (page) => page.source.data.id === "guide.languageClassesAndObjects",
+    )!;
+    const status = model.pages.find(
+      (page) => page.source.data.id === "guide.implementationStatus",
+    )!;
+
+    expect(classes.source.data.availability).toBe("partial");
+    expect(status.source.body).toMatch(
+      /\| Classes and interfaces\s+\| partial\s+\|/,
+    );
+  });
+
+  it("marks implemented recursive adapters and leaves future adapters proposed", async () => {
+    const model = await createModel({ root });
+    const protocolPages = model.pages.filter(
+      (page) =>
+        page.source.data.id === "std.baseTypes.Traversable" ||
+        page.source.data.id === "std.baseTypes.Iterator" ||
+        page.source.data.id.startsWith("std.baseTypes.Iterator::") ||
+        page.source.data.id === "std.baseTypes.IteratorAggregate" ||
+        page.source.data.id.startsWith("std.baseTypes.IteratorAggregate::"),
+    );
+    const adapterPages = model.pages.filter((page) =>
+      page.route.startsWith("/std/iterators/"),
+    );
+
+    expect(protocolPages.length).toBe(9);
+    expect(
+      protocolPages.every(
+        (page) => page.source.data.availability === "implemented",
+      ),
+    ).toBe(true);
+    expect(adapterPages.length).toBeGreaterThan(100);
+    expect(
+      adapterPages.some(
+        (page) => page.source.data.availability === "implemented",
+      ),
+    ).toBe(true);
+    for (const name of [
+      "RecursiveIteratorIterator",
+      "RecursiveCachingIterator",
+      "RecursiveFilterIterator",
+      "ParentIterator",
+      "RecursiveCallbackFilterIterator",
+    ]) {
+      expect(
+        model.pages.find((page) => page.source.data.id === `std.spl.${name}`)
+          ?.source.data.availability,
+      ).toBe("implemented");
+    }
+    expect(
+      model.pages.find(
+        (page) => page.source.data.id === "std.spl.RecursiveTreeIterator",
+      )?.source.data.availability,
+    ).toBe("proposed");
+
+    const status = model.pages.find(
+      (page) => page.source.data.id === "guide.implementationStatus",
+    )!;
+    for (const symbol of [
+      "iterator_apply()",
+      "iterator_to_vector()",
+      "iterator_to_map()",
+      "vector_map()",
+      "vector_filter()",
+      "vector_slice()",
+      "vector_concat()",
+      "map_transform()",
+      "map_filter()",
+      "map_merge()",
+    ])
+      expect(status.source.body).toContain(symbol);
+  });
+
+  it("renders a symbol matrix and keeps count separate from iterator_count", async () => {
+    const model = await createModel({ root, basePath: "/typed-php/" });
+    const status = model.pages.find(
+      (page) => page.source.data.id === "guide.implementationStatus",
+    )!;
+    const html = renderPage(model, status);
+    expect(html).toContain("Collection and iterator symbols");
+    expect(html).toContain("Stream symbols");
+    expect(html).toContain('<div class="table-scroll"><table>');
+
+    expect(status.source.body).toContain(
+      "`count(string\\|vector<T>\\|map<K, V>\\|Countable): int`",
+    );
+    expect(status.source.body).toContain(
+      "Reads native length or dispatches `Countable::count()` and rejects negative results",
+    );
+    expect(status.source.body).toContain(
+      "`iterator_count<K, V>(Iterator<K, V>): int`",
+    );
+
+    const iteratorCount = model.pages.find(
+      (page) => page.source.data.id === "std.spl.iterator_count",
+    )!;
+    expect(iteratorCount.source.data.availability).toBe("implemented");
+    if (iteratorCount.source.data.kind !== "function")
+      throw new Error("iterator_count must remain a function page");
+    expect(iteratorCount.source.data.parameters).toEqual([
+      expect.objectContaining({ name: "iterator", type: "Iterator<K, V>" }),
+    ]);
+    expect(iteratorCount.source.body).toContain("does not call");
+    expect(iteratorCount.source.body).toContain("`rewind()` before or after");
+    expect(iteratorCount.source.body).toContain(
+      "not an alias for, or overload of",
+    );
+  });
+});

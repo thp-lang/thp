@@ -79,6 +79,10 @@ pub enum StmtKind {
     },
     Echo(Expr),
     Return(Option<Expr>),
+    Yield {
+        key: Option<Expr>,
+        value: Expr,
+    },
     If {
         branches: Vec<(Expr, Block)>,
         otherwise: Option<Block>,
@@ -189,10 +193,11 @@ pub struct FunctionDecl {
 pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
+    pub type_parameters: Vec<TypeParameterDecl>,
     pub abstract_class: bool,
     pub final_class: bool,
-    pub parent: Option<NameRef>,
-    pub interfaces: Vec<NameRef>,
+    pub parent: Option<NominalRef>,
+    pub interfaces: Vec<NominalRef>,
     pub trait_uses: Vec<TraitUse>,
     pub properties: Vec<PropertyDecl>,
     pub methods: Vec<MethodDecl>,
@@ -202,8 +207,24 @@ pub struct ClassDecl {
 pub struct InterfaceDecl {
     pub name: String,
     pub name_span: Span,
-    pub parent: Option<NameRef>,
+    pub type_parameters: Vec<TypeParameterDecl>,
+    pub parent: Option<NominalRef>,
     pub methods: Vec<MethodDecl>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeParameterDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub bound: Option<TypeSyntax>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NominalRef {
+    pub name: String,
+    pub arguments: Vec<TypeSyntax>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -299,6 +320,36 @@ pub enum TypeSyntaxKind {
     Union(Vec<TypeSyntax>),
 }
 
+impl std::fmt::Display for TypeSyntax {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            TypeSyntaxKind::Named { name, arguments } if arguments.is_empty() => {
+                formatter.write_str(name)
+            }
+            TypeSyntaxKind::Named { name, arguments } => {
+                write!(formatter, "{name}<")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{argument}")?;
+                }
+                formatter.write_str(">")
+            }
+            TypeSyntaxKind::Nullable(inner) => write!(formatter, "?{inner}"),
+            TypeSyntaxKind::Union(members) => {
+                for (index, member) in members.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str("|")?;
+                    }
+                    write!(formatter, "{member}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,
@@ -314,6 +365,13 @@ pub enum ExprKind {
     String(Vec<u8>),
     Variable(String),
     Name(String),
+    Closure {
+        parameters: Vec<Parameter>,
+        captures: Vec<String>,
+        implicit_captures: bool,
+        return_type: TypeSyntax,
+        body: Block,
+    },
     Vector(Vec<Expr>),
     Map(Vec<MapEntry>),
     Unary {
@@ -334,8 +392,8 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     New {
-        class_name: String,
-        class_span: Span,
+        target: NewTarget,
+        type_arguments: Vec<TypeSyntax>,
         arguments: Vec<Argument>,
     },
     Property {
@@ -373,9 +431,21 @@ pub enum ExprKind {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum NewTarget {
+    Static {
+        class_name: String,
+        class_span: Span,
+    },
+    Dynamic(Box<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScopeTarget {
-    Named(String),
+    Named {
+        name: String,
+        type_arguments: Vec<TypeSyntax>,
+    },
     SelfType,
     Parent,
     Static,

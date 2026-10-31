@@ -2,24 +2,22 @@
 kind: method
 id: std.spl.AppendIterator::getIteratorIndex
 title: AppendIterator::getIteratorIndex
-summary: Returns the active iterator index, or null before traversal.
+summary: Returns the active iterator index, or null before traversal or after exhaustion.
 name: getIteratorIndex
 order: 3
 typeParameters: []
 parameters: []
 returns:
   type: ?int
-  description: Returns the active iterator index, or null before traversal.
+  description: Returns the active iterator index, or null before traversal or after exhaustion.
 errors:
   - description:
       No additional runtime failure beyond parameter validation and failures
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.AppendIterator
 visibility: public

@@ -11,8 +11,8 @@ parameters:
     type: Iterator<K, V>
     description: Iterator wrapped or consumed by this operation.
   - name: callback
-    type: callable
-    description: Callable invoked by this operation.
+    type: callable<V, K, bool>
+    description: Receives each current value then key and decides acceptance.
 returns:
   type: void
   description: This callable does not return a value.
@@ -23,11 +23,9 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
-version: "0.1"
+availability: implemented
+notice: This experimental constructor executes in the standalone compiler and reference VM.
+version: "0.6"
 owner: std.spl.CallbackFilterIterator
 visibility: public
 modifiers: []
@@ -37,7 +35,9 @@ modifiers: []
 
 ## Behavior
 
-Wraps the iterator and stores the callback used to test each current value.
+Wraps the iterator and stores the typed callback used to test each current
+value and key. The adapter keeps the inner cursor; it does not rewind it until
+`rewind()` is called. Allocation failure propagates.
 
 This operation does not change receiver state unless the description explicitly states otherwise.
 

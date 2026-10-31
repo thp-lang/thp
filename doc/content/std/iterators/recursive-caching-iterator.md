@@ -10,6 +10,11 @@ typeParameters:
     description: The key type preserved from the wrapped iterator.
   - name: T
     description: The T type parameter.
+parent:
+  id: std.spl.CachingIterator
+  arguments:
+    - K
+    - RecursiveEntry<K, T>
 interfaces:
   - id: std.spl.RecursiveIterator
     arguments:
@@ -18,15 +23,15 @@ interfaces:
   - id: std.spl.OuterIterator
     arguments:
       - K
-      - RecursiveEntry<T>
+      - RecursiveEntry<K, T>
   - id: std.baseTypes.Countable
 constants: []
 properties: []
 status: experimental
-availability: proposed
+availability: implemented
 notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+  This experimental class is implemented using CachingIterator over recursive
+  entries. Child iterators retain their own cursor and cache state.
 version: "0.1"
 ---
 
@@ -41,7 +46,9 @@ version: "0.1"
 ## Behavior
 
 Each yielded entry retains its original child iterator. Caches belong to one
-wrapper and are not shared automatically with child iterators.
+wrapper and are not shared automatically with child iterators. The constructor
+accepts the same integer flags as `CachingIterator`; `FULL_CACHE` retains keyed
+entries in `getCache()`.
 
 ## Errors
 

@@ -25,10 +25,10 @@ constants:
     description: Skips empty lines.
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: partial
+notice: Read-only construction, line iteration, line seeking, fgets(), fread(),
+  ftell(), and eof() execute. File modes, CSV, flags, locking, and writing
+  remain proposed.
 version: "0.1"
 ---
 

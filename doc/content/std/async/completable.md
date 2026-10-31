@@ -15,10 +15,7 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  Completable is a proposed generic interface and is not implemented in this
-  repository. Cancellation failure types are not finalized.
+availability: implemented
 version: "0.1"
 ---
 
@@ -36,8 +33,17 @@ A completable transitions to one terminal state exactly once:
 Once terminal, its result does not change. Multiple calls to
 [`await()`](thp:std.async.await) observe the same value or failure.
 
-Cancellation is cooperative. Calling `cancel()` requests cancellation, but
-running code observes the request only at a suspension point.
+[`subscribe(callable<void> $notify): callable<void>`](thp:std.async.Completable::subscribe) registers a notification
+for terminal completion. It invokes `$notify` exactly once, immediately when
+already terminal. The returned callable unsubscribes idempotently. [`result(): T`](thp:std.async.Completable::result)
+returns the stored value, rethrows the stored failure, or throws `Error` while
+pending. Neither method can suspend. `await()` accepts `Completable<T>`;
+[`Awaitable<T>`](thp:std.async.Awaitable) remains a marker.
+
+Cancellation of a coroutine is cooperative. A queued coroutine is cancelled
+before its body starts; a running or suspended coroutine receives
+`CancellationException` at its next suspension checkpoint. If it catches the
+exception and returns, it succeeds.
 
 ## Implementations
 

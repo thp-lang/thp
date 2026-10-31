@@ -20,10 +20,8 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: Opens a local directory and includes . and .. entries before host directory entries.
 version: "0.1"
 owner: std.spl.DirectoryIterator
 visibility: public

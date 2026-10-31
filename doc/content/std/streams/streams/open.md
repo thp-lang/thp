@@ -26,10 +26,10 @@ errors:
 related:
   - std.streams.Streams
 status: experimental
-availability: partial
+availability: implemented
 notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  partially implemented experimental contract and may change as runtime integration proceeds.
+  Local paths, local file:// URIs, php://memory, php://temp[/maxmemory:N], and
+  read-only thp:/input execute with mode-specific capabilities.
 version: "0.1"
 owner: std.streams.Streams
 visibility: public

@@ -2,33 +2,50 @@
 kind: module
 id: std.dataStructures
 title: Data structures
-summary: Generic containers, observer contracts, autoloading, and object utilities.
+summary: Generic containers, observer contracts, and object utilities.
 module: data-structures
 order: 60
 status: experimental
-availability: proposed
+availability: partial
 notice:
-  These PHP-inspired class contracts are not implemented. Generic types, iteration
-  behavior, serialization, and concrete errors may change.
+  The THP-native classes listed below are implemented. The PHP-inspired SPL
+  classes remain migration-analysis contracts or proposals.
 ---
 
-| Class                                                    | Purpose                                          |
-| -------------------------------------------------------- | ------------------------------------------------ |
-| [`SplDoublyLinkedList`](thp:std.spl.SplDoublyLinkedList) | Indexed double-ended linked sequence.            |
-| [`SplStack`](thp:std.spl.SplStack)                       | Last-in, first-out stack.                        |
-| [`SplQueue`](thp:std.spl.SplQueue)                       | First-in, first-out queue.                       |
-| [`SplHeap`](thp:std.spl.SplHeap)                         | Base class for value-ordered heaps.              |
-| [`SplMaxHeap`](thp:std.spl.SplMaxHeap)                   | Heap that extracts the greatest value first.     |
-| [`SplMinHeap`](thp:std.spl.SplMinHeap)                   | Heap that extracts the smallest value first.     |
-| [`SplPriorityQueue`](thp:std.spl.SplPriorityQueue)       | Heap ordered by explicit priorities.             |
-| [`SplFixedArray`](thp:std.spl.SplFixedArray)             | Contiguous storage with an explicit size.        |
-| [`ArrayObject`](thp:std.spl.ArrayObject)                 | Object wrapper around array-like storage.        |
-| [`SplObjectStorage`](thp:std.spl.SplObjectStorage)       | Object-identity set with optional attached data. |
+| Class                                                    | Purpose                                                |
+| -------------------------------------------------------- | ------------------------------------------------------ |
+| [`SplDoublyLinkedList`](thp:std.spl.SplDoublyLinkedList) | Indexed double-ended linked sequence.                  |
+| [`SplStack`](thp:std.spl.SplStack)                       | Last-in, first-out stack.                              |
+| [`SplQueue`](thp:std.spl.SplQueue)                       | First-in, first-out queue.                             |
+| [`SplHeap`](thp:std.spl.SplHeap)                         | Base class for value-ordered heaps.                    |
+| [`SplMaxHeap`](thp:std.spl.SplMaxHeap)                   | Heap that extracts the greatest value first.           |
+| [`SplMinHeap`](thp:std.spl.SplMinHeap)                   | Heap that extracts the smallest value first.           |
+| [`SplPriorityQueue`](thp:std.spl.SplPriorityQueue)       | Heap ordered by explicit priorities.                   |
+| [`SplFixedArray`](thp:std.spl.SplFixedArray)             | Contiguous storage with an explicit size.              |
+| [`FixedSequence`](thp:std.dataStructures.FixedSequence)  | Explicitly sized, resizable nullable slots.            |
+| [`LinkedList`](thp:std.dataStructures.LinkedList)        | Native double-ended sequence.                          |
+| [`Queue`](thp:std.dataStructures.Queue)                  | Native FIFO sequence.                                  |
+| [`Stack`](thp:std.dataStructures.Stack)                  | Native LIFO sequence.                                  |
+| [`MaxHeap`](thp:std.dataStructures.MaxHeap)              | Greatest-first value queue.                            |
+| [`MinHeap`](thp:std.dataStructures.MinHeap)              | Least-first value queue.                               |
+| [`PriorityQueue`](thp:std.dataStructures.PriorityQueue)  | Integer-priority value queue.                          |
+| [`TypedMap`](thp:std.dataStructures.TypedMap)            | Shared mutable object around a typed map.              |
+| [`ObjectStorage`](thp:std.dataStructures.ObjectStorage)  | Object-only identity association and object iteration. |
+| [`ArrayObject`](thp:std.spl.ArrayObject)                 | Object wrapper around array-like storage.              |
+| [`SplObjectStorage`](thp:std.spl.SplObjectStorage)       | Object-identity set with optional attached data.       |
 
 `SplFixedArray` and `ArrayObject` are retained only as PHP migration-analysis
-placeholders. Their names are not accepted THP-native API names because THP has
-separate `vector<T>` and `map<K, V>` types. A fixed-size sequence and typed map
-wrapper require independently named contracts before implementation.
+placeholders. THP uses `FixedSequence<T>` for a sequence with an explicit size
+and `TypedMap<K, V>` for a mutable map wrapper.
+
+Choose a native vector unless explicitly sized nullable slots and clearing without
+shifting positions are required; see [`FixedSequence`](thp:std.dataStructures.FixedSequence).
+Native maps are already typed copy-on-write values.
+[`TypedMap`](thp:std.dataStructures.TypedMap) adds shared object mutation, while
+[`ObjectStorage`](thp:std.dataStructures.ObjectStorage) overlaps with object-keyed
+maps and adds object-only runtime validation and object iteration. It strongly
+retains attached objects and data. None of these wrappers implies lower memory
+use or faster execution; their type pages describe current implementation costs.
 
 ## See also
 
@@ -39,52 +56,3 @@ wrapper require independently named contracts before implementation.
 
 [`SplObserver`](thp:std.spl.SplObserver) receives notifications from
 [`SplSubject`](thp:std.spl.SplSubject).
-
-## Autoloading and object utilities
-
-Autoloading lets an application defer loading a class, interface, or enum until
-the declaration is first needed. THP maintains an ordered, process-wide queue of
-loader callbacks, following PHP's SPL autoloading model.
-
-## Registry functions
-
-| Function                                                           | Description                                      |
-| ------------------------------------------------------------------ | ------------------------------------------------ |
-| [`spl_autoload_register()`](thp:std.spl.spl_autoload_register)     | Adds a callback to the autoload queue.           |
-| [`spl_autoload_unregister()`](thp:std.spl.spl_autoload_unregister) | Removes a callback from the autoload queue.      |
-| [`spl_autoload_functions()`](thp:std.spl.spl_autoload_functions)   | Returns the registered callbacks in queue order. |
-| [`spl_autoload_call()`](thp:std.spl.spl_autoload_call)             | Runs the queue for a requested type name.        |
-
-## Default loader
-
-| Function                                                           | Description                                       |
-| ------------------------------------------------------------------ | ------------------------------------------------- |
-| [`spl_autoload()`](thp:std.spl.spl_autoload)                       | Searches include paths using configured suffixes. |
-| [`spl_autoload_extensions()`](thp:std.spl.spl_autoload_extensions) | Reads or replaces the default loader's suffixes.  |
-
-## Example
-
-```thp
-spl_autoload_register(function (string $class): void {
-    $path = "./src/" . str_replace("\\", "/", $class) . ".thp";
-    require $path;
-});
-
-$service = new App\Services\ReportService();
-```
-
-When `ReportService` is not already declared, the runtime passes its qualified
-name to each registered loader until one defines it.
-
-## Design background
-
-The queue and callback signatures follow
-[PHP's class autoloading model](https://www.php.net/manual/en/language.oop5.autoload.php).
-THP preserves explicit collection typing when inspecting the queue and does not
-guarantee that PHP autoloaders registered by dependencies share the THP
-registry.
-
-## See also
-
-- [Standard PHP Library](thp:std.dataStructures)
-- [PHP SPL autoloading functions](https://www.php.net/manual/en/ref.spl.php)

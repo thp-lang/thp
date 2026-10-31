@@ -18,10 +18,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: This adapter executes through the common Iterator<K, V> cursor protocol.
 version: "0.1"
 ---
 
@@ -35,7 +33,7 @@ version: "0.1"
 
 ## Behavior
 
-Values from each appended iterator are exhausted before traversal advances to the next iterator. Appending after traversal starts requires a final THP rule.
+Values from each appended iterator are exhausted before traversal advances to the next iterator. Appending after traversal starts throws `LogicException`. `getArrayIterator()` returns a `VectorIterator` over a snapshot of the appended iterators.
 
 ## Errors
 

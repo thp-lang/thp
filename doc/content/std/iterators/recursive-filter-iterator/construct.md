@@ -22,10 +22,8 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This experimental recursive filtering member is implemented.
 version: "0.1"
 owner: std.spl.RecursiveFilterIterator
 visibility: public

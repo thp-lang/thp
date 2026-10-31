@@ -15,10 +15,10 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
+availability: partial
 notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+  Construction, dot entries, seeking, and the common iterator protocol execute.
+  Additional filename convenience methods remain proposed.
 version: "0.1"
 ---
 

@@ -2,15 +2,17 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, DirectoryBuiltin, FileInfoBuiltin,
+    FileObjectBuiltin, FunctionId, LocalId, MAX_CONSTANT_NESTING, MethodSlot, NominalKind,
+    ParameterMetadata, PropertyId, ReflectionBuiltin, Type, TypeParameter, TypeParameterId,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 use crate::{
-    BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, ExceptionHandler, Function, Instruction,
-    InstructionKind, Method, Program, Property, Terminator, verify,
+    BYTECODE_SCHEMA_VERSION, Block, CatchHandler, Class, DynamicArgument, ExceptionHandler,
+    Function, Instruction, InstructionKind, Method, NominalType, Program, Property, SourceInfo,
+    Terminator, verify,
 };
 
 const MAGIC: &[u8; 8] = b"THPBC\0\0\0";
@@ -41,6 +43,24 @@ pub fn encode(program: &Program) -> Vec<u8> {
     encoder.bytes(MAGIC);
     encoder.u16(program.schema_version);
     encoder.u32(program.entry.0);
+    encoder.len(program.sources.len());
+    for source in &program.sources {
+        encoder.string(&source.path);
+        encoder.len(source.line_starts.len());
+        for start in &source.line_starts {
+            encoder.u32(*start);
+        }
+    }
+    encoder.len(program.native_functions.len());
+    for function in &program.native_functions {
+        encoder.string(&function.name);
+        encoder.string(&function.library_digest);
+        encoder.len(function.parameters.len());
+        for parameter in &function.parameters {
+            encoder.ty(parameter);
+        }
+        encoder.ty(&function.return_type);
+    }
     encoder.len(program.classes.len());
     for class in &program.classes {
         encoder.class(class);
@@ -71,6 +91,23 @@ pub fn decode(bytes: &[u8]) -> Result<Program, DecodeError> {
         )));
     }
     let entry = FunctionId(decoder.u32()?);
+    let sources = decoder.vector(|decoder| {
+        let path = decoder.string()?;
+        let line_starts = decoder.vector(Decoder::u32)?;
+        Ok(SourceInfo { path, line_starts })
+    })?;
+    let native_functions = decoder.vector(|decoder| {
+        let name = decoder.string()?;
+        let library_digest = decoder.string()?;
+        let parameters = decoder.vector(|decoder| decoder.ty(0))?;
+        let return_type = decoder.ty(0)?;
+        Ok(thp_hir::NativeSignature {
+            name,
+            library_digest,
+            parameters,
+            return_type,
+        })
+    })?;
     let classes = decoder.vector(Decoder::class)?;
     let count = decoder.len()?;
     let mut functions = Vec::with_capacity(count);
@@ -82,8 +119,10 @@ pub fn decode(bytes: &[u8]) -> Result<Program, DecodeError> {
     }
     let program = Program {
         schema_version,
+        sources,
         functions,
         classes,
+        native_functions,
         entry,
     };
     verify(&program).map_err(|error| Decoder::error_at(0, error.to_string()))?;
@@ -132,6 +171,7 @@ impl Encoder {
     fn span(&mut self, span: Span) {
         self.u32(span.start);
         self.u32(span.end);
+        self.u32(span.source.map_or(NONE, |source| source.0));
     }
 
     fn ty(&mut self, ty: &Type) {
@@ -164,6 +204,28 @@ impl Encoder {
                 self.u8(11);
                 self.string(name);
             }
+            Type::Nominal { name, arguments } => {
+                self.u8(12);
+                self.string(name);
+                self.len(arguments.len());
+                for argument in arguments {
+                    self.ty(argument);
+                }
+            }
+            Type::Parameter { id, name } => {
+                self.u8(13);
+                self.u32(id.owner.0);
+                self.u32(id.index);
+                self.string(name);
+            }
+            Type::Callable(parameters, result) => {
+                self.u8(14);
+                self.len(parameters.len());
+                for parameter in parameters {
+                    self.ty(parameter);
+                }
+                self.ty(result);
+            }
         }
     }
 
@@ -177,27 +239,37 @@ impl Encoder {
         });
         self.u8(u8::from(class.abstract_class));
         self.u8(u8::from(class.final_class));
+        self.string(&class.module_name);
+        self.u8(u8::from(class.native));
+        self.len(class.type_parameters.len());
+        for parameter in &class.type_parameters {
+            self.u32(parameter.id.owner.0);
+            self.u32(parameter.id.index);
+            self.string(&parameter.name);
+            match &parameter.bound {
+                Some(bound) => {
+                    self.u8(1);
+                    self.ty(bound);
+                }
+                None => self.u8(0),
+            }
+            self.span(parameter.span);
+        }
         self.len(class.properties.len());
         for property in &class.properties {
-            self.ty(&property.ty);
-            self.visibility(property.visibility);
-            self.u32(property.declaring_class.0);
+            self.property(property);
+        }
+        self.len(class.declared_properties.len());
+        for property in &class.declared_properties {
+            self.property(property);
         }
         self.len(class.methods.len());
         for method in &class.methods {
-            self.string(&method.name);
-            self.u32(method.slot.0);
-            self.optional_callee(method.callee);
-            self.visibility(method.visibility);
-            self.u32(method.declaring_class.0);
-            self.u8(u8::from(method.static_method));
-            self.u8(u8::from(method.abstract_method));
-            self.u8(u8::from(method.final_method));
-            self.len(method.parameter_types.len());
-            for ty in &method.parameter_types {
-                self.ty(ty);
-            }
-            self.ty(&method.return_type);
+            self.method(method);
+        }
+        self.len(class.declared_methods.len());
+        for method in &class.declared_methods {
+            self.method(method);
         }
         self.len(class.dispatch.len());
         for callee in &class.dispatch {
@@ -207,21 +279,136 @@ impl Encoder {
         for interface in &class.interfaces {
             self.u32(interface.0);
         }
+        self.len(class.interface_types.len());
+        for interface in &class.interface_types {
+            self.u32(interface.class.0);
+            self.len(interface.arguments.len());
+            for argument in &interface.arguments {
+                self.ty(argument);
+            }
+        }
         self.u32(class.parent.map_or(NONE, |parent| parent.0));
+        match &class.parent_type {
+            Some(parent) => {
+                self.u8(1);
+                self.u32(parent.class.0);
+                self.len(parent.arguments.len());
+                for argument in &parent.arguments {
+                    self.ty(argument);
+                }
+            }
+            None => self.u8(0),
+        }
+        self.len(class.traits.len());
+        for trait_id in &class.traits {
+            self.u32(trait_id.0);
+        }
+    }
+
+    fn property(&mut self, property: &Property) {
+        self.u32(property.id.0);
+        self.string(&property.name);
+        self.ty(&property.ty);
+        self.visibility(property.visibility);
+        self.u32(property.declaring_class.0);
+        self.optional_constant_value(property.default.as_ref());
+        self.u32(property.origin_trait.map_or(NONE, |origin| origin.0));
+    }
+
+    fn method(&mut self, method: &Method) {
+        self.string(&method.name);
+        self.u32(method.slot.0);
+        self.optional_callee(method.callee);
+        self.visibility(method.visibility);
+        self.u32(method.declaring_class.0);
+        self.u8(u8::from(method.static_method));
+        self.u8(u8::from(method.abstract_method));
+        self.u8(u8::from(method.final_method));
+        self.len(method.parameter_types.len());
+        for ty in &method.parameter_types {
+            self.ty(ty);
+        }
+        self.len(method.parameters.len());
+        for parameter in &method.parameters {
+            self.parameter_metadata(parameter);
+        }
+        self.ty(&method.return_type);
+        self.u32(method.origin_trait.map_or(NONE, |origin| origin.0));
+        self.string(&method.origin_name);
+    }
+
+    fn parameter_metadata(&mut self, parameter: &ParameterMetadata) {
+        self.string(&parameter.name);
+        self.ty(&parameter.ty);
+        self.optional_constant_value(parameter.default.as_ref());
+        self.u8(u8::from(parameter.variadic));
+    }
+
+    fn optional_constant_value(&mut self, value: Option<&ConstantValue>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.constant_value(value);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn constant_value(&mut self, value: &ConstantValue) {
+        match value {
+            ConstantValue::Int(value) => {
+                self.u8(0);
+                self.u64(u64::from_ne_bytes(value.to_ne_bytes()));
+            }
+            ConstantValue::Float(value) => {
+                self.u8(1);
+                self.u64(value.to_bits());
+            }
+            ConstantValue::Bool(value) => {
+                self.u8(2);
+                self.u8(u8::from(*value));
+            }
+            ConstantValue::Null => self.u8(3),
+            ConstantValue::String(value) => {
+                self.u8(4);
+                self.blob(value);
+            }
+            ConstantValue::Vector(values) => {
+                self.u8(5);
+                self.len(values.len());
+                for value in values {
+                    self.constant_value(value);
+                }
+            }
+            ConstantValue::Map(entries) => {
+                self.u8(6);
+                self.len(entries.len());
+                for (key, value) in entries {
+                    self.constant_value(key);
+                    self.constant_value(value);
+                }
+            }
+        }
     }
 
     fn function(&mut self, function: &Function) {
         self.u32(function.id.0);
         self.string(&function.name);
+        self.string(&function.module_name);
         self.len(function.parameters.len());
         for parameter in &function.parameters {
             self.u32(parameter.0);
+        }
+        self.len(function.parameter_metadata.len());
+        for parameter in &function.parameter_metadata {
+            self.parameter_metadata(parameter);
         }
         self.len(function.local_types.len());
         for ty in &function.local_types {
             self.ty(ty);
         }
         self.ty(&function.return_type);
+        self.u8(u8::from(function.generator));
         self.u32(function.owner.map_or(NONE, |owner| owner.0));
         self.u8(u8::from(function.static_method));
         self.len(function.register_types.len());
@@ -465,6 +652,50 @@ impl Encoder {
                 self.u32(property.0);
                 self.u32(value.0);
             }
+            InstructionKind::NewDynamic {
+                target,
+                type_arguments,
+                arguments,
+            } => {
+                self.u8(27);
+                self.u32(target.0);
+                self.len(type_arguments.len());
+                for ty in type_arguments {
+                    self.ty(ty);
+                }
+                self.len(arguments.len());
+                for argument in arguments {
+                    if let Some(name) = &argument.name {
+                        self.u8(1);
+                        self.string(name);
+                    } else {
+                        self.u8(0);
+                    }
+                    self.u32(argument.value.0);
+                    self.span(argument.span);
+                }
+            }
+            InstructionKind::CheckedNarrow { value, narrowed } => {
+                self.u8(28);
+                self.u32(value.0);
+                self.ty(narrowed);
+            }
+            InstructionKind::Closure { function, captures } => {
+                self.u8(29);
+                self.u32(function.0);
+                self.len(captures.len());
+                for capture in captures {
+                    self.u32(capture.0);
+                }
+            }
+            InstructionKind::CallValue { callee, arguments } => {
+                self.u8(30);
+                self.u32(callee.0);
+                self.len(arguments.len());
+                for argument in arguments {
+                    self.u32(argument.0);
+                }
+            }
         }
     }
 
@@ -546,6 +777,178 @@ impl Encoder {
             Callee::Builtin(Builtin::ExceptionConstruct) => self.u8(20),
             Callee::Builtin(Builtin::ExceptionGetCode) => self.u8(21),
             Callee::Builtin(Builtin::ExceptionGetPrevious) => self.u8(22),
+            Callee::Builtin(Builtin::Reflection(operation)) => {
+                self.u8(23);
+                self.u8(operation as u8);
+            }
+            Callee::Builtin(Builtin::IsString) => self.u8(24),
+            Callee::Builtin(Builtin::IsInt) => self.u8(25),
+            Callee::Builtin(Builtin::IsFloat) => self.u8(26),
+            Callee::Builtin(Builtin::IsNull) => self.u8(27),
+            Callee::Builtin(Builtin::IsNumeric) => self.u8(28),
+            Callee::Builtin(Builtin::IsVector) => self.u8(29),
+            Callee::Builtin(Builtin::IsMap) => self.u8(30),
+            Callee::Builtin(Builtin::IteratorFromCollection) => self.u8(31),
+            Callee::Builtin(Builtin::IteratorConstruct) => self.u8(32),
+            Callee::Builtin(Builtin::IteratorRewind) => self.u8(33),
+            Callee::Builtin(Builtin::IteratorValid) => self.u8(34),
+            Callee::Builtin(Builtin::IteratorKey) => self.u8(35),
+            Callee::Builtin(Builtin::IteratorValue) => self.u8(36),
+            Callee::Builtin(Builtin::IteratorAdvance) => self.u8(37),
+            Callee::Builtin(Builtin::IteratorGetInner) => self.u8(38),
+            Callee::Builtin(Builtin::IteratorCount) => self.u8(39),
+            Callee::Builtin(Builtin::IteratorToVector) => self.u8(40),
+            Callee::Builtin(Builtin::IteratorToMap) => self.u8(41),
+            Callee::Builtin(Builtin::VectorMap) => self.u8(42),
+            Callee::Builtin(Builtin::VectorFilter) => self.u8(43),
+            Callee::Builtin(Builtin::VectorSlice) => self.u8(44),
+            Callee::Builtin(Builtin::VectorConcat) => self.u8(45),
+            Callee::Builtin(Builtin::MapTransform) => self.u8(46),
+            Callee::Builtin(Builtin::MapFilter) => self.u8(47),
+            Callee::Builtin(Builtin::MapMerge) => self.u8(48),
+            Callee::Builtin(Builtin::IteratorApply) => self.u8(49),
+            Callee::Builtin(Builtin::CallbackFilterAccept) => self.u8(50),
+            Callee::Builtin(Builtin::CallbackFilterConstruct) => self.u8(51),
+            Callee::Builtin(Builtin::GeneratorGetReturn) => self.u8(52),
+            Callee::Builtin(Builtin::GeneratorClose) => self.u8(53),
+            Callee::Builtin(Builtin::OptionSome) => self.u8(54),
+            Callee::Builtin(Builtin::OptionNone) => self.u8(55),
+            Callee::Builtin(Builtin::OptionIsSome) => self.u8(56),
+            Callee::Builtin(Builtin::OptionIsNone) => self.u8(57),
+            Callee::Builtin(Builtin::OptionGet) => self.u8(58),
+            Callee::Builtin(Builtin::Serialize) => self.u8(59),
+            Callee::Builtin(Builtin::Unserialize) => self.u8(60),
+            Callee::Builtin(Builtin::TraceLineConstruct) => self.u8(61),
+            Callee::Builtin(Builtin::ExceptionGetFile) => self.u8(62),
+            Callee::Builtin(Builtin::ExceptionGetLine) => self.u8(63),
+            Callee::Builtin(Builtin::ExceptionGetTrace) => self.u8(64),
+            Callee::Builtin(Builtin::ExceptionGetTraceAsString) => self.u8(65),
+            Callee::Builtin(Builtin::ExceptionToString) => self.u8(66),
+            Callee::Builtin(Builtin::LimitSeek) => self.u8(67),
+            Callee::Builtin(Builtin::LimitGetPosition) => self.u8(68),
+            Callee::Builtin(Builtin::AppendAdd) => self.u8(69),
+            Callee::Builtin(Builtin::AppendGetIndex) => self.u8(70),
+            Callee::Builtin(Builtin::AppendGetIterator) => self.u8(71),
+            Callee::Builtin(Builtin::CachingHasNext) => self.u8(72),
+            Callee::Builtin(Builtin::CachingCount) => self.u8(73),
+            Callee::Builtin(Builtin::CachingGetCache) => self.u8(74),
+            Callee::Builtin(Builtin::CachingGetFlags) => self.u8(75),
+            Callee::Builtin(Builtin::CachingSetFlags) => self.u8(76),
+            Callee::Builtin(Builtin::CachingOffsetExists) => self.u8(77),
+            Callee::Builtin(Builtin::CachingOffsetGet) => self.u8(78),
+            Callee::Builtin(Builtin::CachingOffsetSet) => self.u8(79),
+            Callee::Builtin(Builtin::CachingOffsetUnset) => self.u8(80),
+            Callee::Builtin(Builtin::CachingToString) => self.u8(81),
+            Callee::Builtin(Builtin::RecursiveEntryConstruct) => self.u8(82),
+            Callee::Builtin(Builtin::RecursiveEntryValue) => self.u8(83),
+            Callee::Builtin(Builtin::RecursiveEntryChildren) => self.u8(84),
+            Callee::Builtin(Builtin::RecursiveWalkConstruct) => self.u8(85),
+            Callee::Builtin(Builtin::RecursiveWalkSetMaxDepth) => self.u8(86),
+            Callee::Builtin(Builtin::RecursiveWalkGetMaxDepth) => self.u8(87),
+            Callee::Builtin(Builtin::RecursiveWalkGetDepth) => self.u8(88),
+            Callee::Builtin(Builtin::RecursiveWalkGetSubIterator) => self.u8(89),
+            Callee::Builtin(Builtin::RecursiveWalkGetRecursiveIterator) => self.u8(90),
+            Callee::Builtin(Builtin::RecursiveWalkHook) => self.u8(91),
+            Callee::Builtin(Builtin::FixedConstruct) => self.u8(92),
+            Callee::Builtin(Builtin::FixedSetSize) => self.u8(93),
+            Callee::Builtin(Builtin::FixedGetSize) => self.u8(94),
+            Callee::Builtin(Builtin::FixedOffsetExists) => self.u8(95),
+            Callee::Builtin(Builtin::FixedOffsetGet) => self.u8(96),
+            Callee::Builtin(Builtin::FixedOffsetSet) => self.u8(97),
+            Callee::Builtin(Builtin::FixedOffsetUnset) => self.u8(98),
+            Callee::Builtin(Builtin::FixedGetIterator) => self.u8(99),
+            Callee::Builtin(Builtin::ListConstruct) => self.u8(100),
+            Callee::Builtin(Builtin::ListPush) => self.u8(101),
+            Callee::Builtin(Builtin::ListPop) => self.u8(102),
+            Callee::Builtin(Builtin::ListUnshift) => self.u8(103),
+            Callee::Builtin(Builtin::ListShift) => self.u8(104),
+            Callee::Builtin(Builtin::ListTop) => self.u8(105),
+            Callee::Builtin(Builtin::ListBottom) => self.u8(106),
+            Callee::Builtin(Builtin::ListCount) => self.u8(107),
+            Callee::Builtin(Builtin::ListIsEmpty) => self.u8(108),
+            Callee::Builtin(Builtin::ListGetIterator) => self.u8(109),
+            Callee::Builtin(Builtin::ListToVector) => self.u8(110),
+            Callee::Builtin(Builtin::HeapConstruct) => self.u8(111),
+            Callee::Builtin(Builtin::HeapInsert) => self.u8(112),
+            Callee::Builtin(Builtin::HeapTop) => self.u8(113),
+            Callee::Builtin(Builtin::HeapExtract) => self.u8(114),
+            Callee::Builtin(Builtin::HeapCount) => self.u8(115),
+            Callee::Builtin(Builtin::HeapIsEmpty) => self.u8(116),
+            Callee::Builtin(Builtin::HeapGetIterator) => self.u8(117),
+            Callee::Builtin(Builtin::TypedMapConstruct) => self.u8(118),
+            Callee::Builtin(Builtin::TypedMapSet) => self.u8(119),
+            Callee::Builtin(Builtin::TypedMapGet) => self.u8(120),
+            Callee::Builtin(Builtin::TypedMapContains) => self.u8(121),
+            Callee::Builtin(Builtin::TypedMapRemove) => self.u8(122),
+            Callee::Builtin(Builtin::TypedMapCount) => self.u8(123),
+            Callee::Builtin(Builtin::TypedMapToMap) => self.u8(124),
+            Callee::Builtin(Builtin::TypedMapGetIterator) => self.u8(125),
+            Callee::Builtin(Builtin::ObjectStorageConstruct) => self.u8(126),
+            Callee::Builtin(Builtin::ObjectStorageAttach) => self.u8(127),
+            Callee::Builtin(Builtin::ObjectStorageGet) => self.u8(128),
+            Callee::Builtin(Builtin::ObjectStorageContains) => self.u8(129),
+            Callee::Builtin(Builtin::ObjectStorageDetach) => self.u8(130),
+            Callee::Builtin(Builtin::ObjectStorageCount) => self.u8(131),
+            Callee::Builtin(Builtin::ObjectStorageGetIterator) => self.u8(132),
+            Callee::Builtin(Builtin::ParentAccept) => self.u8(133),
+            Callee::Builtin(Builtin::RecursiveCallbackConstruct) => self.u8(134),
+            Callee::Builtin(Builtin::RecursiveCallbackAccept) => self.u8(135),
+            Callee::Builtin(Builtin::FilesOpenWrite) => self.u8(136),
+            Callee::Builtin(Builtin::FilesOpenReadWrite) => self.u8(137),
+            Callee::Builtin(Builtin::StreamWrite) => self.u8(138),
+            Callee::Builtin(Builtin::StreamFlush) => self.u8(139),
+            Callee::Builtin(Builtin::StreamIsReadable) => self.u8(140),
+            Callee::Builtin(Builtin::StreamIsWritable) => self.u8(141),
+            Callee::Builtin(Builtin::StreamIsSeekable) => self.u8(142),
+            Callee::Builtin(Builtin::FileInfo(operation)) => {
+                self.u8(143);
+                self.u8(operation as u8);
+            }
+            Callee::Builtin(Builtin::FileObject(operation)) => {
+                self.u8(144);
+                self.u8(operation as u8);
+            }
+            Callee::Builtin(Builtin::Directory(operation)) => {
+                self.u8(145);
+                self.u8(operation as u8);
+            }
+            Callee::Builtin(Builtin::Native(index)) => {
+                self.u8(146);
+                self.u32(index);
+            }
+            Callee::Builtin(Builtin::PregMatch) => self.u8(147),
+            Callee::Builtin(Builtin::PregReplace) => self.u8(148),
+            Callee::Builtin(Builtin::PregSplit) => self.u8(149),
+            Callee::Builtin(Builtin::RegexCaptureText) => self.u8(150),
+            Callee::Builtin(Builtin::RegexCaptureOffset) => self.u8(151),
+            Callee::Builtin(Builtin::RegexIteratorConstruct) => self.u8(152),
+            Callee::Builtin(Builtin::RegexIteratorGetInner) => self.u8(153),
+            Callee::Builtin(Builtin::RegexIteratorGetRegex) => self.u8(154),
+            Callee::Builtin(Builtin::RegexIteratorGetMode) => self.u8(155),
+            Callee::Builtin(Builtin::RegexIteratorGetPregFlags) => self.u8(156),
+            Callee::Builtin(Builtin::SchedulerRegisterDefault) => self.u8(157),
+            Callee::Builtin(Builtin::SchedulerRegister) => self.u8(158),
+            Callee::Builtin(Builtin::SchedulerIsRegistered) => self.u8(159),
+            Callee::Builtin(Builtin::Async) => self.u8(160),
+            Callee::Builtin(Builtin::Await) => self.u8(161),
+            Callee::Builtin(Builtin::Suspend) => self.u8(162),
+            Callee::Builtin(Builtin::Delay) => self.u8(163),
+            Callee::Builtin(Builtin::Timeout) => self.u8(164),
+            Callee::Builtin(Builtin::CoroutineCancel) => self.u8(165),
+            Callee::Builtin(Builtin::CoroutineGetId) => self.u8(166),
+            Callee::Builtin(Builtin::CoroutineIsStarted) => self.u8(167),
+            Callee::Builtin(Builtin::CoroutineIsQueued) => self.u8(168),
+            Callee::Builtin(Builtin::CoroutineIsRunning) => self.u8(169),
+            Callee::Builtin(Builtin::CoroutineIsSuspended) => self.u8(170),
+            Callee::Builtin(Builtin::CoroutineIsCompleted) => self.u8(171),
+            Callee::Builtin(Builtin::CoroutineIsCancelled) => self.u8(172),
+            Callee::Builtin(Builtin::CoroutineSubscribe) => self.u8(173),
+            Callee::Builtin(Builtin::CoroutineResult) => self.u8(174),
+            Callee::Builtin(Builtin::TimeoutCancel) => self.u8(175),
+            Callee::Builtin(Builtin::TimeoutIsCompleted) => self.u8(176),
+            Callee::Builtin(Builtin::TimeoutIsCancelled) => self.u8(177),
+            Callee::Builtin(Builtin::TimeoutSubscribe) => self.u8(178),
+            Callee::Builtin(Builtin::TimeoutResult) => self.u8(179),
         }
     }
 
@@ -591,6 +994,12 @@ impl Encoder {
             Terminator::Throw(value) => {
                 self.u8(4);
                 self.u32(value.0);
+            }
+            Terminator::Yield { key, value, resume } => {
+                self.u8(5);
+                self.u32(key.map_or(NONE, |register| register.0));
+                self.u32(value.0);
+                self.u32(resume.0);
             }
         }
     }
@@ -661,10 +1070,15 @@ impl Decoder<'_> {
     fn span(&mut self) -> Result<Span, DecodeError> {
         let start = self.u32()?;
         let end = self.u32()?;
+        let source = self.u32()?;
         if end < start {
             return Err(self.error("source span ends before it starts"));
         }
-        Ok(Span { start, end })
+        Ok(Span {
+            start,
+            end,
+            source: (source != NONE).then_some(thp_diagnostics::SourceId(source)),
+        })
     }
 
     fn ty(&mut self, depth: usize) -> Result<Type, DecodeError> {
@@ -694,6 +1108,21 @@ impl Decoder<'_> {
                 Type::Union(members)
             }
             11 => Type::Object(self.string()?),
+            12 => Type::Nominal {
+                name: self.string()?,
+                arguments: self.vector(|decoder| decoder.ty(depth + 1))?,
+            },
+            13 => Type::Parameter {
+                id: TypeParameterId {
+                    owner: ClassId(self.u32()?),
+                    index: self.u32()?,
+                },
+                name: self.string()?,
+            },
+            14 => Type::Callable(
+                self.vector(|decoder| decoder.ty(depth + 1))?,
+                Box::new(self.ty(depth + 1)?),
+            ),
             tag => return Err(self.error(format!("unknown type tag {tag}"))),
         })
     }
@@ -709,53 +1138,162 @@ impl Decoder<'_> {
         };
         let abstract_class = self.boolean()?;
         let final_class = self.boolean()?;
-        let properties = self.vector(|decoder| {
-            Ok(Property {
-                ty: decoder.ty(0)?,
-                visibility: decoder.visibility()?,
-                declaring_class: ClassId(decoder.u32()?),
+        let module_name = self.string()?;
+        let native = self.boolean()?;
+        let type_parameters = self.vector(|decoder| {
+            let id = TypeParameterId {
+                owner: ClassId(decoder.u32()?),
+                index: decoder.u32()?,
+            };
+            let name = decoder.string()?;
+            let bound = if decoder.boolean()? {
+                Some(decoder.ty(0)?)
+            } else {
+                None
+            };
+            let span = decoder.span()?;
+            Ok(TypeParameter {
+                id,
+                name,
+                bound,
+                span,
             })
         })?;
-        let methods = self.vector(|decoder| {
-            Ok(Method {
-                name: decoder.string()?,
-                slot: MethodSlot(decoder.u32()?),
-                callee: decoder.optional_callee()?,
-                visibility: decoder.visibility()?,
-                declaring_class: ClassId(decoder.u32()?),
-                static_method: decoder.boolean()?,
-                abstract_method: decoder.boolean()?,
-                final_method: decoder.boolean()?,
-                parameter_types: decoder.vector(|decoder| decoder.ty(0))?,
-                return_type: decoder.ty(0)?,
-            })
-        })?;
+        let properties = self.vector(Self::property)?;
+        let declared_properties = self.vector(Self::property)?;
+        let methods = self.vector(Self::method)?;
+        let declared_methods = self.vector(Self::method)?;
         let dispatch = self.vector(Self::optional_callee)?;
         let interfaces = self.vector(|decoder| Ok(ClassId(decoder.u32()?)))?;
+        let interface_types = self.vector(|decoder| {
+            Ok(NominalType {
+                class: ClassId(decoder.u32()?),
+                arguments: decoder.vector(|decoder| decoder.ty(0))?,
+            })
+        })?;
         let parent = match self.u32()? {
             NONE => None,
             parent => Some(ClassId(parent)),
         };
+        let parent_type = if self.boolean()? {
+            Some(NominalType {
+                class: ClassId(self.u32()?),
+                arguments: self.vector(|decoder| decoder.ty(0))?,
+            })
+        } else {
+            None
+        };
+        let traits = self.vector(|decoder| Ok(ClassId(decoder.u32()?)))?;
         Ok(Class {
             id,
             name,
             kind,
             abstract_class,
             final_class,
+            module_name,
+            native,
+            type_parameters,
             properties,
+            declared_properties,
             methods,
+            declared_methods,
             dispatch,
             interfaces,
+            interface_types,
             parent,
+            parent_type,
+            traits,
+        })
+    }
+
+    fn property(&mut self) -> Result<Property, DecodeError> {
+        Ok(Property {
+            id: PropertyId(self.u32()?),
+            name: self.string()?,
+            ty: self.ty(0)?,
+            visibility: self.visibility()?,
+            declaring_class: ClassId(self.u32()?),
+            default: self.optional_constant_value(0)?,
+            origin_trait: match self.u32()? {
+                NONE => None,
+                origin => Some(ClassId(origin)),
+            },
+        })
+    }
+
+    fn method(&mut self) -> Result<Method, DecodeError> {
+        Ok(Method {
+            name: self.string()?,
+            slot: MethodSlot(self.u32()?),
+            callee: self.optional_callee()?,
+            visibility: self.visibility()?,
+            declaring_class: ClassId(self.u32()?),
+            static_method: self.boolean()?,
+            abstract_method: self.boolean()?,
+            final_method: self.boolean()?,
+            parameter_types: self.vector(|decoder| decoder.ty(0))?,
+            parameters: self.vector(Self::parameter_metadata)?,
+            return_type: self.ty(0)?,
+            origin_trait: match self.u32()? {
+                NONE => None,
+                origin => Some(ClassId(origin)),
+            },
+            origin_name: self.string()?,
+        })
+    }
+
+    fn parameter_metadata(&mut self) -> Result<ParameterMetadata, DecodeError> {
+        Ok(ParameterMetadata {
+            name: self.string()?,
+            ty: self.ty(0)?,
+            default: self.optional_constant_value(0)?,
+            variadic: self.boolean()?,
+        })
+    }
+
+    fn optional_constant_value(
+        &mut self,
+        depth: usize,
+    ) -> Result<Option<ConstantValue>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.constant_value(depth).map(Some),
+            tag => Err(self.error(format!("invalid optional constant tag {tag}"))),
+        }
+    }
+
+    fn constant_value(&mut self, depth: usize) -> Result<ConstantValue, DecodeError> {
+        if depth > MAX_CONSTANT_NESTING {
+            return Err(self.error(format!(
+                "constant nesting exceeds {MAX_CONSTANT_NESTING} levels"
+            )));
+        }
+        Ok(match self.u8()? {
+            0 => ConstantValue::Int(i64::from_ne_bytes(self.u64()?.to_ne_bytes())),
+            1 => ConstantValue::Float(f64::from_bits(self.u64()?)),
+            2 => ConstantValue::Bool(self.boolean()?),
+            3 => ConstantValue::Null,
+            4 => ConstantValue::String(self.blob()?),
+            5 => ConstantValue::Vector(self.vector(|decoder| decoder.constant_value(depth + 1))?),
+            6 => ConstantValue::Map(self.vector(|decoder| {
+                Ok((
+                    decoder.constant_value(depth + 1)?,
+                    decoder.constant_value(depth + 1)?,
+                ))
+            })?),
+            tag => return Err(self.error(format!("invalid constant metadata tag {tag}"))),
         })
     }
 
     fn function(&mut self) -> Result<Function, DecodeError> {
         let id = FunctionId(self.u32()?);
         let name = self.string()?;
+        let module_name = self.string()?;
         let parameters = self.vector(|decoder| Ok(LocalId(decoder.u32()?)))?;
+        let parameter_metadata = self.vector(Self::parameter_metadata)?;
         let local_types = self.vector(|decoder| decoder.ty(0))?;
         let return_type = self.ty(0)?;
+        let generator = self.boolean()?;
         let owner = match self.u32()? {
             NONE => None,
             owner => Some(ClassId(owner)),
@@ -769,9 +1307,12 @@ impl Decoder<'_> {
         Ok(Function {
             id,
             name,
+            module_name,
             parameters,
+            parameter_metadata,
             local_types,
             return_type,
+            generator,
             owner,
             static_method,
             register_types,
@@ -924,6 +1465,38 @@ impl Decoder<'_> {
                 property: PropertyId(self.u32()?),
                 value: Register(self.u32()?),
             },
+            27 => InstructionKind::NewDynamic {
+                target: Register(self.u32()?),
+                type_arguments: self.vector(|decoder| decoder.ty(0))?,
+                arguments: self.vector(|decoder| {
+                    let name = match decoder.u8()? {
+                        0 => None,
+                        1 => Some(decoder.string()?),
+                        tag => {
+                            return Err(
+                                decoder.error(format!("invalid optional argument-name tag {tag}"))
+                            );
+                        }
+                    };
+                    Ok(DynamicArgument {
+                        name,
+                        value: Register(decoder.u32()?),
+                        span: decoder.span()?,
+                    })
+                })?,
+            },
+            28 => InstructionKind::CheckedNarrow {
+                value: Register(self.u32()?),
+                narrowed: self.ty(0)?,
+            },
+            29 => InstructionKind::Closure {
+                function: FunctionId(self.u32()?),
+                captures: self.vector(|decoder| Ok(Register(decoder.u32()?)))?,
+            },
+            30 => InstructionKind::CallValue {
+                callee: Register(self.u32()?),
+                arguments: self.vector(|decoder| Ok(Register(decoder.u32()?)))?,
+            },
             tag => return Err(self.error(format!("unknown instruction tag {tag}"))),
         };
         Ok(Instruction {
@@ -981,6 +1554,40 @@ impl Decoder<'_> {
 
     fn callee(&mut self) -> Result<Callee, DecodeError> {
         match self.u8()? {
+            146 => Ok(Callee::Builtin(Builtin::Native(self.u32()?))),
+            147 => Ok(Callee::Builtin(Builtin::PregMatch)),
+            148 => Ok(Callee::Builtin(Builtin::PregReplace)),
+            149 => Ok(Callee::Builtin(Builtin::PregSplit)),
+            150 => Ok(Callee::Builtin(Builtin::RegexCaptureText)),
+            151 => Ok(Callee::Builtin(Builtin::RegexCaptureOffset)),
+            152 => Ok(Callee::Builtin(Builtin::RegexIteratorConstruct)),
+            153 => Ok(Callee::Builtin(Builtin::RegexIteratorGetInner)),
+            154 => Ok(Callee::Builtin(Builtin::RegexIteratorGetRegex)),
+            155 => Ok(Callee::Builtin(Builtin::RegexIteratorGetMode)),
+            156 => Ok(Callee::Builtin(Builtin::RegexIteratorGetPregFlags)),
+            157 => Ok(Callee::Builtin(Builtin::SchedulerRegisterDefault)),
+            158 => Ok(Callee::Builtin(Builtin::SchedulerRegister)),
+            159 => Ok(Callee::Builtin(Builtin::SchedulerIsRegistered)),
+            160 => Ok(Callee::Builtin(Builtin::Async)),
+            161 => Ok(Callee::Builtin(Builtin::Await)),
+            162 => Ok(Callee::Builtin(Builtin::Suspend)),
+            163 => Ok(Callee::Builtin(Builtin::Delay)),
+            164 => Ok(Callee::Builtin(Builtin::Timeout)),
+            165 => Ok(Callee::Builtin(Builtin::CoroutineCancel)),
+            166 => Ok(Callee::Builtin(Builtin::CoroutineGetId)),
+            167 => Ok(Callee::Builtin(Builtin::CoroutineIsStarted)),
+            168 => Ok(Callee::Builtin(Builtin::CoroutineIsQueued)),
+            169 => Ok(Callee::Builtin(Builtin::CoroutineIsRunning)),
+            170 => Ok(Callee::Builtin(Builtin::CoroutineIsSuspended)),
+            171 => Ok(Callee::Builtin(Builtin::CoroutineIsCompleted)),
+            172 => Ok(Callee::Builtin(Builtin::CoroutineIsCancelled)),
+            173 => Ok(Callee::Builtin(Builtin::CoroutineSubscribe)),
+            174 => Ok(Callee::Builtin(Builtin::CoroutineResult)),
+            175 => Ok(Callee::Builtin(Builtin::TimeoutCancel)),
+            176 => Ok(Callee::Builtin(Builtin::TimeoutIsCompleted)),
+            177 => Ok(Callee::Builtin(Builtin::TimeoutIsCancelled)),
+            178 => Ok(Callee::Builtin(Builtin::TimeoutSubscribe)),
+            179 => Ok(Callee::Builtin(Builtin::TimeoutResult)),
             0 => Ok(Callee::Function(FunctionId(self.u32()?))),
             1 => Ok(Callee::Builtin(Builtin::Count)),
             2 => Ok(Callee::Builtin(Builtin::VarDump)),
@@ -1004,6 +1611,145 @@ impl Decoder<'_> {
             20 => Ok(Callee::Builtin(Builtin::ExceptionConstruct)),
             21 => Ok(Callee::Builtin(Builtin::ExceptionGetCode)),
             22 => Ok(Callee::Builtin(Builtin::ExceptionGetPrevious)),
+            23 => ReflectionBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::Reflection(operation)))
+                .ok_or_else(|| self.error("unknown reflection builtin")),
+            24 => Ok(Callee::Builtin(Builtin::IsString)),
+            25 => Ok(Callee::Builtin(Builtin::IsInt)),
+            26 => Ok(Callee::Builtin(Builtin::IsFloat)),
+            27 => Ok(Callee::Builtin(Builtin::IsNull)),
+            28 => Ok(Callee::Builtin(Builtin::IsNumeric)),
+            29 => Ok(Callee::Builtin(Builtin::IsVector)),
+            30 => Ok(Callee::Builtin(Builtin::IsMap)),
+            31 => Ok(Callee::Builtin(Builtin::IteratorFromCollection)),
+            32 => Ok(Callee::Builtin(Builtin::IteratorConstruct)),
+            33 => Ok(Callee::Builtin(Builtin::IteratorRewind)),
+            34 => Ok(Callee::Builtin(Builtin::IteratorValid)),
+            35 => Ok(Callee::Builtin(Builtin::IteratorKey)),
+            36 => Ok(Callee::Builtin(Builtin::IteratorValue)),
+            37 => Ok(Callee::Builtin(Builtin::IteratorAdvance)),
+            38 => Ok(Callee::Builtin(Builtin::IteratorGetInner)),
+            39 => Ok(Callee::Builtin(Builtin::IteratorCount)),
+            40 => Ok(Callee::Builtin(Builtin::IteratorToVector)),
+            41 => Ok(Callee::Builtin(Builtin::IteratorToMap)),
+            42 => Ok(Callee::Builtin(Builtin::VectorMap)),
+            43 => Ok(Callee::Builtin(Builtin::VectorFilter)),
+            44 => Ok(Callee::Builtin(Builtin::VectorSlice)),
+            45 => Ok(Callee::Builtin(Builtin::VectorConcat)),
+            46 => Ok(Callee::Builtin(Builtin::MapTransform)),
+            47 => Ok(Callee::Builtin(Builtin::MapFilter)),
+            48 => Ok(Callee::Builtin(Builtin::MapMerge)),
+            49 => Ok(Callee::Builtin(Builtin::IteratorApply)),
+            50 => Ok(Callee::Builtin(Builtin::CallbackFilterAccept)),
+            51 => Ok(Callee::Builtin(Builtin::CallbackFilterConstruct)),
+            52 => Ok(Callee::Builtin(Builtin::GeneratorGetReturn)),
+            53 => Ok(Callee::Builtin(Builtin::GeneratorClose)),
+            54 => Ok(Callee::Builtin(Builtin::OptionSome)),
+            55 => Ok(Callee::Builtin(Builtin::OptionNone)),
+            56 => Ok(Callee::Builtin(Builtin::OptionIsSome)),
+            57 => Ok(Callee::Builtin(Builtin::OptionIsNone)),
+            58 => Ok(Callee::Builtin(Builtin::OptionGet)),
+            59 => Ok(Callee::Builtin(Builtin::Serialize)),
+            60 => Ok(Callee::Builtin(Builtin::Unserialize)),
+            61 => Ok(Callee::Builtin(Builtin::TraceLineConstruct)),
+            62 => Ok(Callee::Builtin(Builtin::ExceptionGetFile)),
+            63 => Ok(Callee::Builtin(Builtin::ExceptionGetLine)),
+            64 => Ok(Callee::Builtin(Builtin::ExceptionGetTrace)),
+            65 => Ok(Callee::Builtin(Builtin::ExceptionGetTraceAsString)),
+            66 => Ok(Callee::Builtin(Builtin::ExceptionToString)),
+            67 => Ok(Callee::Builtin(Builtin::LimitSeek)),
+            68 => Ok(Callee::Builtin(Builtin::LimitGetPosition)),
+            69 => Ok(Callee::Builtin(Builtin::AppendAdd)),
+            70 => Ok(Callee::Builtin(Builtin::AppendGetIndex)),
+            71 => Ok(Callee::Builtin(Builtin::AppendGetIterator)),
+            72 => Ok(Callee::Builtin(Builtin::CachingHasNext)),
+            73 => Ok(Callee::Builtin(Builtin::CachingCount)),
+            74 => Ok(Callee::Builtin(Builtin::CachingGetCache)),
+            75 => Ok(Callee::Builtin(Builtin::CachingGetFlags)),
+            76 => Ok(Callee::Builtin(Builtin::CachingSetFlags)),
+            77 => Ok(Callee::Builtin(Builtin::CachingOffsetExists)),
+            78 => Ok(Callee::Builtin(Builtin::CachingOffsetGet)),
+            79 => Ok(Callee::Builtin(Builtin::CachingOffsetSet)),
+            80 => Ok(Callee::Builtin(Builtin::CachingOffsetUnset)),
+            81 => Ok(Callee::Builtin(Builtin::CachingToString)),
+            82 => Ok(Callee::Builtin(Builtin::RecursiveEntryConstruct)),
+            83 => Ok(Callee::Builtin(Builtin::RecursiveEntryValue)),
+            84 => Ok(Callee::Builtin(Builtin::RecursiveEntryChildren)),
+            85 => Ok(Callee::Builtin(Builtin::RecursiveWalkConstruct)),
+            86 => Ok(Callee::Builtin(Builtin::RecursiveWalkSetMaxDepth)),
+            87 => Ok(Callee::Builtin(Builtin::RecursiveWalkGetMaxDepth)),
+            88 => Ok(Callee::Builtin(Builtin::RecursiveWalkGetDepth)),
+            89 => Ok(Callee::Builtin(Builtin::RecursiveWalkGetSubIterator)),
+            90 => Ok(Callee::Builtin(Builtin::RecursiveWalkGetRecursiveIterator)),
+            91 => Ok(Callee::Builtin(Builtin::RecursiveWalkHook)),
+            92 => Ok(Callee::Builtin(Builtin::FixedConstruct)),
+            93 => Ok(Callee::Builtin(Builtin::FixedSetSize)),
+            94 => Ok(Callee::Builtin(Builtin::FixedGetSize)),
+            95 => Ok(Callee::Builtin(Builtin::FixedOffsetExists)),
+            96 => Ok(Callee::Builtin(Builtin::FixedOffsetGet)),
+            97 => Ok(Callee::Builtin(Builtin::FixedOffsetSet)),
+            98 => Ok(Callee::Builtin(Builtin::FixedOffsetUnset)),
+            99 => Ok(Callee::Builtin(Builtin::FixedGetIterator)),
+            100 => Ok(Callee::Builtin(Builtin::ListConstruct)),
+            101 => Ok(Callee::Builtin(Builtin::ListPush)),
+            102 => Ok(Callee::Builtin(Builtin::ListPop)),
+            103 => Ok(Callee::Builtin(Builtin::ListUnshift)),
+            104 => Ok(Callee::Builtin(Builtin::ListShift)),
+            105 => Ok(Callee::Builtin(Builtin::ListTop)),
+            106 => Ok(Callee::Builtin(Builtin::ListBottom)),
+            107 => Ok(Callee::Builtin(Builtin::ListCount)),
+            108 => Ok(Callee::Builtin(Builtin::ListIsEmpty)),
+            109 => Ok(Callee::Builtin(Builtin::ListGetIterator)),
+            110 => Ok(Callee::Builtin(Builtin::ListToVector)),
+            111 => Ok(Callee::Builtin(Builtin::HeapConstruct)),
+            112 => Ok(Callee::Builtin(Builtin::HeapInsert)),
+            113 => Ok(Callee::Builtin(Builtin::HeapTop)),
+            114 => Ok(Callee::Builtin(Builtin::HeapExtract)),
+            115 => Ok(Callee::Builtin(Builtin::HeapCount)),
+            116 => Ok(Callee::Builtin(Builtin::HeapIsEmpty)),
+            117 => Ok(Callee::Builtin(Builtin::HeapGetIterator)),
+            118 => Ok(Callee::Builtin(Builtin::TypedMapConstruct)),
+            119 => Ok(Callee::Builtin(Builtin::TypedMapSet)),
+            120 => Ok(Callee::Builtin(Builtin::TypedMapGet)),
+            121 => Ok(Callee::Builtin(Builtin::TypedMapContains)),
+            122 => Ok(Callee::Builtin(Builtin::TypedMapRemove)),
+            123 => Ok(Callee::Builtin(Builtin::TypedMapCount)),
+            124 => Ok(Callee::Builtin(Builtin::TypedMapToMap)),
+            125 => Ok(Callee::Builtin(Builtin::TypedMapGetIterator)),
+            126 => Ok(Callee::Builtin(Builtin::ObjectStorageConstruct)),
+            127 => Ok(Callee::Builtin(Builtin::ObjectStorageAttach)),
+            128 => Ok(Callee::Builtin(Builtin::ObjectStorageGet)),
+            129 => Ok(Callee::Builtin(Builtin::ObjectStorageContains)),
+            130 => Ok(Callee::Builtin(Builtin::ObjectStorageDetach)),
+            131 => Ok(Callee::Builtin(Builtin::ObjectStorageCount)),
+            132 => Ok(Callee::Builtin(Builtin::ObjectStorageGetIterator)),
+            133 => Ok(Callee::Builtin(Builtin::ParentAccept)),
+            134 => Ok(Callee::Builtin(Builtin::RecursiveCallbackConstruct)),
+            135 => Ok(Callee::Builtin(Builtin::RecursiveCallbackAccept)),
+            136 => Ok(Callee::Builtin(Builtin::FilesOpenWrite)),
+            137 => Ok(Callee::Builtin(Builtin::FilesOpenReadWrite)),
+            138 => Ok(Callee::Builtin(Builtin::StreamWrite)),
+            139 => Ok(Callee::Builtin(Builtin::StreamFlush)),
+            140 => Ok(Callee::Builtin(Builtin::StreamIsReadable)),
+            141 => Ok(Callee::Builtin(Builtin::StreamIsWritable)),
+            142 => Ok(Callee::Builtin(Builtin::StreamIsSeekable)),
+            143 => FileInfoBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::FileInfo(operation)))
+                .ok_or_else(|| self.error("unknown file-info builtin")),
+            144 => FileObjectBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::FileObject(operation)))
+                .ok_or_else(|| self.error("unknown file-object builtin")),
+            145 => DirectoryBuiltin::ALL
+                .get(usize::from(self.u8()?))
+                .copied()
+                .map(|operation| Callee::Builtin(Builtin::Directory(operation)))
+                .ok_or_else(|| self.error("unknown directory builtin")),
             tag => Err(self.error(format!("unknown callee tag {tag}"))),
         }
     }
@@ -1047,6 +1793,14 @@ impl Decoder<'_> {
             })),
             3 => Ok(Terminator::Unreachable),
             4 => Ok(Terminator::Throw(Register(self.u32()?))),
+            5 => Ok(Terminator::Yield {
+                key: match self.u32()? {
+                    NONE => None,
+                    register => Some(Register(register)),
+                },
+                value: Register(self.u32()?),
+                resume: BlockId(self.u32()?),
+            }),
             tag => Err(self.error(format!("unknown terminator tag {tag}"))),
         }
     }

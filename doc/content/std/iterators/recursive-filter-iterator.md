@@ -10,6 +10,11 @@ typeParameters:
     description: The key type preserved from the wrapped iterator.
   - name: T
     description: The T type parameter.
+parent:
+  id: std.spl.FilterIterator
+  arguments:
+    - K
+    - RecursiveEntry<K, T>
 interfaces:
   - id: std.spl.RecursiveIterator
     arguments:
@@ -18,14 +23,14 @@ interfaces:
   - id: std.spl.OuterIterator
     arguments:
       - K
-      - RecursiveEntry<T>
+      - RecursiveEntry<K, T>
 constants: []
 properties: []
 status: experimental
-availability: proposed
+availability: implemented
 notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+  This experimental abstract class is implemented. Concrete subclasses supply
+  a boolean accept method for an entry and its key.
 version: "0.1"
 ---
 
@@ -41,9 +46,9 @@ This is an abstract class.
 
 ## Behavior
 
-Concrete subclasses implement `accept()`. Accepted entries retain their
-original child iterators; recursive filtering of descendants is performed by
-wrapping those child iterators with the same policy.
+Concrete subclasses implement `accept(RecursiveEntry<K, T>, K): bool`.
+Accepted entries retain their values; child iterators are wrapped with a copy
+of the same filter policy. Callback failures propagate to the caller.
 
 ## Errors
 

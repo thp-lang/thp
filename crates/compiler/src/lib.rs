@@ -2,19 +2,23 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use thp_bytecode::{Program as BytecodeProgram, lower as lower_bytecode, verify};
-use thp_config::ProjectConfig;
+use thp_config::{AutoloadConfig, LOCK_FILE_NAME, LockFile, ProjectConfig};
 use thp_diagnostics::{Diagnostic, SourceFile, SourceId, SourceMap, Span};
-use thp_hir::{Module as HirModule, lower as lower_hir};
+use thp_hir::{
+    Module as HirModule, lower_with_modules as lower_hir_with_modules, lower_with_native_functions,
+};
 use thp_metrics::{Metrics, Stage};
 use thp_mir::{Module as MirModule, lower as lower_mir};
 use thp_modules::{
     AutoloadMapping, FilesystemSourceProvider, ModuleGraph, ModuleId, ModuleInterface, ModulePath,
     ModuleSourceProvider, build_export_index, extract_interface, resolve_program,
 };
+use thp_native::Registry;
 use thp_opcache::{
     ArtifactKind, CACHE_FORMAT_VERSION, CacheKey, CacheStatus, FrozenManifest, Store,
 };
@@ -92,6 +96,7 @@ pub struct ProjectCompilation {
     pub hir: Option<HirModule>,
     pub mir: Option<MirModule>,
     pub bytecode: Option<BytecodeProgram>,
+    pub native_registry: Registry,
     pub diagnostics: Vec<ProjectDiagnostic>,
     pub metrics: Metrics,
 }
@@ -116,6 +121,7 @@ impl ProjectCompilation {
 #[derive(Clone, Debug)]
 pub struct PreparedProject {
     pub bytecode: BytecodeProgram,
+    pub native_registry: Registry,
     pub sources: SourceMap,
     pub entry_source: SourceId,
 }
@@ -129,6 +135,7 @@ impl PreparedProject {
             .source_id;
         Some(Self {
             bytecode: compilation.bytecode.clone()?,
+            native_registry: compilation.native_registry.clone(),
             sources: compilation.sources.clone(),
             entry_source,
         })
@@ -218,13 +225,8 @@ pub fn compile_path(path: impl AsRef<Path>) -> Result<Compilation, LoadError> {
 /// Returns project configuration, discovery, or source loading failures.
 /// Language errors remain available in [`ProjectCompilation::diagnostics`].
 pub fn compile_project(request: &ProjectRequest) -> Result<ProjectCompilation, LoadError> {
-    let configuration = ProjectConfig::load(&request.project_root).map_err(|error| LoadError {
-        path: error.path.clone(),
-        message: error.to_string(),
-        metrics: Metrics::default(),
-    })?;
-    let mappings = configuration
-        .autoload()
+    let autoload = project_autoload(&request.project_root)?;
+    let mappings = autoload
         .iter()
         .map(|(prefix, directories)| AutoloadMapping::new(prefix, directories.clone()))
         .collect::<Result<Vec<_>, _>>()
@@ -237,6 +239,145 @@ pub fn compile_project(request: &ProjectRequest) -> Result<ProjectCompilation, L
     compile_project_with_provider(request, &provider)
 }
 
+fn project_autoload(root: &Path) -> Result<AutoloadConfig, LoadError> {
+    if root.join(LOCK_FILE_NAME).exists() {
+        LockFile::load(root)
+            .map(|lock| lock.project().autoload.clone())
+            .map_err(|error| {
+                let message = error.to_string();
+                LoadError {
+                    path: error.path,
+                    message,
+                    metrics: Metrics::default(),
+                }
+            })
+    } else {
+        ProjectConfig::load(root)
+            .map(|configuration| configuration.resolved_autoload().clone())
+            .map_err(|error| {
+                let message = error.to_string();
+                LoadError {
+                    path: error.path,
+                    message,
+                    metrics: Metrics::default(),
+                }
+            })
+    }
+}
+
+fn project_native_registry(request: &ProjectRequest) -> Result<Registry, LoadError> {
+    let profile = if request.project_root.join(LOCK_FILE_NAME).exists() {
+        Some(
+            LockFile::load(&request.project_root)
+                .map_err(|error| LoadError {
+                    path: error.path,
+                    message: error.message,
+                    metrics: Metrics::default(),
+                })?
+                .select(request.target.as_deref())
+                .clone(),
+        )
+    } else if request.project_root.join("thp.toml").exists() {
+        Some(
+            ProjectConfig::load(&request.project_root)
+                .and_then(|config| config.resolve(request.target.as_deref()))
+                .map_err(|error| LoadError {
+                    path: error.path,
+                    message: error.message,
+                    metrics: Metrics::default(),
+                })?,
+        )
+    } else {
+        None
+    };
+    let paths = profile.as_ref().map(|profile| &profile.extension_libraries);
+    let settings = profile
+        .as_ref()
+        .map(thp_config::ResolvedProfile::extensions);
+    Registry::load(
+        &request.project_root,
+        paths.unwrap_or(&BTreeMap::new()),
+        settings.unwrap_or(&BTreeMap::new()),
+    )
+    .map_err(|message| LoadError {
+        path: request.project_root.join("thp.toml"),
+        message,
+        metrics: Metrics::default(),
+    })
+}
+
+fn project_configuration_bytes(root: &Path) -> Result<Vec<u8>, LoadError> {
+    let lock_path = root.join(LOCK_FILE_NAME);
+    let (mut bytes, project) = if lock_path.exists() {
+        let lock = LockFile::load(root).map_err(|error| {
+            let message = error.to_string();
+            LoadError {
+                path: error.path,
+                message,
+                metrics: Metrics::default(),
+            }
+        })?;
+        let bytes = fs::read(&lock_path).map_err(|error| LoadError {
+            path: lock_path,
+            message: error.to_string(),
+            metrics: Metrics::default(),
+        })?;
+        (bytes, lock.project().clone())
+    } else {
+        let configuration = ProjectConfig::load(root).map_err(|error| {
+            let message = error.to_string();
+            LoadError {
+                path: error.path,
+                message,
+                metrics: Metrics::default(),
+            }
+        })?;
+        let bytes = configuration
+            .source_fingerprint()
+            .map(String::into_bytes)
+            .map_err(|error| {
+                let message = error.to_string();
+                LoadError {
+                    path: error.path,
+                    message,
+                    metrics: Metrics::default(),
+                }
+            })?;
+        let project = configuration.resolve_all().map_err(|error| LoadError {
+            path: error.path,
+            message: error.message,
+            metrics: Metrics::default(),
+        })?;
+        (bytes, project)
+    };
+    let paths = project
+        .common
+        .extension_libraries
+        .values()
+        .chain(
+            project
+                .targets
+                .values()
+                .flat_map(|profile| profile.extension_libraries.values()),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in paths {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+        let content = fs::read(&path).map_err(|error| LoadError {
+            path: path.clone(),
+            message: format!("cannot read extension library: {error}"),
+            metrics: Metrics::default(),
+        })?;
+        bytes.extend_from_slice(path.to_string_lossy().as_bytes());
+        bytes.extend_from_slice(blake3::hash(&content).as_bytes());
+    }
+    Ok(bytes)
+}
+
 /// Compiles a project using a host-provided synchronous source provider.
 ///
 /// # Errors
@@ -246,6 +387,7 @@ pub fn compile_project_with_provider(
     request: &ProjectRequest,
     provider: &dyn ModuleSourceProvider,
 ) -> Result<ProjectCompilation, LoadError> {
+    let native_registry = project_native_registry(request)?;
     let mut metrics = Metrics::default();
     let modules = metrics
         .measure(Stage::ModuleDiscovery, || provider.enumerate())
@@ -267,6 +409,13 @@ pub fn compile_project_with_provider(
                 metrics: Metrics::default(),
             })?;
         let source_id = sources.add(source.clone());
+        let Some(source) = sources.get(source_id).cloned() else {
+            return Err(LoadError {
+                path: module.path,
+                message: "source map rejected an inserted source".to_owned(),
+                metrics,
+            });
+        };
         let lexed = metrics.measure(Stage::Lexing, || lex(&source));
         let parsed = metrics.measure(Stage::Parsing, || {
             parse_tokens(&source, lexed.tokens, lexed.diagnostics)
@@ -337,7 +486,7 @@ pub fn compile_project_with_provider(
             }),
         }
     }
-    let interfaces = units
+    let mut interfaces = units
         .iter()
         .filter_map(|unit| unit.interface.clone())
         .collect::<Vec<_>>();
@@ -407,6 +556,21 @@ pub fn compile_project_with_provider(
                     }),
             );
         }
+        if diagnostics.is_empty() {
+            for unit in &mut units {
+                match extract_interface(&unit.module, unit.source_id, &unit.ast) {
+                    Ok(interface) => unit.interface = Some(interface),
+                    Err(diagnostic) => diagnostics.push(ProjectDiagnostic {
+                        source: unit.source_id,
+                        diagnostic,
+                    }),
+                }
+            }
+            interfaces = units
+                .iter()
+                .filter_map(|unit| unit.interface.clone())
+                .collect();
+        }
     }
 
     if !diagnostics.is_empty() {
@@ -418,6 +582,7 @@ pub fn compile_project_with_provider(
             hir: None,
             mir: None,
             bytecode: None,
+            native_registry,
             diagnostics,
             metrics,
         });
@@ -440,16 +605,28 @@ pub fn compile_project_with_provider(
         statements,
         span: entry.ast.span,
     };
-    let lowered_hir = metrics.measure(Stage::Hir, || lower_hir(&linked_ast));
-    diagnostics.extend(
-        lowered_hir
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| ProjectDiagnostic {
-                source: entry.source_id,
-                diagnostic,
-            }),
-    );
+    let mut declaration_modules = BTreeMap::new();
+    declaration_modules.insert("<main>".to_owned(), entry.module.id.to_string());
+    for unit in &units {
+        collect_declaration_modules(&unit.ast, unit.module.id.as_str(), &mut declaration_modules);
+    }
+    let lowered_hir = metrics.measure(Stage::Hir, || {
+        lower_with_native_functions(
+            &linked_ast,
+            &declaration_modules,
+            &native_registry.signatures(),
+        )
+    });
+    diagnostics.extend(lowered_hir.diagnostics.into_iter().map(|diagnostic| {
+        ProjectDiagnostic {
+            source: diagnostic
+                .labels
+                .first()
+                .and_then(|label| label.source)
+                .unwrap_or(entry.source_id),
+            diagnostic,
+        }
+    }));
     let hir = lowered_hir.module;
     if !diagnostics.is_empty() {
         return Ok(ProjectCompilation {
@@ -460,19 +637,24 @@ pub fn compile_project_with_provider(
             hir: Some(hir),
             mir: None,
             bytecode: None,
+            native_registry,
             diagnostics,
             metrics,
         });
     }
     let mir = metrics.measure(Stage::Mir, || lower_mir(&hir));
-    let bytecode = metrics.measure(Stage::Linking, || lower_bytecode(&mir));
+    let mut bytecode = metrics.measure(Stage::Linking, || lower_bytecode(&mir));
+    bytecode.sources = sources
+        .iter()
+        .map(|(_, source)| source_info(source))
+        .collect();
     if let Err(error) = metrics.measure(Stage::Verification, || verify(&bytecode)) {
         diagnostics.push(ProjectDiagnostic {
             source: entry.source_id,
             diagnostic: Diagnostic::error(
                 "bytecode_verification",
                 "B0001",
-                Span::empty(0),
+                Span::empty_in(entry.source_id, 0),
                 error.to_string(),
             ),
         });
@@ -485,6 +667,7 @@ pub fn compile_project_with_provider(
         hir: Some(hir),
         mir: Some(mir),
         bytecode: diagnostics.is_empty().then_some(bytecode),
+        native_registry,
         diagnostics,
         metrics,
     })
@@ -504,12 +687,7 @@ pub fn cache_warm_project(
     if !compilation.is_success() {
         return Ok((compilation, None));
     }
-    let configuration =
-        fs::read(request.project_root.join("thp.toml")).map_err(|error| LoadError {
-            path: request.project_root.join("thp.toml"),
-            message: error.to_string(),
-            metrics: Metrics::default(),
-        })?;
+    let configuration = project_configuration_bytes(&request.project_root)?;
     let mut interface_hashes = compilation
         .interfaces
         .iter()
@@ -531,7 +709,11 @@ pub fn cache_warm_project(
             interface
                 .exports
                 .iter()
-                .map(|export| (export.kind.as_str(), export.name.as_str()))
+                .map(|export| (
+                    export.kind.as_str(),
+                    export.name.as_str(),
+                    export.signature.as_str(),
+                ))
                 .collect::<Vec<_>>()
         );
         let reused = compilation
@@ -541,7 +723,7 @@ pub fn cache_warm_project(
             })
             .ok()
             .flatten()
-            .is_some();
+            .is_some_and(|cached| cached == payload.as_bytes());
         if !reused {
             compilation
                 .metrics
@@ -704,12 +886,8 @@ pub fn load_frozen_project(
     request: &ProjectRequest,
     store: &Store,
 ) -> Result<PreparedProject, LoadError> {
-    let configuration_path = request.project_root.join("thp.toml");
-    let configuration = fs::read(&configuration_path).map_err(|error| LoadError {
-        path: configuration_path.clone(),
-        message: error.to_string(),
-        metrics: Metrics::default(),
-    })?;
+    let native_registry = project_native_registry(request)?;
+    let configuration = project_configuration_bytes(&request.project_root)?;
     let expected_fingerprint = project_fingerprint(request, &configuration);
     let manifest = store
         .load_manifest(&manifest_key(&expected_fingerprint))
@@ -743,6 +921,13 @@ pub fn load_frozen_project(
         .to_owned(),
         metrics: Metrics::default(),
     })?;
+    native_registry
+        .verify(&bytecode.native_functions)
+        .map_err(|message| LoadError {
+            path: request.project_root.join("thp.toml"),
+            message,
+            metrics: Metrics::default(),
+        })?;
     let entry_path = if request.entry.is_absolute() {
         request.entry.clone()
     } else {
@@ -752,6 +937,7 @@ pub fn load_frozen_project(
     let entry_source = sources.add(SourceFile::new(entry_path, ""));
     Ok(PreparedProject {
         bytecode,
+        native_registry,
         sources,
         entry_source,
     })
@@ -937,7 +1123,13 @@ fn compile_source_with_metrics(source: SourceFile, mut metrics: Metrics) -> Comp
         };
     }
 
-    let lowered_hir = metrics.measure(Stage::Hir, || lower_hir(&ast));
+    let module_name = ModuleId::synthetic_entry(source.path()).to_string();
+    let mut declaration_modules = BTreeMap::new();
+    declaration_modules.insert("<main>".to_owned(), module_name.clone());
+    collect_declaration_modules(&ast, &module_name, &mut declaration_modules);
+    let lowered_hir = metrics.measure(Stage::Hir, || {
+        lower_hir_with_modules(&ast, &declaration_modules)
+    });
     if let Some(measurement) = metrics.last_mut() {
         measurement.set_output(
             lowered_hir.module.expression_count(),
@@ -963,7 +1155,8 @@ fn compile_source_with_metrics(source: SourceFile, mut metrics: Metrics) -> Comp
     if let Some(measurement) = metrics.last_mut() {
         measurement.set_output(mir.instruction_count(), std::mem::size_of_val(&mir));
     }
-    let bytecode = metrics.measure(Stage::Bytecode, || lower_bytecode(&mir));
+    let mut bytecode = metrics.measure(Stage::Bytecode, || lower_bytecode(&mir));
+    bytecode.sources.push(source_info(&source));
     if let Some(measurement) = metrics.last_mut() {
         measurement.set_output(
             bytecode.instruction_count(),
@@ -995,8 +1188,41 @@ fn compile_source_with_metrics(source: SourceFile, mut metrics: Metrics) -> Comp
     }
 }
 
+fn source_info(source: &SourceFile) -> thp_bytecode::SourceInfo {
+    let mut line_starts = vec![0];
+    for (index, byte) in source.text().bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(u32::try_from(index + 1).expect("source offsets fit u32"));
+        }
+    }
+    thp_bytecode::SourceInfo {
+        path: source.path().to_string_lossy().into_owned(),
+        line_starts,
+    }
+}
+
+fn collect_declaration_modules(
+    program: &AstProgram,
+    module: &str,
+    output: &mut BTreeMap<String, String>,
+) {
+    for statement in &program.statements {
+        let name = match &statement.kind {
+            thp_syntax::StmtKind::Function(declaration) => Some(&declaration.name),
+            thp_syntax::StmtKind::Class(declaration) => Some(&declaration.name),
+            thp_syntax::StmtKind::Interface(declaration) => Some(&declaration.name),
+            thp_syntax::StmtKind::Trait(declaration) => Some(&declaration.name),
+            _ => None,
+        };
+        if let Some(name) = name {
+            output.insert(name.clone(), module.to_owned());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use thp_config::build_lock;
     use thp_opcache::{CacheStatus, Store};
 
     use super::{
@@ -1119,6 +1345,216 @@ mod tests {
     }
 
     #[test]
+    fn compiles_discovered_packages_live_and_from_a_fresh_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("vendor/acme/math");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\npackages = \"vendor/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("thp.toml"),
+            "[autoload]\n\"Acme\\\\Math\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/functions.thp"),
+            "<?thp\nnamespace Acme\\Math;\nfunction answer(): int { return 42; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("main.thp"),
+            "<?thp\nuse function Acme\\Math\\answer;\necho answer();\n",
+        )
+        .unwrap();
+        let request = ProjectRequest::new(directory.path(), "main.thp");
+        assert!(compile_project(&request).unwrap().is_success());
+        build_lock(directory.path()).unwrap();
+        assert!(compile_project(&request).unwrap().is_success());
+
+        std::fs::write(
+            package.join("thp.toml"),
+            "# changed\n[autoload]\n\"Acme\\\\Math\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        assert!(
+            compile_project(&request)
+                .unwrap_err()
+                .message
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn compiler_preserves_project_and_lock_error_context() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\npackages = \"../vendor\"\n",
+        )
+        .unwrap();
+        let request = ProjectRequest::new(directory.path(), "main.thp");
+        let project_error = compile_project(&request).unwrap_err().to_string();
+
+        std::fs::write(directory.path().join("thp.toml"), "").unwrap();
+        std::fs::write(
+            directory.path().join("thp.lock"),
+            format!(
+                "THP-LOCK 2\nfingerprint {}\nprofile common\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        let lock_error = compile_project(&request).unwrap_err().to_string();
+        assert!(
+            project_error.contains(":2:1 (autoload.packages):")
+                && lock_error.contains(":3:1 (format):"),
+            "project error: {project_error}\nlock error: {lock_error}"
+        );
+    }
+
+    #[test]
+    fn frozen_project_rejects_changed_package_autoload_without_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("vendor/acme/message");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::create_dir_all(package.join("replacement")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\npackages = \"vendor/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("thp.toml"),
+            "[autoload]\n\"Acme\\\\Message\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        for (directory_name, value) in [("src", "old"), ("replacement", "new")] {
+            std::fs::write(
+                package.join(directory_name).join("Message.thp"),
+                format!(
+                    "<?thp\nnamespace Acme\\Message;\nfunction message(): string {{ return \"{value}\"; }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            directory.path().join("main.thp"),
+            "<?thp\nuse function Acme\\Message\\message;\necho message();\n",
+        )
+        .unwrap();
+        let request = ProjectRequest::new(directory.path(), "main.thp");
+        let store = Store::new(directory.path().join("cache"));
+        assert!(cache_warm_project(&request, &store).unwrap().0.is_success());
+
+        std::fs::write(
+            package.join("thp.toml"),
+            "[autoload]\n\"Acme\\\\Message\\\\\" = \"replacement/\"\n",
+        )
+        .unwrap();
+        assert!(compile_project(&request).unwrap().is_success());
+        assert!(load_frozen_project(&request, &store).is_err());
+    }
+
+    #[test]
+    fn compiles_generic_contracts_across_modules() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\n\"App\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Value.thp"),
+            r"<?thp
+namespace App;
+interface Named { public function name(): string; }
+interface Value<T extends Named> { public function value(): T; }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Base.thp"),
+            r"<?thp
+namespace App;
+abstract class Base<T extends Named> implements Value<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Box.thp"),
+            "<?thp\nnamespace App;\nclass Box<T extends Named> extends Base<T> {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/Wrapped.thp"),
+            "<?thp\nnamespace App;\nclass Wrapped<U extends Value<T>, T extends Named> {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("main.thp"),
+            r#"<?thp
+use App\Value;
+use App\Box;
+class Label implements App\Named {
+    public string $text;
+    public function __construct(string $text) { $this->text = $text; }
+    public function name(): string { return $this->text; }
+}
+$value: Value<Label> = new Box(new Label("modules"));
+echo $value->value()->name();
+"#,
+        )
+        .unwrap();
+        let compilation = compile_project(&ProjectRequest::new(
+            directory.path(),
+            directory.path().join("main.thp"),
+        ))
+        .unwrap();
+        assert!(
+            compilation.is_success(),
+            "{}",
+            compilation.rendered_diagnostics()
+        );
+        let value_interface = compilation
+            .interfaces
+            .iter()
+            .flat_map(|interface| &interface.exports)
+            .find(|export| export.name == "App\\Value")
+            .unwrap();
+        assert!(
+            value_interface
+                .signature
+                .contains("parameters=T:App\\Named")
+        );
+        let box_export = compilation
+            .interfaces
+            .iter()
+            .flat_map(|interface| &interface.exports)
+            .find(|export| export.name == "App\\Box")
+            .unwrap();
+        assert_eq!(box_export.parent.as_deref(), Some("App\\Base<T>"));
+        let wrapped_export = compilation
+            .interfaces
+            .iter()
+            .flat_map(|interface| &interface.exports)
+            .find(|export| export.name == "App\\Wrapped")
+            .unwrap();
+        assert!(
+            wrapped_export
+                .signature
+                .contains("parameters=U:App\\Value<T>,T:App\\Named")
+        );
+    }
+
+    #[test]
     fn warms_and_loads_a_frozen_project_without_sources() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("src")).unwrap();
@@ -1134,7 +1570,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             directory.path().join("main.thp"),
-            "<?thp\nuse function App\\message;\necho message();\n",
+            "<?thp\nuse function App\\message;\necho message();\necho (new ReflectionFunction(\"App\\\\message\"))->getName();\n",
         )
         .unwrap();
         let request = ProjectRequest::new(directory.path(), directory.path().join("main.thp"));
@@ -1146,6 +1582,13 @@ mod tests {
         std::fs::remove_dir_all(directory.path().join("src")).unwrap();
         let prepared = load_frozen_project(&request, &store).unwrap();
         assert!(prepared.bytecode.instruction_count() > 0);
+        assert!(
+            prepared
+                .bytecode
+                .functions
+                .iter()
+                .any(|function| function.name == "App\\message" && !function.module_name.is_empty())
+        );
     }
 
     #[test]
@@ -1160,12 +1603,22 @@ mod tests {
         let library = directory.path().join("src/Math.thp");
         std::fs::write(
             &library,
-            "<?thp\nnamespace App;\nfunction calculate(int $value): int { return $value * 2; }\n",
+            r"<?thp
+namespace App;
+interface Left {}
+interface Right {}
+class Item implements Left, Right {}
+class Box<T extends Left> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+",
         )
         .unwrap();
         std::fs::write(
             directory.path().join("main.thp"),
-            "<?thp\nuse function App\\calculate;\necho calculate(2) . \"\";\n",
+            "<?thp\nuse App\\Box;\nuse App\\Item;\n$box = new Box(new Item());\necho \"ok\";\n",
         )
         .unwrap();
         let request = ProjectRequest::new(directory.path(), directory.path().join("main.thp"));
@@ -1175,7 +1628,17 @@ mod tests {
 
         std::fs::write(
             &library,
-            "<?thp\nnamespace App;\nfunction calculate(int $value): int { return $value + 2; }\n",
+            r"<?thp
+namespace App;
+interface Left {}
+interface Right {}
+class Item implements Left, Right {}
+class Box<T extends Left> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { $copy = $this->item; return $copy; }
+}
+",
         )
         .unwrap();
         let (body_edit, _) = cache_warm_project(&request, &store).unwrap();
@@ -1196,7 +1659,17 @@ mod tests {
 
         std::fs::write(
             &library,
-            "<?thp\nnamespace App;\nfunction calculate(int $number): int { return $number + 2; }\n",
+            r"<?thp
+namespace App;
+interface Left {}
+interface Right {}
+class Item implements Left, Right {}
+class Box<T extends Right> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { $copy = $this->item; return $copy; }
+}
+",
         )
         .unwrap();
         let (interface_edit, _) = cache_warm_project(&request, &store).unwrap();
@@ -1208,5 +1681,47 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn project_hir_and_diagnostics_retain_their_source_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("thp.toml"),
+            "[autoload]\n\"App\\\\\" = \"src/\"\n",
+        )
+        .unwrap();
+        let library = directory.path().join("src/Broken.thp");
+        std::fs::write(
+            &library,
+            "<?thp\nnamespace App;\nfunction broken(): int { return \"no\"; }\n",
+        )
+        .unwrap();
+        let entry = directory.path().join("main.thp");
+        std::fs::write(&entry, "<?thp\necho \"entry\";\n").unwrap();
+
+        let compilation = compile_project(&ProjectRequest::new(directory.path(), &entry)).unwrap();
+        let library_id = compilation
+            .units
+            .iter()
+            .find(|unit| unit.source.path() == library)
+            .unwrap()
+            .source_id;
+        assert!(
+            compilation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.source == library_id)
+        );
+        let function = compilation
+            .hir
+            .as_ref()
+            .unwrap()
+            .functions
+            .iter()
+            .find(|function| function.name == "App\\broken")
+            .unwrap();
+        assert_eq!(function.span.source, Some(library_id));
     }
 }

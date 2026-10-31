@@ -11,16 +11,10 @@ returns:
   type: void
   description: This function does not return a value.
 errors:
-  - description: "The call fails when:"
-  - description: a scheduler has already been registered;
-  - description: asynchronous work started before registration completed; or
-  - description: the built-in scheduler cannot be initialized.
-  - description: The concrete error types are not yet finalized.
+  - description: A second registration throws Error at this call site.
 related: []
 status: experimental
-availability: proposed
-notice: This function is proposed and is not implemented in this repository. The
-  built-in scheduler and its registration lifecycle may change.
+availability: implemented
 version: "0.1"
 module: async
 ---
@@ -31,9 +25,9 @@ does not provide its own scheduler.
 
 ## Behavior
 
-Registration is process-wide and must happen before the first call to
-[`async()`](thp:std.async.async) or [`await()`](thp:std.async.await). The built-in scheduler remains
-active for the lifetime of the process.
+Registration is request-local and must happen before starting asynchronous work.
+The default scheduler selects ready coroutines in FIFO order. A second call to
+either registration function throws `Error`.
 
 Calling this function is equivalent to creating THP's default
 [`SchedulerInterface`](thp:std.async.SchedulerInterface) implementation and registering

@@ -12,8 +12,7 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: Awaitable is a proposed generic interface and is not implemented in this repository.
+availability: implemented
 version: "0.1"
 ---
 
@@ -22,9 +21,8 @@ version: "0.1"
 
 ## Contract
 
-`Awaitable` is a marker interface. The scheduler and higher-level asynchronous
-operations use it to recognize readiness sources; it does not expose a public
-polling method.
+`Awaitable` is a marker interface. It does not expose a public polling method,
+and `await()` accepts the stronger `Completable<T>` contract.
 
 An awaitable may become ready more than once. One-shot results use the stronger
 [`Completable<T>`](thp:std.async.Completable) contract.

@@ -15,6 +15,7 @@ thp-compiler = { path = "../compiler" }
 thp-diagnostics = { path = "../diagnostics" }
 thp-embed = { path = "../embed" }
 thp-modules = { path = "../modules" }
+thp-native = { path = "../native" }
 thp-runtime = { path = "../runtime" }
 thp-vm = { path = "../vm" }
 

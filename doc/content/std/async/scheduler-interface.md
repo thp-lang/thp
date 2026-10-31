@@ -2,7 +2,7 @@
 kind: interface
 id: std.async.SchedulerInterface
 title: SchedulerInterface
-summary: Defines coroutine creation, suspension, and scheduling.
+summary: Selects the next ready coroutine from THP's request-owned queue.
 name: SchedulerInterface
 module: async
 typeParameters: []
@@ -10,41 +10,40 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This interface is proposed and is not implemented in this repository. The
-  runtime integration contract may change.
+availability: implemented
 version: "0.1"
 ---
 
-`SchedulerInterface` defines the operations a scheduler must provide to create,
-suspend, enqueue, and time coroutines.
+`SchedulerInterface` has one method, [`chooseNext()`](thp:std.async.SchedulerInterface::chooseNext):
+
+```thp
+interface SchedulerInterface {
+    function chooseNext(vector<int> $ready): int;
+}
+```
 
 ## Contract
 
-Implementations manage when enqueued coroutines run and how a suspended
-coroutine returns control to the scheduler. They must also arrange non-blocking
-timers for `delay()` and `timeout()`, and cooperate with runtime I/O adapters
-that suspend the current coroutine.
+THP owns the ready queue, timers, I/O readiness, cancellation, and VM context
+switching. `chooseNext()` receives the IDs currently ready and must return one
+of those IDs. IDs are unique within a request. The method cannot suspend or
+reenter the scheduler. An invalid choice throws `Error`; an exception from the
+callback fails the request.
 
-The interface does not prescribe a queue implementation or execution order.
-Implementations must avoid starvation and must never execute two coroutines in
-parallel on the scheduler thread.
+The default scheduler chooses the first ready ID in FIFO order. A custom
+scheduler changes selection only; it cannot create or run coroutines directly.
 
 ## Example
 
-The following function creates a coroutine and submits it to a scheduler:
+The following scheduler selects the last ready coroutine:
 
 ```thp
-function schedule<T>(
-    SchedulerInterface $scheduler,
-    callable $function,
-    mixed ...$arguments,
-): Coroutine<T> {
-    $coroutine = $scheduler->newCoroutine<T>($function, ...$arguments);
-    $scheduler->enqueue($coroutine);
+<?thp
 
-    return $coroutine;
+final class LastReadyScheduler implements SchedulerInterface {
+    function chooseNext(vector<int> $ready): int {
+        return $ready[count($ready) - 1];
+    }
 }
 ```
 

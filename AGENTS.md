@@ -18,7 +18,8 @@ language authorities.
 `crates/` contains the Rust 2024 implementation workspace. Compiler phases have
 separate crates for syntax, HIR, MIR, bytecode, runtime values, the VM, JIT,
 static module discovery/indexing, OPcache, metrics, orchestration, safe
-embedding/SAPI adapters, the versioned C ABI, the CLI, and the reusable
+embedding/SAPI adapters, native extension loading and value handles, the
+versioned C ABI, the CLI, and the reusable
 `thp-test` PHPT runner; preserve those one-way
 dependencies. Run selected PHPT files with
 `cargo run -p thp-test -- [--max-instructions=N] PATH...`. The public C header is
@@ -36,6 +37,10 @@ runtime settings must not require parsing extension-owned TOML. See
 interfaces, dependency edges, deterministic graph order, SCCs, and project
 name resolution. It must not depend on HIR, MIR, bytecode, the VM, or platform
 presentation layers.
+`crates/native` owns ABI-v1 native library loading, fixed function signatures,
+and call-scoped opaque values. Check it with `cargo check -p thp-native` and
+keep the C declarations in `crates/abi/include/thp.h` aligned with its
+`#[repr(C)]` structs.
 `benchmarks/modules/` is the opt-in PHP/THP static-module comparison suite.
 Follow its README, warm every artifact before measurement, and record the
 environment and exact commands with results; do not add hardware-sensitive CI

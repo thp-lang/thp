@@ -30,6 +30,11 @@ Entries are immutable and published atomically. A hit is fully decoded and
 verified before use; a missing, corrupt, or incompatible normal entry compiles
 again.
 
+Generic signatures and bounds participate in module-interface hashes and the
+bytecode schema identity. Generic bodies retain parameter-dependent value types,
+which are outside the baseline JIT subset; `auto` therefore selects the VM for
+them.
+
 Project cache warming uses separate artifacts:
 
 | Extension | Contents                                      |
@@ -41,9 +46,11 @@ Project cache warming uses separate artifacts:
 
 The manifest is published last. Frozen execution validates project and format
 identity, configuration, entry selection, referenced artifacts, and the linked
-program without scanning mapped source directories.
+program without scanning mapped source directories. Deployment preparation
+generates the configuration lock before warming those artifacts.
 
 ```console
+thp lock --project=.
 thp cache-warm --project=. --opcache=.thp-cache main.thp
 thp run --project=. --frozen --opcache=.thp-cache main.thp
 ```
