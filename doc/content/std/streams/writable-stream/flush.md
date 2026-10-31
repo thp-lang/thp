@@ -18,11 +18,8 @@ errors:
 related:
   - std.streams.WritableStream
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: Native writable streams flush their backing storage and report I/O failures.
 version: "0.1"
 owner: std.streams.WritableStream
 visibility: public

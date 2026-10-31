@@ -1,7 +1,8 @@
 # THP documentation compiler
 
 This directory contains the source and compiler for the static THP
-documentation website. It requires Node 22 or newer and pnpm 10.14.
+documentation website. It requires Node 22.13 or newer in the Node 22 series, or Node 24 or newer,
+and pnpm 10.14.
 
 ## Pipeline
 

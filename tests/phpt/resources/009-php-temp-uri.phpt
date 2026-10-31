@@ -8,13 +8,13 @@ $stream = Streams::open(
     OpenMode::ReadWrite,
 );
 
-if (
-    $stream instanceof ReadableStream
-    && $stream instanceof WritableStream
-    && $stream instanceof SeekableStream
-) {
+if ($stream instanceof WritableStream) {
     $stream->writeAll("spill");
+}
+if ($stream instanceof SeekableStream) {
     $stream->seek(0);
+}
+if ($stream instanceof ReadableStream) {
     echo $stream->readAll() . "\n";
 }
 --EXPECT--

@@ -92,6 +92,7 @@ impl Engine {
         context: &ExecutionContext,
     ) -> Response {
         let context = self.constrain_context(context);
+        let _native = prepared.project.native_registry.activate();
         let mut metrics = Metrics::default();
         let execution = metrics.measure(Stage::PreparedExecution, || {
             execute_captured(&prepared.project.bytecode, &context)
@@ -140,6 +141,7 @@ impl Engine {
         sink: &mut dyn Write,
     ) -> StreamingResponse {
         let context = self.constrain_context(context);
+        let _native = prepared.project.native_registry.activate();
         let mut metrics = Metrics::default();
         let execution = metrics.measure(Stage::PreparedExecution, || {
             execute_to(&prepared.project.bytecode, &context, sink)

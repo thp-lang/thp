@@ -16,10 +16,8 @@ errors:
       or propagate as the experimental THP I/O failure where no sentinel is available.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: partial
+notice: Returns the byte cursor; I/O failures throw instead of returning false.
 version: "0.1"
 owner: std.spl.SplFileObject
 visibility: public

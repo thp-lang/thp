@@ -10,10 +10,6 @@ parameters:
   - name: object_or_class
     type: object|string
     description: Object instance or qualified type name to inspect.
-  - name: autoload
-    type: bool
-    description: Whether an unknown type name may trigger autoloading.
-    default: "true"
 returns:
   type: map<string, string>|false
   description:
@@ -21,8 +17,8 @@ returns:
     when the type cannot be resolved.
 errors:
   - description:
-      Lookup, callback, or iteration failures propagate. Concrete THP error
-      classes for invalid inputs are not yet established.
+      Lookup or iteration failures propagate. Concrete THP error classes for
+      invalid inputs are not yet established.
 related: []
 status: experimental
 availability: proposed
@@ -37,12 +33,12 @@ module: data-structures
 
 ## Behavior
 
-The result includes interfaces inherited through parent classes and parent interfaces. When `$autoload` is `false`, lookup does not invoke the autoload queue.
+The result includes interfaces inherited through parent classes and parent interfaces.
 
 ## Example
 
 ```thp
-$interfaces = class_implements(AppService::class, autoload: false);
+$interfaces = class_implements(AppService::class);
 ```
 
 ## See also

@@ -27,11 +27,8 @@ errors:
 related:
   - std.streams.SeekableStream
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: All three SeekFrom origins execute for memory, temporary, and regular-file streams.
 version: "0.1"
 owner: std.streams.SeekableStream
 visibility: public

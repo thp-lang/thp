@@ -13,10 +13,7 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  Timeout is proposed and is not implemented in this repository. Its failure type
-  and cancellation behavior are not finalized.
+availability: implemented
 version: "0.1"
 ---
 
@@ -31,11 +28,14 @@ be supplied as the cancellation source for [`await()`](thp:std.async.await).
 
 ## Behavior
 
-A fired timeout completes with a failure rather than a value. Its
+A fired timeout completes with `TimeoutException` rather than a value. Its
 `Completable<mixed>` parameter exists only so it can serve as a general
 cancellation source; successful completion does not produce a value. When used
 as the second argument of `await()`, timeout completion cancels only the wait;
 the target operation remains active.
+Cancelling a pending timeout releases its timer resource.
+The cancelled timeout is terminal and `result()` throws
+`CancellationException`.
 
 ## Example
 

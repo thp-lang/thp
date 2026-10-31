@@ -14,16 +14,11 @@ returns:
   type: void
   description: This function does not return a value.
 errors:
-  - description:
-      A negative $milliseconds value is invalid. The call also fails when no
-      scheduler is registered or the active scheduler cannot create the timer. Concrete
-      error types are not yet finalized.
+  - description: A negative duration or invalid context throws Error.
+  - description: Pending cancellation throws CancellationException at this checkpoint.
 related: []
 status: experimental
-availability: proposed
-notice:
-  delay() is proposed and is not implemented in this repository. Timing precision
-  and cancellation failure types are not finalized.
+availability: implemented
 version: "0.1"
 module: async
 ---
@@ -33,7 +28,7 @@ has elapsed.
 
 ## Behavior
 
-For a positive duration, the scheduler arranges a timer and runs other ready
+For a positive duration, THP arranges a monotonic deadline and runs other ready
 work. The coroutine becomes eligible to resume after the duration has elapsed;
 load may make the actual delay longer.
 

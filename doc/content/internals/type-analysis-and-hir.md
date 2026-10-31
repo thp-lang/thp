@@ -56,6 +56,14 @@ operands, calls and argument binding, collection element types, visibility,
 inheritance, overrides, trait composition, constructors, exception catches,
 and the implemented control-flow requirements.
 
+Generic declarations receive declaration-owned parameter identities in HIR.
+Nominal types retain their argument lists, and parent/interface edges retain
+their instantiations. One centralized substitution path is used for bounds,
+subtyping, inherited properties and constructors, method lookup, overrides,
+and interface requirements. A generic method body is checked once under those
+parameter identities; runtime values depending on an unbounded parameter use
+the conservative general-value representation.
+
 Diagnostics keep the AST span that caused the mismatch. For example, `echo`
 currently requires a string; passing an integer produces a type diagnostic on
 the expression rather than a runtime conversion.

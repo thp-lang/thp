@@ -22,16 +22,11 @@ returns:
   type: void
   description: This callable does not return a value.
 errors:
-  - description:
-      Construction fails when an argument violates the documented contract or an
-      underlying resource cannot be created. Concrete THP error classes remain
-      experimental unless named above.
+  - description: Throws ValueError when offset is negative or limit is less than -1.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.LimitIterator
 visibility: public

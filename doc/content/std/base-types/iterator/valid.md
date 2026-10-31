@@ -13,8 +13,8 @@ returns:
 errors: []
 related: []
 status: experimental
-availability: proposed
-notice: This member belongs to an experimental API contract and is not implemented in this repository.
+availability: implemented
+notice: This method signature participates in executable interface checks and virtual dispatch.
 version: "0.1"
 owner: std.baseTypes.Iterator
 visibility: public
@@ -29,6 +29,8 @@ currently identifies an element.
 This method does not move the cursor. It returns `false` for an empty iterator,
 before a successful positioning operation, and after exhaustion. Repeated
 calls return the same result until `rewind()` or `advance()` changes the cursor.
+During `foreach`, this is the first call in each iteration, before `value()` and
+the optional `key()` call.
 
 ## Example
 

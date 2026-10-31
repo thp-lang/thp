@@ -12,10 +12,8 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired exception class contract is proposed and is not implemented in
-  this repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: This native exception class is constructible and catchable.
 version: "0.1"
 ---
 
@@ -35,7 +33,7 @@ Construction and diagnostic access are inherited from `RuntimeException`.
 throw new OverflowException("operation failed");
 ```
 
-The example demonstrates the proposed inheritance name only; concrete APIs do not yet promise this failure type.
+The class and inheritance are executable; failure sites are documented by each API.
 
 ## See also
 

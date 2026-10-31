@@ -9,10 +9,11 @@ nav:
 status: experimental
 availability: partial
 notice: >-
-  The nominal object model described here is experimental. Generic interfaces,
-  interface state, trait constants, static properties, property hooks, magic
-  methods, anonymous classes, cloning, reflection, and serialization remain
-  outside the executable contract.
+  The nominal object model and reified generic classes/interfaces are
+  experimental. Generic functions, methods, and traits, interface state, trait
+  constants, static properties, property hooks, magic methods, anonymous
+  classes, cloning, and serialization remain outside the executable
+  contract.
 ---
 
 A class groups state and behavior. Instances are created with `new`; methods
@@ -50,16 +51,19 @@ lexically:
 Trait members become members of the consuming class before these rules are
 applied. Both the type checker and bytecode verifier enforce access.
 
-Property names are unique across an inheritance hierarchy; a descendant cannot
-replace even a private parent property. Concrete classes are flattened with
-parent slots first, then composed-trait properties, then class properties.
+Public and protected property names remain unique across an inheritance
+hierarchy. A descendant may privately redeclare a parent-private property; the
+parent slot remains intact and the child receives a distinct slot. Concrete
+classes are flattened with parent slots first, then composed-trait properties,
+then class properties.
 Inherited slots keep their index. Constant defaults for all flattened
 properties run before the effective constructor, and reading a property that
-was never initialized is a runtime error.
+was never initialized is a runtime error. Property defaults may nest at most
+128 vector or map levels.
 
 ## Interfaces and inheritance
 
-Interfaces are non-generic, methods-only nominal contracts. An interface may
+Interfaces are methods-only nominal contracts. An interface may
 extend zero or one interface. A class may extend zero or one class and implement
 multiple comma-separated interfaces. Class and interface ancestry is
 transitive.
@@ -126,10 +130,102 @@ cannot be replaced by a descendant or a trait.
 
 Overrides are deliberately strict. Staticness, parameter names and order,
 parameter types, defaults, variadic shape, and return type must match exactly.
-Visibility may stay equal or widen, never narrow. A descendant cannot redeclare
-a parent-private method name. Constructors follow the same compatibility
+Visibility may stay equal or widen, never narrow. A descendant may redeclare a
+parent-private method name as a distinct declaration; code already resolved in
+the parent remains bound to the parent method. Constructors follow the same compatibility
 rules, are inherited when omitted, and are not invoked implicitly when a child
 declares its own constructor.
+
+## Generic classes and interfaces
+
+Classes and interfaces declare invariant type parameters. Each parameter may
+have one nominal upper bound, and bounds may refer to parameters from the same
+declaration:
+
+```thp
+interface Source<T>
+{
+}
+
+class Box<T, U extends Source<T>>
+{
+    public T $value;
+
+    public function __construct(T $value)
+    {
+        $this->value = $value;
+    }
+
+    public function value(): T
+    {
+        return $this->value;
+    }
+}
+```
+
+A generic name always has its exact argument count in a static type position.
+Arguments cannot contain `void` and must satisfy substituted bounds. Parameters
+may appear in properties, method signatures and bodies, parent classes,
+implemented interfaces, and bounds. Member access through a parameter requires
+a bound that provides that member.
+
+Generic arguments are invariant: `Source<Dog>` is not assignable to
+`Source<Animal>`, even if `Dog` extends `Animal`. Parent and interface arguments
+are substituted through the complete hierarchy. Reaching the same generic
+interface with different arguments is an error.
+
+Construction accepts explicit arguments (`new Box<int>(1)`) or infers them
+from supplied constructor arguments (`new Box(1)`). Inference binds positional,
+named, and variadic arguments first, then structurally matches class parameters
+inside nominal, `vector`, and `map` types. Repeated occurrences must infer the
+same exact type. Defaults, omitted arguments, unions, subtype conversion,
+assignment context, and return context do not infer arguments; an
+underdetermined or conflicting call must provide explicit arguments.
+
+## Dynamic construction
+
+`new $class(...)` and `new (expression)<T, U>(...)` resolve a class at runtime.
+The target expression must have the narrowed static type `string`; it is
+evaluated once, followed by each explicit argument once in source order. The
+result type is always `mixed`.
+
+```thp
+$class: mixed = "App\\Service\\Worker";
+if (is_string($class)) {
+    $worker = new $class<string>(name: "queue");
+    if ($worker instanceof Worker) {
+        $worker->run();
+    }
+}
+```
+
+Lookup is exact, case-sensitive, and uses the compiled program's canonical
+class names. It does not apply the caller's namespace, normalize a leading
+backslash, load source files, autoload, invoke callbacks, or use reflection.
+Interfaces, traits, abstract classes, native classes, unknown names, and
+inaccessible constructors fail with `Error`; invalid UTF-8 names fail with
+`ValueError`. Runtime argument mismatches are type errors.
+
+Explicit generic arguments are checked after lookup. Missing trailing
+arguments become `mixed`, excess arguments fail, and every declared bound must
+still be satisfied. Constructor defaults, names, variadics, visibility,
+inheritance, and property defaults use the same rules as static construction.
+Collections used as defaults are freshly materialized for each object. Because
+object generic arguments are erased, a parameterized runtime compatibility
+check that cannot be proved fails safely.
+
+Named static access to a generic class is explicit, as in
+`Box<int>::make(1)`. Inside a generic class, `self`, `parent`, and `static`
+retain the lexical instantiation. Runtime objects retain their concrete generic
+arguments while sharing one class ID per declaration; no monomorphization occurs, and
+`$value instanceof Box` tests that erased ID. `instanceof Box<int>` is rejected.
+Generic throwable declarations and generic catch targets are unsupported.
+Duplicate parameters are diagnosed at the repeated name. Arity, raw-type,
+`void`-argument, and bound failures point to the offending nominal reference;
+failed constructor inference points to the complete `new` expression and adds
+a note to supply explicit arguments. Parameter defaults, `in`/`out` variance,
+intersection bounds, generic functions, generic methods, and generic traits are
+not accepted by this milestone.
 
 ## Dispatch and class scope
 
@@ -147,7 +243,8 @@ method without an object. Constructors are selected from the effective class
 hierarchy and invoked directly.
 
 `instanceof` accepts a class or interface name and follows the complete nominal
-graph. It does not currently narrow the static type of the tested expression.
+graph. A direct positive `if ($value instanceof Foo)` condition narrows that
+local to `Foo` within the branch when `Foo` is non-generic.
 
 ## Traits
 

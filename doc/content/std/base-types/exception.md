@@ -14,9 +14,8 @@ status: experimental
 availability: partial
 notice: >-
   The compiler and reference VM implement construction, nominal subtype
-  catching, message, code, previous, and suppressed-failure state. Source
-  origin, trace inspection, cloning rules, and string conversion remain
-  proposed.
+  catching, message, code, previous, suppressed-failure state, origin, trace,
+  and string conversion. Cloning rules remain proposed.
 version: "0.1"
 ---
 

@@ -27,10 +27,10 @@ constants:
     description: Yields children before their parent.
 properties: []
 status: experimental
-availability: proposed
+availability: implemented
 notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+  This experimental class is implemented for recursive iterators and entries.
+  Child lookup and callback failures propagate to the caller.
 version: "0.1"
 ---
 
@@ -52,7 +52,8 @@ children-before-parent ordering. Child iterators come from each current
 
 PHP's `CATCH_GET_CHILD` flag can suppress failures while obtaining child
 iterators. THP omits that flag: failures from a `RecursiveEntry` child
-iterator propagate to the caller.
+iterator propagate to the caller. A depth limit treats entries at that depth
+as leaves. Rewinding restarts the root and hooks.
 
 ## Errors
 

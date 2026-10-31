@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test-First Regression Fix"
+  short_description: "Find and repair THP regressions test-first"
+  default_prompt: "Use $test-first-regression-fix to inspect these changes for bugs, reproduce each confirmed issue with a failing test, and fix the root cause."

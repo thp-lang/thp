@@ -181,20 +181,29 @@ Finish the existing partial stream contract:
 Then implement filesystem metadata and file iterators. This must precede
 `DirectoryIterator`, `GlobIterator`, and their recursive adapters.
 
-## v0.11.0: Async and extensions
+## v0.11.0: Native extensions and regex
 
 Prerequisites: the callable, generator, and cleanup contracts are documented,
 implemented, and covered by conformance tests.
 
-Implement:
+Implemented: fixed typed native functions through ABI version 1, checked
+call-scoped value handles, project library loading, and a bundled PCRE2 regex
+extension with `RegexIterator` and `RecursiveRegexIterator`.
 
-- coroutine scheduling and cancellation;
-- `async()`, `await()`, `delay()`, `suspend()`, and `timeout()`;
-- extension registration and native-call dispatch;
-- bundled extension APIs;
-- a regex extension, followed by `RegexIterator` and
-  `RecursiveRegexIterator`;
-- runtime autoload callbacks.
+Coroutine scheduling and cancellation, `async()`, `await()`, `delay()`,
+`suspend()`, `timeout()`, other bundled extension APIs, and runtime autoload
+callbacks remain proposed for later work.
+
+## v0.12.0: Async runtime
+
+Implemented: request-local FIFO and custom scheduling, typed coroutine calls,
+one-shot completions and subscriptions, cancellation, monotonic timers,
+deadlock detection, and draining of spawned work. Explicit VM frame stacks
+resume nested calls, generators, iterator adapters, and reflected calls through
+suspension. File-backed streams and filesystem operations, including
+temporary-file spill, run on four bounded standard-library workers. Synchronous
+host input and output callbacks and ABI-v1 native callbacks can block all
+coroutines.
 
 ## Capability checkpoints
 
@@ -205,7 +214,8 @@ Implement:
 | Lazy sequences             | v0.7.0  | Generators exposed through the iterator protocol               |
 | Base library               | v0.9.0  | Foundational protocols, throwable traces, and core structures  |
 | I/O library                | v0.10.0 | Complete streams, filesystem objects, and filesystem iterators |
-| Concurrency and extensions | v0.11.0 | Async runtime and extension dispatch                           |
+| Native extensions          | v0.11.0 | Fixed typed C calls and bundled PCRE2 regex                     |
+| Async runtime               | v0.12.0 | Coroutines, completions, timers, and worker-backed file streams  |
 
 For every version, require positive, negative, and boundary unit tests plus
 PHPT coverage. Update `doc/content/guides/implementation-status.md`, and mark an

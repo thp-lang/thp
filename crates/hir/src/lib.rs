@@ -2,15 +2,32 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::rc::Rc;
 
 use thp_diagnostics::{Diagnostic, Span};
 use thp_syntax::{
     Argument, BinaryOp, Block, Expr, ExprKind, ForClause, ForClauseKind, FunctionDecl, MatchArm,
-    MethodDecl, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation, TraitUse, TypeSyntax,
-    TypeSyntaxKind, UnaryOp, Visibility,
+    MethodDecl, NewTarget, NominalRef, Program, ScopeTarget, Stmt, StmtKind, TraitAdaptation,
+    TraitUse, TypeParameterDecl as SyntaxTypeParameter, TypeSyntax, TypeSyntaxKind, UnaryOp,
+    Visibility,
 };
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TypeParameterId {
+    pub owner: ClassId,
+    pub index: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TypeParameter {
+    pub id: TypeParameterId,
+    pub name: String,
+    pub bound: Option<Type>,
+    pub span: Span,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Type {
@@ -24,8 +41,11 @@ pub enum Type {
     Mixed,
     Vector(Box<Type>),
     Map(Box<Type>, Box<Type>),
+    Callable(Vec<Type>, Box<Type>),
     Union(Vec<Type>),
     Object(String),
+    Nominal { name: String, arguments: Vec<Type> },
+    Parameter { id: TypeParameterId, name: String },
 }
 
 impl Type {
@@ -35,10 +55,17 @@ impl Type {
             Self::Float => Representation::F64,
             Self::Bool => Representation::Bool,
             Self::String => Representation::Bytes,
-            Self::Vector(_) | Self::Map(_, _) | Self::Object(_) => Representation::Reference,
-            Self::Null | Self::Void | Self::Never | Self::Mixed | Self::Union(_) => {
-                Representation::Value
-            }
+            Self::Vector(_)
+            | Self::Map(_, _)
+            | Self::Callable(_, _)
+            | Self::Object(_)
+            | Self::Nominal { .. } => Representation::Reference,
+            Self::Null
+            | Self::Void
+            | Self::Never
+            | Self::Mixed
+            | Self::Union(_)
+            | Self::Parameter { .. } => Representation::Value,
         }
     }
 
@@ -93,7 +120,24 @@ impl fmt::Display for Type {
             Self::Mixed => formatter.write_str("mixed"),
             Self::Vector(element) => write!(formatter, "vector<{element}>"),
             Self::Map(key, value) => write!(formatter, "map<{key}, {value}>"),
-            Self::Object(name) => formatter.write_str(name),
+            Self::Callable(parameters, result) => {
+                formatter.write_str("callable<")?;
+                for parameter in parameters {
+                    write!(formatter, "{parameter}, ")?;
+                }
+                write!(formatter, "{result}>")
+            }
+            Self::Object(name) | Self::Parameter { name, .. } => formatter.write_str(name),
+            Self::Nominal { name, arguments } => {
+                write!(formatter, "{name}<")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{argument}")?;
+                }
+                formatter.write_str(">")
+            }
             Self::Union(members) => {
                 for (index, member) in members.iter().enumerate() {
                     if index > 0 {
@@ -132,6 +176,25 @@ pub struct PropertyId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MethodSlot(pub u32);
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstantValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+    String(Vec<u8>),
+    Vector(Vec<Self>),
+    Map(Vec<(Self, Self)>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParameterMetadata {
+    pub name: String,
+    pub ty: Type,
+    pub default: Option<ConstantValue>,
+    pub variadic: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NominalKind {
     Class,
@@ -141,20 +204,156 @@ pub enum NominalKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Builtin {
+    Native(u32),
+    SchedulerRegisterDefault,
+    SchedulerRegister,
+    SchedulerIsRegistered,
+    Async,
+    Await,
+    Suspend,
+    Delay,
+    Timeout,
+    CoroutineCancel,
+    CoroutineGetId,
+    CoroutineIsStarted,
+    CoroutineIsQueued,
+    CoroutineIsRunning,
+    CoroutineIsSuspended,
+    CoroutineIsCompleted,
+    CoroutineIsCancelled,
+    CoroutineSubscribe,
+    CoroutineResult,
+    TimeoutCancel,
+    TimeoutIsCompleted,
+    TimeoutIsCancelled,
+    TimeoutSubscribe,
+    TimeoutResult,
+    PregMatch,
+    PregReplace,
+    PregSplit,
+    RegexCaptureText,
+    RegexCaptureOffset,
+    RegexIteratorConstruct,
+    RegexIteratorGetInner,
+    RegexIteratorGetRegex,
+    RegexIteratorGetMode,
+    RegexIteratorGetPregFlags,
     Count,
+    IteratorFromCollection,
+    IteratorConstruct,
+    IteratorRewind,
+    IteratorValid,
+    IteratorKey,
+    IteratorValue,
+    IteratorAdvance,
+    IteratorGetInner,
+    LimitSeek,
+    LimitGetPosition,
+    AppendAdd,
+    AppendGetIndex,
+    AppendGetIterator,
+    CachingHasNext,
+    CachingCount,
+    CachingGetCache,
+    CachingGetFlags,
+    CachingSetFlags,
+    CachingOffsetExists,
+    CachingOffsetGet,
+    CachingOffsetSet,
+    CachingOffsetUnset,
+    CachingToString,
+    RecursiveEntryConstruct,
+    RecursiveEntryValue,
+    RecursiveEntryChildren,
+    RecursiveWalkConstruct,
+    RecursiveWalkSetMaxDepth,
+    RecursiveWalkGetMaxDepth,
+    RecursiveWalkGetDepth,
+    RecursiveWalkGetSubIterator,
+    RecursiveWalkGetRecursiveIterator,
+    RecursiveWalkHook,
+    FixedConstruct,
+    FixedSetSize,
+    FixedGetSize,
+    FixedOffsetExists,
+    FixedOffsetGet,
+    FixedOffsetSet,
+    FixedOffsetUnset,
+    FixedGetIterator,
+    ListConstruct,
+    ListPush,
+    ListPop,
+    ListUnshift,
+    ListShift,
+    ListTop,
+    ListBottom,
+    ListCount,
+    ListIsEmpty,
+    ListGetIterator,
+    ListToVector,
+    HeapConstruct,
+    HeapInsert,
+    HeapTop,
+    HeapExtract,
+    HeapCount,
+    HeapIsEmpty,
+    HeapGetIterator,
+    TypedMapConstruct,
+    TypedMapSet,
+    TypedMapGet,
+    TypedMapContains,
+    TypedMapRemove,
+    TypedMapCount,
+    TypedMapToMap,
+    TypedMapGetIterator,
+    ObjectStorageConstruct,
+    ObjectStorageAttach,
+    ObjectStorageGet,
+    ObjectStorageContains,
+    ObjectStorageDetach,
+    ObjectStorageCount,
+    ObjectStorageGetIterator,
+    ParentAccept,
+    RecursiveCallbackConstruct,
+    RecursiveCallbackAccept,
+    GeneratorGetReturn,
+    GeneratorClose,
+    IteratorCount,
+    IteratorToVector,
+    IteratorToMap,
+    VectorMap,
+    VectorFilter,
+    VectorSlice,
+    VectorConcat,
+    MapTransform,
+    MapFilter,
+    MapMerge,
+    IteratorApply,
+    CallbackFilterAccept,
+    CallbackFilterConstruct,
     VarDump,
     MemoryStreamOpen,
     TempStreamOpen,
     StreamsOpen,
     FilesOpenRead,
+    FilesOpenWrite,
+    FilesOpenReadWrite,
     StreamTell,
     StreamRead,
     StreamReadAll,
     StreamEof,
     StreamSeek,
+    StreamWrite,
     StreamWriteAll,
+    StreamFlush,
+    StreamIsReadable,
+    StreamIsWritable,
+    StreamIsSeekable,
     StreamClose,
     StreamIsClosed,
+    FileInfo(FileInfoBuiltin),
+    FileObject(FileObjectBuiltin),
+    Directory(DirectoryBuiltin),
     ExceptionNew,
     ExceptionConstruct,
     ExceptionGetMessage,
@@ -163,6 +362,343 @@ pub enum Builtin {
     ExceptionGetTarget,
     ExceptionGetSystemCode,
     ExceptionGetSuppressed,
+    OptionSome,
+    OptionNone,
+    OptionIsSome,
+    OptionIsNone,
+    OptionGet,
+    Serialize,
+    Unserialize,
+    TraceLineConstruct,
+    ExceptionGetFile,
+    ExceptionGetLine,
+    ExceptionGetTrace,
+    ExceptionGetTraceAsString,
+    ExceptionToString,
+    Reflection(ReflectionBuiltin),
+    IsString,
+    IsInt,
+    IsFloat,
+    IsNull,
+    IsNumeric,
+    IsVector,
+    IsMap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FileInfoBuiltin {
+    Construct,
+    Path,
+    Pathname,
+    Filename,
+    Basename,
+    Extension,
+    RealPath,
+    LinkTarget,
+    Type,
+    IsFile,
+    IsDir,
+    IsLink,
+    IsReadable,
+    IsWritable,
+    IsExecutable,
+    Size,
+    ATime,
+    MTime,
+    CTime,
+    Perms,
+    Owner,
+    Group,
+    Inode,
+    ToString,
+}
+
+impl FileInfoBuiltin {
+    pub const ALL: [Self; 24] = [
+        Self::Construct,
+        Self::Path,
+        Self::Pathname,
+        Self::Filename,
+        Self::Basename,
+        Self::Extension,
+        Self::RealPath,
+        Self::LinkTarget,
+        Self::Type,
+        Self::IsFile,
+        Self::IsDir,
+        Self::IsLink,
+        Self::IsReadable,
+        Self::IsWritable,
+        Self::IsExecutable,
+        Self::Size,
+        Self::ATime,
+        Self::MTime,
+        Self::CTime,
+        Self::Perms,
+        Self::Owner,
+        Self::Group,
+        Self::Inode,
+        Self::ToString,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FileObjectBuiltin {
+    Construct,
+    Rewind,
+    Valid,
+    Key,
+    Value,
+    Advance,
+    Seek,
+    Fgets,
+    Eof,
+    Fread,
+    Ftell,
+}
+
+impl FileObjectBuiltin {
+    pub const ALL: [Self; 11] = [
+        Self::Construct,
+        Self::Rewind,
+        Self::Valid,
+        Self::Key,
+        Self::Value,
+        Self::Advance,
+        Self::Seek,
+        Self::Fgets,
+        Self::Eof,
+        Self::Fread,
+        Self::Ftell,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DirectoryBuiltin {
+    ConstructDirectory,
+    ConstructFilesystem,
+    Rewind,
+    Valid,
+    KeyInt,
+    KeyPath,
+    Value,
+    Advance,
+    Seek,
+    IsDot,
+    ToString,
+    SkipsDots,
+    FollowsSymlinks,
+    ConstructRecursive,
+    RecursiveValue,
+    GetSubPath,
+    GetSubPathname,
+    ConstructGlob,
+    Count,
+}
+
+impl DirectoryBuiltin {
+    pub const ALL: [Self; 19] = [
+        Self::ConstructDirectory,
+        Self::ConstructFilesystem,
+        Self::Rewind,
+        Self::Valid,
+        Self::KeyInt,
+        Self::KeyPath,
+        Self::Value,
+        Self::Advance,
+        Self::Seek,
+        Self::IsDot,
+        Self::ToString,
+        Self::SkipsDots,
+        Self::FollowsSymlinks,
+        Self::ConstructRecursive,
+        Self::RecursiveValue,
+        Self::GetSubPath,
+        Self::GetSubPathname,
+        Self::ConstructGlob,
+        Self::Count,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ReflectionBuiltin {
+    TypeAllowsNull,
+    TypeGetDisplayName,
+    TypeEquals,
+    TypeIsAssignableFrom,
+    NamedTypeGetName,
+    NamedTypeIsBuiltin,
+    NamedTypeIsTypeParameter,
+    NamedTypeGetTypeArguments,
+    UnionTypeGetTypes,
+    ClassConstruct,
+    ClassGetName,
+    ClassGetShortName,
+    ClassGetNamespaceName,
+    ClassGetModuleName,
+    ClassGetType,
+    ClassIsAbstract,
+    ClassIsFinal,
+    ClassIsInterface,
+    ClassIsTrait,
+    ClassIsInternal,
+    ClassIsUserDefined,
+    ClassIsInstantiable,
+    ClassGetParentClass,
+    ClassGetInterfaces,
+    ClassGetTraits,
+    ClassGetConstructor,
+    ClassGetDeclaredMethods,
+    ClassGetDeclaredMethod,
+    ClassGetMethods,
+    ClassGetMethod,
+    ClassHasMethod,
+    ClassGetDeclaredProperties,
+    ClassGetDeclaredProperty,
+    ClassGetProperties,
+    ClassGetProperty,
+    ClassHasProperty,
+    ClassNewInstanceArgs,
+    CallableGetName,
+    CallableGetShortName,
+    CallableGetNamespaceName,
+    CallableGetModuleName,
+    CallableGetNumberOfParameters,
+    CallableGetNumberOfRequiredParameters,
+    CallableGetParameters,
+    CallableGetReturnType,
+    CallableIsVariadic,
+    CallableIsInternal,
+    CallableIsUserDefined,
+    FunctionConstruct,
+    MethodConstruct,
+    PropertyConstruct,
+    ParameterConstruct,
+    FunctionInvokeArgs,
+    MethodGetDeclaringClass,
+    MethodGetOriginTrait,
+    MethodGetOriginMethod,
+    MethodIsPublic,
+    MethodIsProtected,
+    MethodIsPrivate,
+    MethodIsStatic,
+    MethodIsAbstract,
+    MethodIsFinal,
+    MethodIsConstructor,
+    MethodInvokeArgs,
+    PropertyGetName,
+    PropertyGetDeclaringClass,
+    PropertyGetOriginTrait,
+    PropertyGetType,
+    PropertyHasDefaultValue,
+    PropertyGetDefaultValue,
+    PropertyIsPublic,
+    PropertyIsProtected,
+    PropertyIsPrivate,
+    PropertyIsStatic,
+    PropertyGetValue,
+    PropertySetValue,
+    ParameterGetName,
+    ParameterGetPosition,
+    ParameterGetType,
+    ParameterGetDeclaringFunction,
+    ParameterIsDefaultValueAvailable,
+    ParameterGetDefaultValue,
+    ParameterIsOptional,
+    ParameterIsVariadic,
+}
+
+impl ReflectionBuiltin {
+    pub const ALL: &'static [Self] = &[
+        Self::TypeAllowsNull,
+        Self::TypeGetDisplayName,
+        Self::TypeEquals,
+        Self::TypeIsAssignableFrom,
+        Self::NamedTypeGetName,
+        Self::NamedTypeIsBuiltin,
+        Self::NamedTypeIsTypeParameter,
+        Self::NamedTypeGetTypeArguments,
+        Self::UnionTypeGetTypes,
+        Self::ClassConstruct,
+        Self::ClassGetName,
+        Self::ClassGetShortName,
+        Self::ClassGetNamespaceName,
+        Self::ClassGetModuleName,
+        Self::ClassGetType,
+        Self::ClassIsAbstract,
+        Self::ClassIsFinal,
+        Self::ClassIsInterface,
+        Self::ClassIsTrait,
+        Self::ClassIsInternal,
+        Self::ClassIsUserDefined,
+        Self::ClassIsInstantiable,
+        Self::ClassGetParentClass,
+        Self::ClassGetInterfaces,
+        Self::ClassGetTraits,
+        Self::ClassGetConstructor,
+        Self::ClassGetDeclaredMethods,
+        Self::ClassGetDeclaredMethod,
+        Self::ClassGetMethods,
+        Self::ClassGetMethod,
+        Self::ClassHasMethod,
+        Self::ClassGetDeclaredProperties,
+        Self::ClassGetDeclaredProperty,
+        Self::ClassGetProperties,
+        Self::ClassGetProperty,
+        Self::ClassHasProperty,
+        Self::ClassNewInstanceArgs,
+        Self::CallableGetName,
+        Self::CallableGetShortName,
+        Self::CallableGetNamespaceName,
+        Self::CallableGetModuleName,
+        Self::CallableGetNumberOfParameters,
+        Self::CallableGetNumberOfRequiredParameters,
+        Self::CallableGetParameters,
+        Self::CallableGetReturnType,
+        Self::CallableIsVariadic,
+        Self::CallableIsInternal,
+        Self::CallableIsUserDefined,
+        Self::FunctionConstruct,
+        Self::MethodConstruct,
+        Self::PropertyConstruct,
+        Self::ParameterConstruct,
+        Self::FunctionInvokeArgs,
+        Self::MethodGetDeclaringClass,
+        Self::MethodGetOriginTrait,
+        Self::MethodGetOriginMethod,
+        Self::MethodIsPublic,
+        Self::MethodIsProtected,
+        Self::MethodIsPrivate,
+        Self::MethodIsStatic,
+        Self::MethodIsAbstract,
+        Self::MethodIsFinal,
+        Self::MethodIsConstructor,
+        Self::MethodInvokeArgs,
+        Self::PropertyGetName,
+        Self::PropertyGetDeclaringClass,
+        Self::PropertyGetOriginTrait,
+        Self::PropertyGetType,
+        Self::PropertyHasDefaultValue,
+        Self::PropertyGetDefaultValue,
+        Self::PropertyIsPublic,
+        Self::PropertyIsProtected,
+        Self::PropertyIsPrivate,
+        Self::PropertyIsStatic,
+        Self::PropertyGetValue,
+        Self::PropertySetValue,
+        Self::ParameterGetName,
+        Self::ParameterGetPosition,
+        Self::ParameterGetType,
+        Self::ParameterGetDeclaringFunction,
+        Self::ParameterIsDefaultValueAvailable,
+        Self::ParameterGetDefaultValue,
+        Self::ParameterIsOptional,
+        Self::ParameterIsVariadic,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,7 +711,17 @@ pub enum Callee {
 pub struct Module {
     pub functions: Vec<Function>,
     pub classes: Vec<Class>,
+    pub native_functions: Vec<NativeSignature>,
     pub entry: FunctionId,
+}
+
+/// A fixed native callable signature retained in verified bytecode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeSignature {
+    pub name: String,
+    pub parameters: Vec<Type>,
+    pub return_type: Type,
+    pub library_digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -185,13 +731,21 @@ pub struct Class {
     pub kind: NominalKind,
     pub abstract_class: bool,
     pub final_class: bool,
+    pub module_name: String,
+    pub native: bool,
+    pub type_parameters: Vec<TypeParameter>,
     pub parent: Option<String>,
+    pub parent_type: Option<Type>,
     pub interfaces: Vec<String>,
+    pub interface_types: Vec<Type>,
     pub properties: Vec<Property>,
+    pub declared_properties: Vec<Property>,
     pub methods: Vec<Method>,
+    pub declared_methods: Vec<Method>,
     pub method_slots: Vec<MethodSlot>,
     pub dispatch: Vec<Option<Callee>>,
     pub constructor: Option<Callee>,
+    pub traits: Vec<ClassId>,
     pub span: Span,
 }
 
@@ -202,6 +756,8 @@ pub struct Property {
     pub ty: Type,
     pub visibility: Visibility,
     pub declaring_class: ClassId,
+    pub default: Option<ConstantValue>,
+    pub origin_trait: Option<ClassId>,
     pub span: Span,
 }
 
@@ -216,9 +772,14 @@ pub struct Method {
     pub abstract_method: bool,
     pub final_method: bool,
     pub parameter_types: Vec<Type>,
+    pub parameters: Vec<ParameterMetadata>,
     pub return_type: Type,
+    pub origin_trait: Option<ClassId>,
+    pub origin_name: String,
     pub span: Span,
 }
+
+pub const MAX_CONSTANT_NESTING: usize = 128;
 
 impl Module {
     pub fn function(&self, id: FunctionId) -> &Function {
@@ -231,15 +792,43 @@ impl Module {
             .map(|function| count_expressions(&function.body))
             .sum()
     }
+
+    /// Reports nominal inheritance using the resolved class graph retained in HIR.
+    pub fn is_nominal_subtype(&self, actual: &str, expected: &str) -> bool {
+        fn visit(
+            module: &Module,
+            actual: &str,
+            expected: &str,
+            seen: &mut BTreeSet<String>,
+        ) -> bool {
+            if actual == expected {
+                return true;
+            }
+            let Some(class) = module.classes.iter().find(|class| class.name == actual) else {
+                return false;
+            };
+            seen.insert(actual.to_owned())
+                && class
+                    .parent
+                    .iter()
+                    .chain(&class.interfaces)
+                    .any(|parent| visit(module, parent, expected, seen))
+        }
+
+        visit(self, actual, expected, &mut BTreeSet::new())
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub module_name: String,
     pub parameters: Vec<LocalId>,
+    pub parameter_metadata: Vec<ParameterMetadata>,
     pub locals: Vec<Local>,
     pub return_type: Type,
+    pub generator: bool,
     pub owner: Option<ClassId>,
     pub static_method: bool,
     pub body: Vec<Statement>,
@@ -261,6 +850,18 @@ pub struct Statement {
     pub span: Span,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ForeachObjectProtocol {
+    pub iterator: ClassId,
+    pub aggregate: ClassId,
+    pub get_iterator: MethodSlot,
+    pub rewind: MethodSlot,
+    pub valid: MethodSlot,
+    pub key: MethodSlot,
+    pub value: MethodSlot,
+    pub advance: MethodSlot,
+}
+
 #[derive(Clone, Debug)]
 pub enum StatementKind {
     Assign {
@@ -270,6 +871,10 @@ pub enum StatementKind {
     },
     Echo(TypedExpr),
     Return(Option<TypedExpr>),
+    Yield {
+        key: Option<TypedExpr>,
+        value: TypedExpr,
+    },
     If {
         branches: Vec<(TypedExpr, Vec<Statement>)>,
         otherwise: Vec<Statement>,
@@ -290,6 +895,7 @@ pub enum StatementKind {
         value: LocalId,
         key_type: Type,
         value_type: Type,
+        object_protocol: Option<ForeachObjectProtocol>,
         body: Vec<Statement>,
     },
     Break,
@@ -385,6 +991,14 @@ pub enum TypedExprKind {
         callee: Callee,
         arguments: BoundArguments,
     },
+    Closure {
+        function: FunctionId,
+        captures: Vec<TypedExpr>,
+    },
+    CallValue {
+        callee: Box<TypedExpr>,
+        arguments: Vec<TypedExpr>,
+    },
     DirectMethod {
         callee: Callee,
         receiver: Option<Box<TypedExpr>>,
@@ -411,6 +1025,15 @@ pub enum TypedExprKind {
         initializers: Vec<(PropertyId, TypedExpr)>,
         arguments: BoundArguments,
     },
+    DynamicNew {
+        target: Box<TypedExpr>,
+        type_arguments: Vec<Type>,
+        arguments: Vec<DynamicArgument>,
+    },
+    CheckedNarrow {
+        value: Box<TypedExpr>,
+        narrowed: Type,
+    },
     Property {
         object: Box<TypedExpr>,
         property: PropertyId,
@@ -423,6 +1046,13 @@ pub enum TypedExprKind {
         subject: Box<TypedExpr>,
         arms: Vec<TypedMatchArm>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct DynamicArgument {
+    pub name: Option<String>,
+    pub value: TypedExpr,
+    pub span: Span,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,6 +1100,7 @@ pub struct LowerOutput {
 #[derive(Clone, Debug, PartialEq)]
 struct Signature {
     id: FunctionId,
+    native_index: Option<u32>,
     parameters: Vec<ParameterSignature>,
     return_type: Type,
     span: Span,
@@ -507,12 +1138,20 @@ struct ClassSignature {
     kind: NominalKind,
     abstract_class: bool,
     final_class: bool,
+    module_name: String,
+    type_parameters: Vec<TypeParameter>,
+    type_parameter_syntax: Vec<SyntaxTypeParameter>,
     parent: Option<String>,
+    parent_syntax: Option<NominalRef>,
+    parent_type: Option<Type>,
     interfaces: Vec<String>,
+    interface_syntax: Vec<NominalRef>,
+    interface_types: Vec<Type>,
     trait_uses: Vec<TraitUse>,
     declared_properties: Vec<Property>,
     declared_property_initializers: Vec<Option<Expr>>,
     declared_methods: BTreeMap<String, MethodSignature>,
+    declared_method_order: Vec<String>,
     properties: Vec<Property>,
     property_initializers: Vec<Option<Expr>>,
     methods: BTreeMap<String, MethodSignature>,
@@ -534,7 +1173,31 @@ struct PendingMethod {
 /// Resolves names and produces typed HIR. A module may be inspected when
 /// diagnostics exist, but must not be lowered to executable code.
 pub fn lower(program: &Program) -> LowerOutput {
-    TypeChecker::new(program).lower(program)
+    lower_with_modules(program, &BTreeMap::new())
+}
+
+pub fn lower_with_modules(
+    program: &Program,
+    declaration_modules: &BTreeMap<String, String>,
+) -> LowerOutput {
+    lower_with_native_functions(program, declaration_modules, &[])
+}
+
+pub fn lower_with_native_functions(
+    program: &Program,
+    declaration_modules: &BTreeMap<String, String>,
+    native_functions: &[NativeSignature],
+) -> LowerOutput {
+    TypeChecker::new(program, declaration_modules, native_functions).lower(program)
+}
+
+/// Lowers a linked project whose syntax spans already carry their [`SourceId`]
+/// provenance. Declarations, callables, locals, expressions, and diagnostics
+/// retain those source-qualified spans in the resulting HIR.
+///
+/// [`SourceId`]: thp_diagnostics::SourceId
+pub fn lower_project(program: &Program) -> LowerOutput {
+    lower(program)
 }
 
 struct TypeChecker {
@@ -544,17 +1207,57 @@ struct TypeChecker {
     functions: Vec<Option<Function>>,
     pending_methods: Vec<PendingMethod>,
     method_slots: BTreeMap<String, MethodSlot>,
+    declaration_modules: BTreeMap<String, String>,
+    closures: Rc<RefCell<Vec<Option<Function>>>>,
+    native_functions: Vec<NativeSignature>,
 }
 
 impl TypeChecker {
-    fn new(_program: &Program) -> Self {
+    fn new(
+        _program: &Program,
+        declaration_modules: &BTreeMap<String, String>,
+        native_functions: &[NativeSignature],
+    ) -> Self {
+        let signatures = native_functions
+            .iter()
+            .enumerate()
+            .map(|(index, function)| {
+                (
+                    function.name.clone(),
+                    Signature {
+                        id: FunctionId(0),
+                        native_index: Some(
+                            u32::try_from(index).expect("native function index fits u32"),
+                        ),
+                        parameters: function
+                            .parameters
+                            .iter()
+                            .enumerate()
+                            .map(|(index, ty)| {
+                                native_parameter(
+                                    &format!("arg{index}"),
+                                    ty.clone(),
+                                    None,
+                                    Span::default(),
+                                )
+                            })
+                            .collect(),
+                        return_type: function.return_type.clone(),
+                        span: Span::default(),
+                    },
+                )
+            })
+            .collect();
         Self {
             diagnostics: Vec::new(),
-            signatures: BTreeMap::new(),
+            signatures,
             classes: native_nominals(),
             functions: vec![None],
             pending_methods: Vec::new(),
             method_slots: BTreeMap::new(),
+            declaration_modules: declaration_modules.clone(),
+            closures: Rc::new(RefCell::new(Vec::new())),
+            native_functions: native_functions.to_vec(),
         }
     }
 
@@ -579,16 +1282,22 @@ impl TypeChecker {
             .cloned()
             .collect::<Vec<_>>();
         let entry = FunctionId(0);
+        let closure_base = u32::try_from(self.functions.len()).expect("function count fits u32");
         let mut main = FunctionChecker::new(
             &self.signatures,
             &self.classes,
             &mut self.diagnostics,
             entry,
             "<main>",
+            self.declaration_modules
+                .get("<main>")
+                .map_or("@entry", String::as_str),
             Type::Void,
             program.span,
             None,
             false,
+            closure_base,
+            Rc::clone(&self.closures),
         );
         let body = main.lower_block(&top_level);
         self.functions[0] = Some(main.finish(body));
@@ -606,12 +1315,18 @@ impl TypeChecker {
                 &mut self.diagnostics,
                 signature.id,
                 &declaration.name,
+                self.declaration_modules
+                    .get(&declaration.name)
+                    .map_or("@entry", String::as_str),
                 signature.return_type.clone(),
                 statement.span,
                 None,
                 false,
+                closure_base,
+                Rc::clone(&self.closures),
             );
             checker.declare_parameters(declaration, &signature.parameters);
+            checker.generator = block_has_yield(&declaration.body);
             let body = checker.lower_block(&declaration.body);
             let index = signature.id.0 as usize;
             self.functions[index] = Some(checker.finish(body));
@@ -632,20 +1347,25 @@ impl TypeChecker {
                 &mut self.diagnostics,
                 pending.id,
                 &format!("{}::{}", class.name, pending.declaration.function.name),
+                &class.module_name,
                 pending.signature.return_type.clone(),
                 pending.span,
                 Some(class.id),
                 pending.declaration.static_method,
+                closure_base,
+                Rc::clone(&self.closures),
             );
             if !pending.declaration.static_method {
                 checker.declare_receiver(&class);
             }
             checker
                 .declare_parameters(&pending.declaration.function, &pending.signature.parameters);
+            checker.generator = block_has_yield(&pending.declaration.function.body);
             let body = checker.lower_block(&pending.declaration.function.body);
             self.functions[pending.id.0 as usize] = Some(checker.finish(body));
         }
 
+        self.functions.extend(self.closures.borrow_mut().drain(..));
         let functions = self
             .functions
             .into_iter()
@@ -656,9 +1376,12 @@ impl TypeChecker {
                         u32::try_from(index).expect("function count is limited to u32::MAX"),
                     ),
                     name: format!("<invalid-{index}>"),
+                    module_name: "@entry".to_owned(),
                     parameters: Vec::new(),
+                    parameter_metadata: Vec::new(),
                     locals: Vec::new(),
                     return_type: Type::Never,
+                    generator: false,
                     owner: None,
                     static_method: false,
                     body: Vec::new(),
@@ -666,51 +1389,80 @@ impl TypeChecker {
                 })
             })
             .collect();
+        let class_ids = self
+            .classes
+            .iter()
+            .map(|(name, class)| (name.clone(), class.id))
+            .collect::<BTreeMap<_, _>>();
         let mut classes = self
             .classes
             .into_values()
-            .map(|class| Class {
-                id: class.id,
-                name: class.name,
-                kind: class.kind,
-                abstract_class: class.abstract_class,
-                final_class: class.final_class,
-                parent: class.parent,
-                interfaces: class.interfaces,
-                properties: class.properties,
-                methods: class
+            .map(|class| {
+                let methods = class
                     .methods
-                    .clone()
-                    .into_iter()
-                    .map(|(name, method)| Method {
-                        name,
-                        callee: method.callee,
-                        slot: method.slot,
-                        declaring_class: method.declaring_class,
-                        visibility: method.visibility,
-                        static_method: method.static_method,
-                        abstract_method: method.abstract_method,
-                        final_method: method.final_method,
-                        parameter_types: method
-                            .signature
-                            .parameters
-                            .iter()
-                            .map(|parameter| parameter.ty.clone())
-                            .collect(),
-                        return_type: method.signature.return_type,
-                        span: method.span,
+                    .iter()
+                    .map(|(name, method)| method_metadata(name, method, &class_ids))
+                    .collect::<Vec<_>>();
+                let mut declared_methods = class
+                    .declared_method_order
+                    .iter()
+                    .filter_map(|name| {
+                        class
+                            .methods
+                            .get(name)
+                            .filter(|method| method.declaring_class == class.id)
+                            .map(|method| method_metadata(name, method, &class_ids))
                     })
-                    .collect(),
-                method_slots: class.methods.values().map(|method| method.slot).collect(),
-                dispatch: {
-                    let mut dispatch = vec![None; self.method_slots.len()];
-                    for method in class.methods.values() {
-                        dispatch[method.slot.0 as usize] = method.callee;
+                    .collect::<Vec<_>>();
+                for (name, method) in &class.methods {
+                    if method.declaring_class == class.id
+                        && !declared_methods
+                            .iter()
+                            .any(|existing| existing.name == *name)
+                    {
+                        declared_methods.push(method_metadata(name, method, &class_ids));
                     }
-                    dispatch
-                },
-                constructor: class.constructor,
-                span: class.span,
+                }
+                let declared_properties = class
+                    .properties
+                    .iter()
+                    .filter(|property| property.declaring_class == class.id)
+                    .cloned()
+                    .collect();
+                Class {
+                    id: class.id,
+                    name: class.name,
+                    kind: class.kind,
+                    abstract_class: class.abstract_class,
+                    final_class: class.final_class,
+                    module_name: class.module_name,
+                    native: class.native,
+                    type_parameters: class.type_parameters,
+                    parent: class.parent,
+                    parent_type: class.parent_type,
+                    interfaces: class.interfaces,
+                    interface_types: class.interface_types,
+                    traits: class
+                        .trait_uses
+                        .iter()
+                        .flat_map(|use_site| &use_site.traits)
+                        .filter_map(|used| class_ids.get(&used.name).copied())
+                        .collect(),
+                    declared_properties,
+                    properties: class.properties,
+                    declared_methods,
+                    methods,
+                    method_slots: class.methods.values().map(|method| method.slot).collect(),
+                    dispatch: {
+                        let mut dispatch = vec![None; self.method_slots.len()];
+                        for method in class.methods.values() {
+                            dispatch[method.slot.0 as usize] = method.callee;
+                        }
+                        dispatch
+                    },
+                    constructor: class.constructor,
+                    span: class.span,
+                }
             })
             .collect::<Vec<_>>();
         classes.sort_by_key(|class| class.id);
@@ -718,6 +1470,7 @@ impl TypeChecker {
             module: Module {
                 functions,
                 classes,
+                native_functions: self.native_functions,
                 entry,
             },
             diagnostics: self.diagnostics,
@@ -726,50 +1479,52 @@ impl TypeChecker {
 
     fn collect_nominal_names(&mut self, program: &Program) {
         for statement in &program.statements {
-            let (name, name_span, kind, abstract_class, final_class, parent, interfaces, uses) =
-                match &statement.kind {
-                    StmtKind::Class(declaration) => (
-                        &declaration.name,
-                        declaration.name_span,
-                        NominalKind::Class,
-                        declaration.abstract_class,
-                        declaration.final_class,
-                        declaration
-                            .parent
-                            .as_ref()
-                            .map(|parent| parent.name.clone()),
-                        declaration
-                            .interfaces
-                            .iter()
-                            .map(|interface| interface.name.clone())
-                            .collect(),
-                        declaration.trait_uses.clone(),
-                    ),
-                    StmtKind::Interface(declaration) => (
-                        &declaration.name,
-                        declaration.name_span,
-                        NominalKind::Interface,
-                        true,
-                        false,
-                        declaration
-                            .parent
-                            .as_ref()
-                            .map(|parent| parent.name.clone()),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                    StmtKind::Trait(declaration) => (
-                        &declaration.name,
-                        declaration.name_span,
-                        NominalKind::Trait,
-                        true,
-                        false,
-                        None,
-                        Vec::new(),
-                        declaration.trait_uses.clone(),
-                    ),
-                    _ => continue,
-                };
+            let (
+                name,
+                name_span,
+                kind,
+                abstract_class,
+                final_class,
+                type_parameter_syntax,
+                parent_syntax,
+                interface_syntax,
+                uses,
+            ) = match &statement.kind {
+                StmtKind::Class(declaration) => (
+                    &declaration.name,
+                    declaration.name_span,
+                    NominalKind::Class,
+                    declaration.abstract_class,
+                    declaration.final_class,
+                    declaration.type_parameters.clone(),
+                    declaration.parent.clone(),
+                    declaration.interfaces.clone(),
+                    declaration.trait_uses.clone(),
+                ),
+                StmtKind::Interface(declaration) => (
+                    &declaration.name,
+                    declaration.name_span,
+                    NominalKind::Interface,
+                    true,
+                    false,
+                    declaration.type_parameters.clone(),
+                    declaration.parent.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                StmtKind::Trait(declaration) => (
+                    &declaration.name,
+                    declaration.name_span,
+                    NominalKind::Trait,
+                    true,
+                    false,
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    declaration.trait_uses.clone(),
+                ),
+                _ => continue,
+            };
             if let Some(previous) = self.classes.get(name) {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -785,6 +1540,45 @@ impl TypeChecker {
             let id = ClassId(
                 u32::try_from(self.classes.len()).expect("class count is limited to u32::MAX"),
             );
+            let mut seen_parameters = BTreeMap::new();
+            let type_parameters = type_parameter_syntax
+                .iter()
+                .enumerate()
+                .filter_map(|(index, parameter)| {
+                    if let Some(previous) =
+                        seen_parameters.insert(&parameter.name, parameter.name_span)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "name_resolution",
+                                "N0010",
+                                parameter.name_span,
+                                format!(
+                                    "type parameter `{}` is declared more than once",
+                                    parameter.name
+                                ),
+                            )
+                            .with_label(previous, "first parameter is here"),
+                        );
+                        return None;
+                    }
+                    Some(TypeParameter {
+                        id: TypeParameterId {
+                            owner: id,
+                            index: u32::try_from(index)
+                                .expect("type parameter count is limited to u32::MAX"),
+                        },
+                        name: parameter.name.clone(),
+                        bound: None,
+                        span: parameter.span,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let parent = parent_syntax.as_ref().map(|parent| parent.name.clone());
+            let interfaces = interface_syntax
+                .iter()
+                .map(|interface| interface.name.clone())
+                .collect();
             self.classes.insert(
                 name.clone(),
                 ClassSignature {
@@ -793,12 +1587,24 @@ impl TypeChecker {
                     kind,
                     abstract_class,
                     final_class,
+                    module_name: self
+                        .declaration_modules
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| "@entry".to_owned()),
+                    type_parameters,
+                    type_parameter_syntax,
                     parent,
+                    parent_syntax,
+                    parent_type: None,
                     interfaces,
+                    interface_syntax,
+                    interface_types: Vec::new(),
                     trait_uses: uses,
                     declared_properties: Vec::new(),
                     declared_property_initializers: Vec::new(),
                     declared_methods: BTreeMap::new(),
+                    declared_method_order: Vec::new(),
                     properties: Vec::new(),
                     property_initializers: Vec::new(),
                     methods: BTreeMap::new(),
@@ -890,6 +1696,87 @@ impl TypeChecker {
     }
 
     fn collect_signatures(&mut self, program: &Program) {
+        let nominal_names = self.classes.keys().cloned().collect::<Vec<_>>();
+        for name in &nominal_names {
+            let Some(snapshot) = self.classes.get(name).cloned() else {
+                continue;
+            };
+            if snapshot.native {
+                continue;
+            }
+            let environment = type_parameter_environment(&snapshot.type_parameters);
+            let mut parameters = snapshot.type_parameters.clone();
+            for (parameter, syntax) in parameters.iter_mut().zip(&snapshot.type_parameter_syntax) {
+                let Some(bound_syntax) = &syntax.bound else {
+                    continue;
+                };
+                let bound = resolve_type_with_bound_check(
+                    bound_syntax,
+                    &self.classes,
+                    &environment,
+                    &mut self.diagnostics,
+                    false,
+                );
+                if let Some(bound) = bound {
+                    if matches!(bound, Type::Object(_) | Type::Nominal { .. }) {
+                        parameter.bound = Some(bound);
+                    } else {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1010",
+                            bound_syntax.span,
+                            "a type-parameter bound must name a class or interface",
+                        ));
+                    }
+                }
+            }
+            self.classes
+                .get_mut(name)
+                .expect("nominal exists")
+                .type_parameters = parameters;
+        }
+        for name in nominal_names {
+            let Some(snapshot) = self.classes.get(&name).cloned() else {
+                continue;
+            };
+            if snapshot.native {
+                continue;
+            }
+            for (parameter, syntax) in snapshot
+                .type_parameters
+                .iter()
+                .zip(&snapshot.type_parameter_syntax)
+            {
+                if let (Some(bound), Some(bound_syntax)) = (&parameter.bound, &syntax.bound) {
+                    validate_type_argument_bounds(
+                        bound,
+                        bound_syntax.span,
+                        &self.classes,
+                        &mut self.diagnostics,
+                    );
+                }
+            }
+            let environment = type_parameter_environment(&snapshot.type_parameters);
+            let parent_type = snapshot.parent_syntax.as_ref().and_then(|parent| {
+                resolve_nominal_ref(parent, &self.classes, &environment, &mut self.diagnostics)
+            });
+            let interface_types = snapshot
+                .interface_syntax
+                .iter()
+                .filter_map(|interface| {
+                    resolve_nominal_ref(
+                        interface,
+                        &self.classes,
+                        &environment,
+                        &mut self.diagnostics,
+                    )
+                })
+                .collect();
+            let class = self.classes.get_mut(&name).expect("nominal exists");
+            class.parent_type = parent_type;
+            class.interface_types = interface_types;
+        }
+        let empty_parameters = BTreeMap::new();
         for statement in &program.statements {
             let StmtKind::Function(declaration) = &statement.kind else {
                 continue;
@@ -906,10 +1793,16 @@ impl TypeChecker {
                 );
                 continue;
             }
-            let parameters = resolve_parameters(declaration, &self.classes, &mut self.diagnostics);
+            let parameters = resolve_parameters(
+                declaration,
+                &self.classes,
+                &empty_parameters,
+                &mut self.diagnostics,
+            );
             let return_type = resolve_type(
                 &declaration.return_type,
                 &self.classes,
+                &empty_parameters,
                 &mut self.diagnostics,
             )
             .unwrap_or(Type::Mixed);
@@ -921,6 +1814,7 @@ impl TypeChecker {
                 declaration.name.clone(),
                 Signature {
                     id,
+                    native_index: None,
                     parameters,
                     return_type,
                     span: declaration.name_span,
@@ -952,6 +1846,7 @@ impl TypeChecker {
             let Some(existing) = self.classes.get(name).cloned() else {
                 continue;
             };
+            let type_parameters = type_parameter_environment(&existing.type_parameters);
             if existing.span != statement.span {
                 continue;
             }
@@ -972,8 +1867,25 @@ impl TypeChecker {
                     continue;
                 }
                 property_names.insert(property.name.clone(), property.name_span);
-                let ty = resolve_type(&property.ty, &self.classes, &mut self.diagnostics)
-                    .unwrap_or(Type::Mixed);
+                let ty = resolve_type(
+                    &property.ty,
+                    &self.classes,
+                    &type_parameters,
+                    &mut self.diagnostics,
+                )
+                .unwrap_or(Type::Mixed);
+                if let Some(initializer) = &property.initializer
+                    && exceeds_constant_nesting_limit(initializer, 0)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0311",
+                        initializer.span,
+                        format!(
+                            "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                        ),
+                    ));
+                }
                 properties.push(Property {
                     id: PropertyId(
                         u32::try_from(properties.len())
@@ -983,6 +1895,8 @@ impl TypeChecker {
                     ty,
                     visibility: property.visibility,
                     declaring_class: existing.id,
+                    default: property.initializer.as_ref().and_then(constant_value),
+                    origin_trait: (existing.kind == NominalKind::Trait).then_some(existing.id),
                     span: property.span,
                 });
                 property_initializers.push(property.initializer.clone());
@@ -1005,11 +1919,16 @@ impl TypeChecker {
                     );
                     continue;
                 }
-                let parameters =
-                    resolve_parameters(&method.function, &self.classes, &mut self.diagnostics);
+                let parameters = resolve_parameters(
+                    &method.function,
+                    &self.classes,
+                    &type_parameters,
+                    &mut self.diagnostics,
+                );
                 let return_type = resolve_type(
                     &method.function.return_type,
                     &self.classes,
+                    &type_parameters,
                     &mut self.diagnostics,
                 )
                 .unwrap_or(Type::Mixed);
@@ -1038,6 +1957,7 @@ impl TypeChecker {
                 };
                 let signature = Signature {
                     id,
+                    native_index: None,
                     parameters,
                     return_type,
                     span: method.function.name_span,
@@ -1084,6 +2004,10 @@ impl TypeChecker {
             class.declared_properties = properties;
             class.declared_property_initializers = property_initializers;
             class.declared_methods = methods;
+            class.declared_method_order = source_methods
+                .iter()
+                .map(|method| method.function.name.clone())
+                .collect();
         }
     }
 
@@ -1182,27 +2106,46 @@ impl TypeChecker {
         let mut initializers = Vec::new();
         let mut methods: BTreeMap<String, MethodSignature> = BTreeMap::new();
         let mut interfaces = current.interfaces.clone();
-        if let Some(parent_name) = &current.parent {
-            if let Some(parent) = self.classes.get(parent_name).filter(|parent| parent.linked) {
-                properties.clone_from(&parent.properties);
-                initializers.clone_from(&parent.property_initializers);
-                methods = parent.methods.clone();
-                if current.kind == NominalKind::Class {
-                    interfaces.extend(parent.interfaces.clone());
-                } else if current.kind == NominalKind::Interface {
-                    interfaces.push(parent.name.clone());
-                    interfaces.extend(parent.interfaces.clone());
-                }
+        if let Some(parent_name) = &current.parent
+            && let Some(parent) = self.classes.get(parent_name).filter(|parent| parent.linked)
+        {
+            properties.clone_from(&parent.properties);
+            initializers.clone_from(&parent.property_initializers);
+            methods = parent.methods.clone();
+            methods.retain(|_, method| method.visibility != Visibility::Private);
+            let parent_type = current
+                .parent_type
+                .clone()
+                .unwrap_or_else(|| Type::Object(parent_name.clone()));
+            for property in &mut properties {
+                property.ty = instantiate_member_type(
+                    &parent_type,
+                    property.declaring_class,
+                    &property.ty,
+                    &self.classes,
+                );
+            }
+            for method in methods.values_mut() {
+                instantiate_method_signature(method, &parent_type, &self.classes);
+            }
+            if current.kind == NominalKind::Class {
+                interfaces.extend(parent.interfaces.clone());
+            } else if current.kind == NominalKind::Interface {
+                interfaces.push(parent.name.clone());
+                interfaces.extend(parent.interfaces.clone());
             }
         }
 
+        let mut trait_method_order = Vec::new();
         if current.kind != NominalKind::Interface {
             let (trait_properties, trait_initializers, trait_methods) =
-                self.compose_traits(&current);
+                self.compose_traits(&current, &mut trait_method_order);
             for (property, initializer) in trait_properties.into_iter().zip(trait_initializers) {
                 if let Some(inherited) = properties
                     .iter()
+                    .rev()
                     .find(|inherited: &&Property| inherited.name == property.name)
+                    .filter(|inherited| inherited.visibility != Visibility::Private)
                 {
                     self.diagnostics.push(
                         Diagnostic::error(
@@ -1237,7 +2180,12 @@ impl TypeChecker {
         {
             if let Some(previous) = properties
                 .iter()
+                .rev()
                 .find(|previous| previous.name == property.name)
+                .filter(|previous| {
+                    previous.visibility != Visibility::Private
+                        || previous.declaring_class == current.id
+                })
             {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -1275,7 +2223,14 @@ impl TypeChecker {
                 };
                 interfaces.push(interface.name.clone());
                 interfaces.extend(interface.interfaces.clone());
-                for (method_name, requirement) in interface.methods {
+                let interface_type = current
+                    .interface_types
+                    .iter()
+                    .find(|ty| nominal_parts(ty).is_some_and(|(name, _)| name == interface_name))
+                    .cloned()
+                    .unwrap_or_else(|| Type::Object(interface_name.clone()));
+                for (method_name, mut requirement) in interface.methods {
+                    instantiate_method_signature(&mut requirement, &interface_type, &self.classes);
                     if let Some(existing) = methods.get(&method_name) {
                         if !method_contract_equal(existing, &requirement)
                             || existing.visibility != Visibility::Public
@@ -1300,25 +2255,82 @@ impl TypeChecker {
             }
         } else if current.kind == NominalKind::Interface {
             for (name, requirement) in &current.declared_methods {
-                if let Some(previous) = methods.get(name) {
-                    if !method_contract_equal(requirement, previous) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "typing",
-                                "T0023",
-                                requirement.span,
-                                format!("conflicting interface requirement for `{name}`"),
-                            )
-                            .with_label(previous.span, "inherited requirement is here"),
-                        );
-                    }
+                if let Some(previous) = methods.get(name)
+                    && !method_contract_equal(requirement, previous)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "typing",
+                            "T0023",
+                            requirement.span,
+                            format!("conflicting interface requirement for `{name}`"),
+                        )
+                        .with_label(previous.span, "inherited requirement is here"),
+                    );
                 }
                 methods.insert(name.clone(), requirement.clone());
             }
         }
 
-        interfaces.sort();
-        interfaces.dedup();
+        let interface_types = instantiated_interface_closure(&current, &self.classes);
+        let mut canonical_interfaces = BTreeMap::<String, Type>::new();
+        for interface_type in interface_types {
+            let Some((interface_name, _)) = nominal_parts(&interface_type) else {
+                continue;
+            };
+            if let Some(previous) = canonical_interfaces.get(interface_name) {
+                if previous != &interface_type {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1012",
+                        current.span,
+                        format!(
+                            "hierarchy reaches interface `{interface_name}` with conflicting arguments `{previous}` and `{interface_type}`"
+                        ),
+                    ));
+                }
+            } else {
+                canonical_interfaces.insert(interface_name.to_owned(), interface_type);
+            }
+        }
+        if current.kind == NominalKind::Class
+            && methods.get("__toString").is_some_and(|method| {
+                !method.static_method
+                    && method.visibility == Visibility::Public
+                    && method.signature.parameters.is_empty()
+                    && method.signature.return_type == Type::String
+            })
+        {
+            canonical_interfaces.insert(
+                "Stringable".to_owned(),
+                Type::Object("Stringable".to_owned()),
+            );
+        }
+        if current.kind == NominalKind::Class && !current.abstract_class {
+            let has_traversable = canonical_interfaces.contains_key("Traversable");
+            let has_iterator = canonical_interfaces.contains_key("Iterator");
+            let has_aggregate = canonical_interfaces.contains_key("IteratorAggregate");
+            let directly_traversable = current.interface_types.iter().any(|interface| {
+                nominal_parts(interface).is_some_and(|(name, _)| name == "Traversable")
+            });
+            if directly_traversable || (has_traversable && !has_iterator && !has_aggregate) {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1013",
+                    current.span,
+                    "a concrete class cannot implement `Traversable<K, V>` directly; implement `Iterator<K, V>` or `IteratorAggregate<K, V>`",
+                ));
+            }
+            if has_iterator && has_aggregate {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1014",
+                    current.span,
+                    "a concrete class cannot implement both iterator strategies",
+                ));
+            }
+        }
+        interfaces = canonical_interfaces.keys().cloned().collect();
         if interfaces.iter().any(|interface| interface == "Throwable") {
             let allowed = match current.kind {
                 NominalKind::Interface => current.name == "Throwable",
@@ -1337,6 +2349,14 @@ impl TypeChecker {
                     "T0014",
                     current.span,
                     "`Throwable` is sealed; only `Exception`, `Error`, and their descendants are throwable",
+                ));
+            }
+            if !current.type_parameters.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1015",
+                    current.span,
+                    "generic throwable classes and interfaces are not supported",
                 ));
             }
         }
@@ -1363,10 +2383,16 @@ impl TypeChecker {
         }
         let constructor = methods.get("__construct").and_then(|method| method.callee);
         let class = self.classes.get_mut(name).expect("nominal type exists");
+        for method in trait_method_order {
+            if !class.declared_method_order.contains(&method) {
+                class.declared_method_order.push(method);
+            }
+        }
         class.properties = properties;
         class.property_initializers = initializers;
         class.methods = methods;
         class.interfaces = interfaces;
+        class.interface_types = canonical_interfaces.into_values().collect();
         class.constructor = constructor;
         class.linked = true;
         stack.pop();
@@ -1375,6 +2401,7 @@ impl TypeChecker {
     fn compose_traits(
         &mut self,
         consumer: &ClassSignature,
+        method_order: &mut Vec<String>,
     ) -> (
         Vec<Property>,
         Vec<Option<Expr>>,
@@ -1385,6 +2412,7 @@ impl TypeChecker {
         let mut methods: BTreeMap<String, MethodSignature> = BTreeMap::new();
         for trait_use in &consumer.trait_uses {
             let mut candidates = BTreeMap::<String, Vec<(String, MethodSignature)>>::new();
+            let mut candidate_order = Vec::new();
             for used in &trait_use.traits {
                 let Some(trait_type) = self
                     .classes
@@ -1427,8 +2455,18 @@ impl TypeChecker {
                         initializers.push(initializer);
                     }
                 }
-                for (name, mut method) in trait_type.methods {
+                let mut names = trait_type.declared_method_order.clone();
+                for name in trait_type.methods.keys() {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+                for name in names {
+                    let mut method = trait_type.methods[&name].clone();
                     method.origin_trait = Some(used.name.clone());
+                    if !candidate_order.contains(&name) {
+                        candidate_order.push(name.clone());
+                    }
                     candidates
                         .entry(name)
                         .or_default()
@@ -1597,31 +2635,40 @@ impl TypeChecker {
                         .with_label(previous.span, "existing method is here"),
                     );
                 } else {
+                    candidate_order.push(target_name.clone());
                     selected.insert(target_name, adapted);
                 }
             }
-            for (name, mut method) in selected {
+            let mut ordered = Vec::new();
+            for name in candidate_order {
+                if let Some(method) = selected.remove(&name) {
+                    ordered.push((name, method));
+                }
+            }
+            ordered.extend(selected);
+            for (name, mut method) in ordered {
                 method.declaring_class = consumer.id;
                 method.slot = self.method_slots[&name];
-                if consumer.kind == NominalKind::Class && !method.abstract_method {
-                    if let Some(source) = method.source.clone() {
-                        let id = self.allocate_function();
-                        method.signature.id = id;
-                        method.callee = Some(Callee::Function(id));
-                        self.pending_methods.push(PendingMethod {
-                            id,
-                            owner: consumer.id,
-                            declaration: MethodDecl {
-                                function: FunctionDecl {
-                                    name: name.clone(),
-                                    ..source.function.clone()
-                                },
-                                ..source
+                if consumer.kind == NominalKind::Class
+                    && !method.abstract_method
+                    && let Some(source) = method.source.clone()
+                {
+                    let id = self.allocate_function();
+                    method.signature.id = id;
+                    method.callee = Some(Callee::Function(id));
+                    self.pending_methods.push(PendingMethod {
+                        id,
+                        owner: consumer.id,
+                        declaration: MethodDecl {
+                            function: FunctionDecl {
+                                name: name.clone(),
+                                ..source.function.clone()
                             },
-                            signature: method.signature.clone(),
-                            span: method.span,
-                        });
-                    }
+                            ..source
+                        },
+                        signature: method.signature.clone(),
+                        span: method.span,
+                    });
                 }
                 if let Some(previous) = methods.get(&name) {
                     self.diagnostics.push(
@@ -1634,6 +2681,7 @@ impl TypeChecker {
                         .with_label(previous.span, "first contribution is here"),
                     );
                 } else {
+                    method_order.push(name.clone());
                     methods.insert(name, method);
                 }
             }
@@ -1648,19 +2696,6 @@ impl TypeChecker {
         replacement: &MethodSignature,
         parent: &MethodSignature,
     ) {
-        if parent.visibility == Visibility::Private {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "typing",
-                    "T0028",
-                    replacement.span,
-                    format!(
-                        "`{class_name}::{method_name}` redeclares a parent-private method name"
-                    ),
-                )
-                .with_label(parent.span, "private method is declared here"),
-            );
-        }
         if parent.final_method {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -1672,7 +2707,12 @@ impl TypeChecker {
                 .with_label(parent.span, "final method is declared here"),
             );
         }
-        if !method_contract_equal(replacement, parent) {
+        if !(method_contract_equal(replacement, parent)
+            || matches!(
+                class_name,
+                "CallbackFilterIterator" | "RecursiveCallbackFilterIterator"
+            ) && method_name == "__construct")
+        {
             self.diagnostics.push(
                 Diagnostic::error(
                     "typing",
@@ -1703,14 +2743,21 @@ struct FunctionChecker<'signatures, 'diagnostics> {
     diagnostics: &'diagnostics mut Vec<Diagnostic>,
     id: FunctionId,
     name: String,
+    module_name: String,
     return_type: Type,
+    generator: bool,
     span: Span,
     locals: Vec<Local>,
     names: HashMap<String, LocalId>,
     parameters: Vec<LocalId>,
+    parameter_metadata: Vec<ParameterMetadata>,
     loop_depth: usize,
     owner: Option<ClassId>,
     static_method: bool,
+    type_parameters: BTreeMap<String, Type>,
+    narrowed: HashMap<LocalId, Type>,
+    closure_base: u32,
+    closures: Rc<RefCell<Vec<Option<Function>>>>,
 }
 
 impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
@@ -1721,35 +2768,45 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         diagnostics: &'diagnostics mut Vec<Diagnostic>,
         id: FunctionId,
         name: &str,
+        module_name: &str,
         return_type: Type,
         span: Span,
         owner: Option<ClassId>,
         static_method: bool,
+        closure_base: u32,
+        closures: Rc<RefCell<Vec<Option<Function>>>>,
     ) -> Self {
+        let type_parameters = owner
+            .and_then(|owner| classes.values().find(|class| class.id == owner))
+            .map_or_else(BTreeMap::new, |class| {
+                type_parameter_environment(&class.type_parameters)
+            });
         Self {
             signatures,
             classes,
             diagnostics,
             id,
             name: name.to_owned(),
+            module_name: module_name.to_owned(),
             return_type,
+            generator: false,
             span,
             locals: Vec::new(),
             names: HashMap::new(),
             parameters: Vec::new(),
+            parameter_metadata: Vec::new(),
             loop_depth: 0,
             owner,
             static_method,
+            type_parameters,
+            narrowed: HashMap::new(),
+            closure_base,
+            closures,
         }
     }
 
     fn declare_receiver(&mut self, class: &ClassSignature) {
-        let id = self.add_local(
-            "this".to_owned(),
-            Type::Object(class.name.clone()),
-            class.span,
-            true,
-        );
+        let id = self.add_local("this".to_owned(), declaration_type(class), class.span, true);
         self.parameters.push(id);
     }
 
@@ -1758,6 +2815,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         declaration: &FunctionDecl,
         signatures: &[ParameterSignature],
     ) {
+        self.parameter_metadata = signatures.iter().map(parameter_metadata).collect();
         for (parameter, signature) in declaration.parameters.iter().zip(signatures) {
             let ty = &signature.ty;
             if let Some(previous) = self.names.get(&parameter.name).copied() {
@@ -1835,9 +2893,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 annotation,
                 value,
             } => {
-                let annotated = annotation
-                    .as_ref()
-                    .and_then(|syntax| resolve_type(syntax, self.classes, self.diagnostics));
+                let annotated = annotation.as_ref().and_then(|syntax| {
+                    resolve_type(
+                        syntax,
+                        self.classes,
+                        &self.type_parameters,
+                        self.diagnostics,
+                    )
+                });
                 if let Some(id) = self.names.get(name).copied() {
                     if annotation.is_some() {
                         self.diagnostics.push(Diagnostic::error(
@@ -1850,6 +2913,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     let expected = self.locals[id.0 as usize].ty.clone();
                     let value = self.lower_expression(value, Some(&expected))?;
                     self.expect_type(&expected, &value.ty, value.span);
+                    self.narrowed.remove(&id);
                     StatementKind::Assign {
                         local: id,
                         value,
@@ -1883,7 +2947,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 StatementKind::Echo(value)
             }
             StmtKind::Return(expression) => {
-                let return_type = self.return_type.clone();
+                let return_type = if self.generator {
+                    Type::Mixed
+                } else {
+                    self.return_type.clone()
+                };
                 let value = expression
                     .as_ref()
                     .and_then(|expression| self.lower_expression(expression, Some(&return_type)));
@@ -1896,6 +2964,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     )),
                     (expected, Some(value)) => self.expect_type(expected, &value.ty, value.span),
                     (Type::Void, None) => {}
+                    (_, None) if self.generator => {}
                     (expected, None) => self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0004",
@@ -1905,27 +2974,91 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 }
                 StatementKind::Return(value)
             }
+            StmtKind::Yield { key, value } => {
+                if !self.generator {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0700",
+                        statement.span,
+                        "`yield` is only valid inside a generator function",
+                    ));
+                    return None;
+                }
+                let Some((key_type, value_type)) =
+                    generator_target_args(&self.return_type).map(|(k, v)| (k.clone(), v.clone()))
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0701",
+                        statement.span,
+                        "a generator function must declare `Iterator<K, V>` or `Generator<K, V>`",
+                    ));
+                    return None;
+                };
+                let key = key
+                    .as_ref()
+                    .and_then(|key| self.lower_expression(key, Some(&key_type)));
+                if let Some(key) = &key {
+                    self.expect_type(&key_type, &key.ty, key.span);
+                } else {
+                    self.expect_type(&key_type, &Type::Int, statement.span);
+                }
+                let value = self.lower_expression(value, Some(&value_type))?;
+                self.expect_type(&value_type, &value.ty, value.span);
+                StatementKind::Yield { key, value }
+            }
             StmtKind::If {
                 branches,
                 otherwise,
             } => {
-                let branches = branches
-                    .iter()
-                    .filter_map(|(condition, body)| {
-                        let condition = self.lower_expression(condition, Some(&Type::Bool))?;
-                        self.expect_type(&Type::Bool, &condition.ty, condition.span);
-                        Some((condition, self.lower_block(body)))
-                    })
-                    .collect();
+                let entry_narrowed = self.narrowed.clone();
+                let mut exits = Vec::with_capacity(branches.len() + 1);
+                let mut lowered = Vec::new();
+                for (condition, body) in branches {
+                    self.narrowed.clone_from(&entry_narrowed);
+                    let Some(typed_condition) = self.lower_expression(condition, Some(&Type::Bool))
+                    else {
+                        continue;
+                    };
+                    self.expect_type(&Type::Bool, &typed_condition.ty, typed_condition.span);
+                    let refinement = self.positive_refinement(condition);
+                    let previous = refinement
+                        .as_ref()
+                        .and_then(|(local, _)| self.narrowed.get(local).cloned());
+                    if let Some((local, ty)) = refinement.clone() {
+                        self.narrowed.insert(local, ty);
+                    }
+                    let typed_body = self.lower_block(body);
+                    if let Some((local, narrowed)) = refinement
+                        && self.narrowed.get(&local) == Some(&narrowed)
+                    {
+                        match previous {
+                            Some(previous) => {
+                                self.narrowed.insert(local, previous);
+                            }
+                            None => {
+                                self.narrowed.remove(&local);
+                            }
+                        }
+                    }
+                    exits.push(self.narrowed.clone());
+                    lowered.push((typed_condition, typed_body));
+                }
+                self.narrowed.clone_from(&entry_narrowed);
                 let otherwise = otherwise
                     .as_ref()
                     .map_or_else(Vec::new, |body| self.lower_block(body));
+                exits.push(self.narrowed.clone());
+                self.narrowed = entry_narrowed;
+                self.narrowed
+                    .retain(|local, ty| exits.iter().all(|exit| exit.get(local) == Some(ty)));
                 StatementKind::If {
-                    branches,
+                    branches: lowered,
                     otherwise,
                 }
             }
             StmtKind::While { condition, body } => {
+                self.invalidate_loop_refinements(body, &[]);
                 let condition = self.lower_expression(condition, Some(&Type::Bool))?;
                 self.expect_type(&Type::Bool, &condition.ty, condition.span);
                 self.loop_depth += 1;
@@ -1943,6 +3076,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     .iter()
                     .filter_map(|clause| self.lower_loop_clause(clause))
                     .collect::<Vec<_>>();
+                self.invalidate_loop_refinements(body, conditions);
+                self.invalidate_loop_refinements(&[], updates);
                 let conditions = conditions
                     .iter()
                     .filter_map(|clause| self.lower_loop_clause(clause))
@@ -1971,19 +3106,52 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 body,
             } => {
                 let source = self.lower_expression(source, None)?;
-                let (key_type, value_type) = match &source.ty {
-                    Type::Vector(value) => (Type::Int, value.as_ref().clone()),
-                    Type::Map(key, value) => (key.as_ref().clone(), value.as_ref().clone()),
+                let (key_type, value_type, object_protocol) = match &source.ty {
+                    Type::Vector(value) => (Type::Int, value.as_ref().clone(), None),
+                    Type::Map(key, value) => (key.as_ref().clone(), value.as_ref().clone(), None),
                     other => {
-                        self.diagnostics.push(Diagnostic::error(
-                            "typing",
-                            "T0610",
-                            source.span,
-                            format!(
-                                "`foreach` requires `vector<T>` or `map<K, V>`, found `{other}`"
-                            ),
-                        ));
-                        return None;
+                        let nominal = match other {
+                            Type::Object(_) | Type::Nominal { .. } => Some(other.clone()),
+                            Type::Parameter { id, .. } => self
+                                .classes
+                                .values()
+                                .flat_map(|class| &class.type_parameters)
+                                .find(|parameter| parameter.id == *id)
+                                .and_then(|parameter| parameter.bound.clone()),
+                            _ => None,
+                        };
+                        let Some(Type::Nominal { arguments, .. }) = nominal
+                            .as_ref()
+                            .and_then(|ty| instantiated_ancestor(ty, "Traversable", self.classes))
+                        else {
+                            self.diagnostics.push(Diagnostic::error(
+                                "typing",
+                                "T0610",
+                                source.span,
+                                format!(
+                                    "`foreach` requires `vector<T>`, `map<K, V>`, or `Traversable<K, V>`, found `{other}`"
+                                ),
+                            ));
+                            return None;
+                        };
+                        let [key_type, value_type] = arguments.as_slice() else {
+                            unreachable!("validated Traversable types have two arguments")
+                        };
+                        (
+                            key_type.clone(),
+                            value_type.clone(),
+                            Some(ForeachObjectProtocol {
+                                iterator: self.classes["Iterator"].id,
+                                aggregate: self.classes["IteratorAggregate"].id,
+                                get_iterator:
+                                    self.classes["IteratorAggregate"].methods["getIterator"].slot,
+                                rewind: self.classes["Iterator"].methods["rewind"].slot,
+                                valid: self.classes["Iterator"].methods["valid"].slot,
+                                key: self.classes["Iterator"].methods["key"].slot,
+                                value: self.classes["Iterator"].methods["value"].slot,
+                                advance: self.classes["Iterator"].methods["advance"].slot,
+                            }),
+                        )
                     }
                 };
                 if key.as_ref().is_some_and(|key| key.name == value.name) {
@@ -1999,6 +3167,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     .as_ref()
                     .map(|binding| self.bind_foreach_local(&binding.name, &key_type, binding.span));
                 let value_binding = self.bind_foreach_local(&value.name, &value_type, value.span);
+                self.invalidate_loop_refinements(body, &[]);
                 self.loop_depth += 1;
                 let lowered_body = self.lower_block(body);
                 self.loop_depth -= 1;
@@ -2012,6 +3181,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     value: value_binding.0,
                     key_type,
                     value_type,
+                    object_protocol,
                     body: lowered_body,
                 }
             }
@@ -2104,6 +3274,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
+                        if !class.type_parameters.is_empty() {
+                            self.diagnostics.push(Diagnostic::error(
+                                "typing",
+                                "T1016",
+                                clause.class_span,
+                                "generic catch targets are not supported",
+                            ));
+                        }
                         if !is_nominal_subtype(self.classes, &class.name, "Throwable") {
                             self.diagnostics.push(Diagnostic::error(
                                 "typing",
@@ -2170,7 +3348,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 body,
             } => {
                 let value = self.lower_expression(value, None)?;
-                let Type::Object(class_name) = &value.ty else {
+                let Some(lookup_type) = nominal_lookup_type(&value.ty, self.classes) else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0601",
@@ -2179,6 +3357,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                let (class_name, _) = nominal_parts(&lookup_type).expect("lookup type is nominal");
                 if !is_nominal_subtype(self.classes, class_name, "Closeable") {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
@@ -2237,6 +3416,17 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         })
     }
 
+    fn invalidate_loop_refinements(&mut self, body: &[Stmt], clauses: &[ForClause]) {
+        // A write on any iteration invalidates the incoming guard before the loop head.
+        self.narrowed.retain(|local, _| {
+            let name = &self.locals[local.0 as usize].name;
+            !block_assigns_local(body, name)
+                && !clauses
+                    .iter()
+                    .any(|clause| clause_assigns_local(clause, name))
+        });
+    }
+
     fn lower_loop_clause(&mut self, clause: &ForClause) -> Option<LoopClause> {
         let kind = match &clause.kind {
             ForClauseKind::Assign {
@@ -2245,9 +3435,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 annotation,
                 value,
             } => {
-                let annotated = annotation
-                    .as_ref()
-                    .and_then(|syntax| resolve_type(syntax, self.classes, self.diagnostics));
+                let annotated = annotation.as_ref().and_then(|syntax| {
+                    resolve_type(
+                        syntax,
+                        self.classes,
+                        &self.type_parameters,
+                        self.diagnostics,
+                    )
+                });
                 let local = if let Some(local) = self.names.get(name).copied() {
                     if annotation.is_some() {
                         self.diagnostics.push(Diagnostic::error(
@@ -2270,6 +3465,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 } else {
                     self.expect_type(&expected, &value.ty, value.span);
                 }
+                self.narrowed.remove(&local);
                 LoopClauseKind::Assign { local, value }
             }
             ForClauseKind::SetProperty {
@@ -2323,6 +3519,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         if let Some(local) = self.names.get(name).copied() {
             let existing = self.locals[local.0 as usize].ty.clone();
             self.expect_type(&existing, ty, span);
+            self.narrowed.remove(&local);
             return (local, Some(local), name.to_owned());
         }
         (
@@ -2386,6 +3583,148 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         Some((root, collection_types, lowered_indices, value))
     }
 
+    fn lower_closure(
+        &mut self,
+        parameters: &[thp_syntax::Parameter],
+        declared_captures: &[String],
+        implicit_captures: bool,
+        return_type: &TypeSyntax,
+        body: &Block,
+        span: Span,
+    ) -> Option<TypedExpr> {
+        let result = resolve_type(
+            return_type,
+            self.classes,
+            &self.type_parameters,
+            self.diagnostics,
+        )?;
+        let mut capture_names = declared_captures.to_vec();
+        if implicit_captures {
+            let mut used = BTreeSet::new();
+            for statement in body {
+                if let StmtKind::Return(Some(value)) = &statement.kind {
+                    collect_expr_variables(value, &mut used);
+                }
+            }
+            capture_names.extend(used.into_iter().filter(|name| {
+                self.names.contains_key(name)
+                    && !parameters.iter().any(|parameter| parameter.name == *name)
+            }));
+        }
+        let mut seen = BTreeSet::new();
+        let mut captures = Vec::new();
+        for name in capture_names {
+            if !seen.insert(name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0320",
+                    span,
+                    format!("`${name}` is captured more than once"),
+                ));
+                continue;
+            }
+            let Some(id) = self.names.get(&name).copied() else {
+                self.diagnostics.push(Diagnostic::error(
+                    "name_resolution",
+                    "N0101",
+                    span,
+                    format!("unknown captured variable `${name}`"),
+                ));
+                continue;
+            };
+            captures.push((
+                name,
+                TypedExpr {
+                    kind: TypedExprKind::Local(id),
+                    ty: self.locals[id.0 as usize].ty.clone(),
+                    span,
+                },
+            ));
+        }
+        let parameter_types = parameters
+            .iter()
+            .filter_map(|parameter| {
+                resolve_type(
+                    &parameter.ty,
+                    self.classes,
+                    &self.type_parameters,
+                    self.diagnostics,
+                )
+            })
+            .collect::<Vec<_>>();
+        if parameter_types.len() != parameters.len() {
+            return None;
+        }
+        let id = {
+            let mut closures = self.closures.borrow_mut();
+            let id = FunctionId(
+                self.closure_base + u32::try_from(closures.len()).expect("closure count fits u32"),
+            );
+            closures.push(None);
+            id
+        };
+        let mut checker = FunctionChecker::new(
+            self.signatures,
+            self.classes,
+            self.diagnostics,
+            id,
+            &format!("<closure:{}>", id.0),
+            &self.module_name,
+            result.clone(),
+            span,
+            None,
+            false,
+            self.closure_base,
+            Rc::clone(&self.closures),
+        );
+        for (name, value) in &captures {
+            let local = checker.add_local(name.clone(), value.ty.clone(), span, true);
+            checker.parameters.push(local);
+            checker.parameter_metadata.push(ParameterMetadata {
+                name: name.clone(),
+                ty: value.ty.clone(),
+                default: None,
+                variadic: false,
+            });
+        }
+        for (parameter, ty) in parameters.iter().zip(&parameter_types) {
+            if checker.names.contains_key(&parameter.name) {
+                checker.diagnostics.push(Diagnostic::error(
+                    "name_resolution",
+                    "N0002",
+                    parameter.name_span,
+                    format!("duplicate closure parameter `${}`", parameter.name),
+                ));
+                continue;
+            }
+            let local = checker.add_local(
+                parameter.name.clone(),
+                ty.clone(),
+                parameter.name_span,
+                true,
+            );
+            checker.parameters.push(local);
+            checker.parameter_metadata.push(ParameterMetadata {
+                name: parameter.name.clone(),
+                ty: ty.clone(),
+                default: None,
+                variadic: false,
+            });
+        }
+        checker.generator = block_has_yield(body);
+        let lowered = checker.lower_block(body);
+        let function = checker.finish(lowered);
+        self.closures.borrow_mut()[(id.0 - self.closure_base) as usize] = Some(function);
+        Some(TypedExpr {
+            kind: TypedExprKind::Closure {
+                function: id,
+                captures: captures.into_iter().map(|(_, value)| value).collect(),
+            },
+            ty: Type::Callable(parameter_types, Box::new(result)),
+            span,
+        })
+    }
+
     fn lower_expression(
         &mut self,
         expression: &Expr,
@@ -2407,24 +3746,87 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
-                (
-                    TypedExprKind::Local(id),
-                    self.locals[id.0 as usize].ty.clone(),
-                )
+                let declared = self.locals[id.0 as usize].ty.clone();
+                if let Some(narrowed) = self.narrowed.get(&id).cloned() {
+                    (
+                        TypedExprKind::CheckedNarrow {
+                            value: Box::new(TypedExpr {
+                                kind: TypedExprKind::Local(id),
+                                ty: declared,
+                                span: expression.span,
+                            }),
+                            narrowed: narrowed.clone(),
+                        },
+                        narrowed,
+                    )
+                } else {
+                    (TypedExprKind::Local(id), declared)
+                }
             }
             ExprKind::Name(name) => {
+                if let Some(signature) = self.signatures.get(name)
+                    && signature.native_index.is_none()
+                    && signature
+                        .parameters
+                        .iter()
+                        .all(|parameter| parameter.default.is_none() && !parameter.variadic)
+                {
+                    return Some(TypedExpr {
+                        kind: TypedExprKind::Closure {
+                            function: signature.id,
+                            captures: Vec::new(),
+                        },
+                        ty: Type::Callable(
+                            signature
+                                .parameters
+                                .iter()
+                                .map(|parameter| parameter.ty.clone())
+                                .collect(),
+                            Box::new(signature.return_type.clone()),
+                        ),
+                        span: expression.span,
+                    });
+                }
                 self.diagnostics.push(Diagnostic::error(
-                    "name_resolution",
-                    "N0102",
+                    "typing",
+                    "T0301",
                     expression.span,
-                    format!("name `{name}` is only valid as a callable in this language subset"),
+                    format!("`{name}` cannot be used as a callable value"),
                 ));
                 return None;
             }
+            ExprKind::Closure {
+                parameters,
+                captures,
+                implicit_captures,
+                return_type,
+                body,
+            } => {
+                return self.lower_closure(
+                    parameters,
+                    captures,
+                    *implicit_captures,
+                    return_type,
+                    body,
+                    expression.span,
+                );
+            }
             ExprKind::Vector(values) => {
+                let target_element = expected
+                    .and_then(iterator_target_args)
+                    .and_then(|(key, value)| (key == &Type::Int).then_some(value));
                 let expected_element = match expected {
                     Some(Type::Vector(element)) => Some(element.as_ref()),
-                    _ => None,
+                    Some(Type::Union(members)) => members
+                        .iter()
+                        .find_map(|member| {
+                            let Type::Vector(element) = member else {
+                                return None;
+                            };
+                            Some(element.as_ref())
+                        })
+                        .or(target_element),
+                    _ => target_element,
                 };
                 let values = values
                     .iter()
@@ -2456,9 +3858,22 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 )
             }
             ExprKind::Map(entries) => {
+                let target_types = expected.and_then(iterator_target_args);
                 let (expected_key, expected_value) = match expected {
                     Some(Type::Map(key, value)) => (Some(key.as_ref()), Some(value.as_ref())),
-                    _ => (None, None),
+                    Some(Type::Union(members)) => members
+                        .iter()
+                        .find_map(|member| {
+                            let Type::Map(key, value) = member else {
+                                return None;
+                            };
+                            Some((Some(key.as_ref()), Some(value.as_ref())))
+                        })
+                        .unwrap_or_else(|| {
+                            target_types
+                                .map_or((None, None), |(key, value)| (Some(key), Some(value)))
+                        }),
+                    _ => target_types.map_or((None, None), |(key, value)| (Some(key), Some(value))),
                 };
                 let entries = entries
                     .iter()
@@ -2541,16 +3956,66 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 )
             }
             ExprKind::Call { callee, arguments } => {
-                let ExprKind::Name(name) = &callee.kind else {
-                    self.diagnostics.push(Diagnostic::error(
-                        "typing",
-                        "T0301",
-                        callee.span,
-                        "dynamic callable invocation is not supported",
-                    ));
-                    return None;
+                let value = if let ExprKind::Name(name) = &callee.kind {
+                    self.lower_call(name, arguments, expression.span, expected)?
+                } else {
+                    let callee = self.lower_expression(callee, None)?;
+                    let Type::Callable(parameters, result) = &callee.ty else {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0301",
+                            callee.span,
+                            format!("type `{}` is not callable", callee.ty),
+                        ));
+                        return None;
+                    };
+                    let parameters = parameters.clone();
+                    let result = result.as_ref().clone();
+                    if arguments.len() != parameters.len() {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0303",
+                            expression.span,
+                            format!(
+                                "callable expects {} arguments, found {}",
+                                parameters.len(),
+                                arguments.len()
+                            ),
+                        ));
+                    }
+                    let values = arguments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, argument)| {
+                            if argument.name.is_some() {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "typing",
+                                    "T0318",
+                                    argument.span,
+                                    "named arguments are not supported for callable values",
+                                ));
+                            }
+                            let value =
+                                self.lower_expression(&argument.value, parameters.get(index))?;
+                            if let Some(expected) = parameters.get(index) {
+                                self.expect_type(expected, &value.ty, value.span);
+                            }
+                            Some(value)
+                        })
+                        .collect();
+                    TypedExpr {
+                        kind: TypedExprKind::CallValue {
+                            callee: Box::new(callee),
+                            arguments: values,
+                        },
+                        ty: result,
+                        span: expression.span,
+                    }
                 };
-                return self.lower_call(name, arguments, expression.span);
+                return Some(match expected {
+                    Some(expected) => coerce_collection_iterator(value, expected, self.classes),
+                    None => value,
+                });
             }
             ExprKind::Index { collection, index } => {
                 let collection = self.lower_expression(collection, None)?;
@@ -2578,10 +4043,67 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 )
             }
             ExprKind::New {
-                class_name,
-                class_span,
+                target,
+                type_arguments,
                 arguments,
             } => {
+                let NewTarget::Static {
+                    class_name,
+                    class_span,
+                } = target
+                else {
+                    let NewTarget::Dynamic(target) = target else {
+                        unreachable!()
+                    };
+                    let target = self.lower_expression(target, Some(&Type::String))?;
+                    if target.ty != Type::String {
+                        let mut diagnostic = Diagnostic::error(
+                            "typing",
+                            "T0415",
+                            target.span,
+                            format!(
+                                "dynamic class target must be `string`, found `{}`",
+                                target.ty
+                            ),
+                        );
+                        if target.ty == Type::Mixed {
+                            diagnostic = diagnostic.with_note(
+                                "narrow the value with `is_string($value)` before dynamic construction",
+                            );
+                        }
+                        self.diagnostics.push(diagnostic);
+                    }
+                    let type_arguments = type_arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            resolve_type(
+                                argument,
+                                self.classes,
+                                &self.type_parameters,
+                                self.diagnostics,
+                            )
+                        })
+                        .collect();
+                    let arguments = arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            Some(DynamicArgument {
+                                name: argument.name.clone(),
+                                value: self.lower_expression(&argument.value, None)?,
+                                span: argument.span,
+                            })
+                        })
+                        .collect();
+                    return Some(TypedExpr {
+                        kind: TypedExprKind::DynamicNew {
+                            target: Box::new(target),
+                            type_arguments,
+                            arguments,
+                        },
+                        ty: Type::Mixed,
+                        span: expression.span,
+                    });
+                };
                 let Some(class) = self.classes.get(class_name).cloned() else {
                     self.diagnostics.push(Diagnostic::error(
                         "name_resolution",
@@ -2611,7 +4133,49 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         format!("abstract class `{class_name}` cannot be instantiated"),
                     ));
                 }
-                if class.native && !is_nominal_subtype(self.classes, class_name, "Throwable") {
+                if class.native
+                    && !is_nominal_subtype(self.classes, class_name, "Throwable")
+                    && !matches!(
+                        class_name.as_str(),
+                        "ReflectionClass"
+                            | "ReflectionFunction"
+                            | "ReflectionMethod"
+                            | "ReflectionProperty"
+                            | "ReflectionParameter"
+                            | "VectorIterator"
+                            | "MapIterator"
+                            | "EmptyIterator"
+                            | "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "AppendIterator"
+                            | "CachingIterator"
+                            | "RecursiveEntry"
+                            | "RecursiveIteratorIterator"
+                            | "RecursiveCachingIterator"
+                            | "FixedSequence"
+                            | "LinkedList"
+                            | "Queue"
+                            | "Stack"
+                            | "MaxHeap"
+                            | "MinHeap"
+                            | "PriorityQueue"
+                            | "TypedMap"
+                            | "ObjectStorage"
+                            | "ParentIterator"
+                            | "RecursiveCallbackFilterIterator"
+                            | "CallbackFilterIterator"
+                            | "RegexIterator"
+                            | "RecursiveRegexIterator"
+                            | "TraceLine"
+                            | "SplFileInfo"
+                            | "SplFileObject"
+                            | "DirectoryIterator"
+                            | "FilesystemIterator"
+                            | "RecursiveDirectoryIterator"
+                            | "GlobIterator"
+                    )
+                {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0409",
@@ -2620,6 +4184,35 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 }
+                let instance_type = if class.type_parameters.is_empty() {
+                    if !type_arguments.is_empty() {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1002",
+                            *class_span,
+                            format!(
+                                "type `{class_name}` expects 0 generic arguments, found {}",
+                                type_arguments.len()
+                            ),
+                        ));
+                    }
+                    Type::Object(class.name.clone())
+                } else if type_arguments.is_empty() {
+                    self.infer_construction_type(&class, arguments, expression.span)?
+                } else {
+                    resolve_type(
+                        &TypeSyntax {
+                            kind: TypeSyntaxKind::Named {
+                                name: class_name.clone(),
+                                arguments: type_arguments.clone(),
+                            },
+                            span: *class_span,
+                        },
+                        self.classes,
+                        &self.type_parameters,
+                        self.diagnostics,
+                    )?
+                };
                 let constructor = class.constructor;
                 let initializers = class
                     .properties
@@ -2627,16 +4220,31 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     .zip(&class.property_initializers)
                     .filter_map(|(property, initializer)| {
                         let initializer = initializer.as_ref()?;
-                        let value = self.lower_expression(initializer, Some(&property.ty))?;
-                        self.expect_type(&property.ty, &value.ty, value.span);
+                        let property_type = instantiate_member_type(
+                            &instance_type,
+                            property.declaring_class,
+                            &property.ty,
+                            self.classes,
+                        );
+                        let value = self.lower_expression(initializer, Some(&property_type))?;
+                        self.expect_type(&property_type, &value.ty, value.span);
                         Some((property.id, value))
                     })
                     .collect();
                 let arguments = if constructor.is_some() {
-                    let method = class
+                    let mut method = class
                         .methods
                         .get("__construct")
-                        .expect("constructor id has a method signature");
+                        .expect("constructor id has a method signature")
+                        .clone();
+                    instantiate_method_signature(&mut method, &instance_type, self.classes);
+                    self.check_member_access(
+                        method.declaring_class,
+                        method.visibility,
+                        *class_span,
+                        "constructor",
+                        "__construct",
+                    );
                     self.bind_arguments(
                         "__construct",
                         arguments,
@@ -2646,6 +4254,42 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 } else {
                     self.bind_arguments("__construct", arguments, &[], expression.span)
                 };
+                if matches!(
+                    class.name.as_str(),
+                    "RegexIterator" | "RecursiveRegexIterator"
+                ) {
+                    let constant = |index| {
+                        arguments
+                            .explicit
+                            .iter()
+                            .chain(&arguments.defaults)
+                            .find(|argument| argument.target == ArgumentTarget::Parameter(index))
+                            .and_then(|argument| match argument.value.kind {
+                                TypedExprKind::Integer(value) => Some(value),
+                                _ => None,
+                            })
+                    };
+                    let mode = constant(2);
+                    let flags = constant(4);
+                    let valid = if let (
+                        Type::Nominal {
+                            arguments: types, ..
+                        },
+                        Some(mode),
+                        Some(flags),
+                    ) = (&instance_type, mode, flags)
+                    {
+                        types.len() == 3
+                            && regex_output_type(mode, flags, &types[1]).as_ref() == Some(&types[2])
+                            && (mode != 5 || types[0] == Type::String)
+                    } else {
+                        false
+                    };
+                    if !valid {
+                        self.diagnostics.push(Diagnostic::error("typing", "T1020", expression.span,
+                            "regex iterator requires constant mode and flags with matching input and output types"));
+                    }
+                }
                 (
                     TypedExprKind::New {
                         class: class.id,
@@ -2653,7 +4297,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         initializers,
                         arguments,
                     },
-                    Type::Object(class.name),
+                    instance_type,
                 )
             }
             ExprKind::Property {
@@ -2678,7 +4322,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 arguments,
             } => {
                 let object = self.lower_expression(object, None)?;
-                let Type::Object(class_name) = object.ty.clone() else {
+                let Some(lookup_type) = nominal_lookup_type(&object.ty, self.classes) else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0402",
@@ -2687,6 +4331,9 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                let (class_name, _) =
+                    nominal_parts(&lookup_type).expect("nominal lookup type is nominal");
+                let class_name = class_name.to_owned();
                 let Some(class) = self.classes.get(&class_name) else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
@@ -2696,7 +4343,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
-                let Some(method) = class.methods.get(name).cloned() else {
+                let Some(mut method) = class.methods.get(name).cloned() else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0404",
@@ -2705,6 +4352,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                instantiate_method_signature(&mut method, &lookup_type, self.classes);
                 self.check_member_access(
                     method.declaring_class,
                     method.visibility,
@@ -2758,7 +4406,9 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 name_span,
                 arguments,
             } => {
-                if let ScopeTarget::Named(class_name) = target
+                if let ScopeTarget::Named {
+                    name: class_name, ..
+                } = target
                     && self
                         .classes
                         .get(class_name)
@@ -2767,8 +4417,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 {
                     return self.lower_native_static(class_name, name, arguments, expression.span);
                 }
-                let (class_name, called_class, late_static) = match target {
-                    ScopeTarget::Named(class_name) => {
+                let mut inferred_option_arguments = None;
+                let (class_name, called_class, late_static, call_type) = match target {
+                    ScopeTarget::Named {
+                        name: class_name,
+                        type_arguments,
+                    } => {
                         let Some(class) = self.classes.get(class_name) else {
                             self.diagnostics.push(Diagnostic::error(
                                 "name_resolution",
@@ -2778,7 +4432,90 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (class.name.clone(), CalledClass::Explicit(class.id), false)
+                        let call_type = if class.type_parameters.is_empty() {
+                            if !type_arguments.is_empty() {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "typing",
+                                    "T1002",
+                                    *class_span,
+                                    format!(
+                                        "type `{class_name}` expects 0 generic arguments, found {}",
+                                        type_arguments.len()
+                                    ),
+                                ));
+                            }
+                            Type::Object(class.name.clone())
+                        } else if type_arguments.is_empty() {
+                            if class_name == "Option" && matches!(name.as_str(), "some" | "none") {
+                                let inferred = expected.and_then(|ty| match ty {
+                                    Type::Nominal { name, arguments } if name == "Option" => {
+                                        arguments.first().cloned()
+                                    }
+                                    _ => None,
+                                });
+                                let inferred = if inferred.is_none() && name == "some" {
+                                    let bound = self.bind_arguments(
+                                        name,
+                                        arguments,
+                                        &[native_parameter(
+                                            "value",
+                                            Type::Mixed,
+                                            None,
+                                            expression.span,
+                                        )],
+                                        expression.span,
+                                    );
+                                    let value = bound.explicit.first()?;
+                                    let ty = value.value.ty.clone();
+                                    inferred_option_arguments = Some(bound);
+                                    Some(ty)
+                                } else {
+                                    inferred
+                                };
+                                if let Some(value) = inferred {
+                                    Type::Nominal {
+                                        name: "Option".to_owned(),
+                                        arguments: vec![value],
+                                    }
+                                } else {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        "typing", "T1002", *class_span,
+                                        "`Option::none()` requires an expected Option<T> type or explicit type arguments",
+                                    ));
+                                    declaration_type(class)
+                                }
+                            } else {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "typing",
+                                    "T1002",
+                                    *class_span,
+                                    format!(
+                                        "generic class `{class_name}` requires {} explicit arguments for named static access",
+                                        class.type_parameters.len()
+                                    ),
+                                ));
+                                declaration_type(class)
+                            }
+                        } else {
+                            resolve_type(
+                                &TypeSyntax {
+                                    kind: TypeSyntaxKind::Named {
+                                        name: class_name.clone(),
+                                        arguments: type_arguments.clone(),
+                                    },
+                                    span: *class_span,
+                                },
+                                self.classes,
+                                &self.type_parameters,
+                                self.diagnostics,
+                            )?
+                        };
+                        (
+                            class.name.clone(),
+                            CalledClass::Explicit(class.id),
+                            false,
+                            call_type,
+                        )
                     }
                     ScopeTarget::SelfType => {
                         let Some(owner) = self.owner_class() else {
@@ -2790,7 +4527,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (owner.name.clone(), CalledClass::Forwarded, false)
+                        (
+                            owner.name.clone(),
+                            CalledClass::Forwarded,
+                            false,
+                            declaration_type(owner),
+                        )
                     }
                     ScopeTarget::Parent => {
                         let Some(owner) = self.owner_class() else {
@@ -2811,7 +4553,11 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (parent.clone(), CalledClass::Forwarded, false)
+                        let parent_type = owner
+                            .parent_type
+                            .clone()
+                            .unwrap_or_else(|| Type::Object(parent.clone()));
+                        (parent.clone(), CalledClass::Forwarded, false, parent_type)
                     }
                     ScopeTarget::Static => {
                         let Some(owner) = self.owner_class() else {
@@ -2823,7 +4569,12 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                             ));
                             return None;
                         };
-                        (owner.name.clone(), CalledClass::Forwarded, true)
+                        (
+                            owner.name.clone(),
+                            CalledClass::Forwarded,
+                            true,
+                            declaration_type(owner),
+                        )
                     }
                 };
                 let Some(class) = self.classes.get(&class_name) else {
@@ -2835,7 +4586,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
-                let Some(method) = class.methods.get(name).cloned() else {
+                let Some(mut method) = class.methods.get(name).cloned() else {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0404",
@@ -2844,6 +4595,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     ));
                     return None;
                 };
+                instantiate_method_signature(&mut method, &call_type, self.classes);
                 self.check_member_access(
                     method.declaring_class,
                     method.visibility,
@@ -2851,12 +4603,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     "method",
                     name,
                 );
-                let arguments = self.bind_arguments(
-                    name,
-                    arguments,
-                    &method.signature.parameters,
-                    expression.span,
-                );
+                let arguments = inferred_option_arguments.unwrap_or_else(|| {
+                    self.bind_arguments(
+                        name,
+                        arguments,
+                        &method.signature.parameters,
+                        expression.span,
+                    )
+                });
                 let receiver = if method.static_method {
                     None
                 } else {
@@ -2882,7 +4636,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         ));
                         return None;
                     };
-                    if matches!(target, ScopeTarget::Named(_))
+                    if matches!(target, ScopeTarget::Named { .. })
                         && self.owner_class().is_some_and(|owner| {
                             !is_nominal_subtype(self.classes, &owner.name, &class_name)
                         })
@@ -2931,9 +4685,36 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 name_span,
             } => {
                 let value = match (class_name.as_str(), name.as_str()) {
-                    ("OpenMode", "Read") | ("SeekFrom", "Start") => 0,
-                    ("OpenMode", "Write") | ("SeekFrom", "Current") => 1,
-                    ("OpenMode", "ReadWrite") | ("SeekFrom", "End") => 2,
+                    ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_CURRENT") => 8,
+                    ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_INNER") => 16,
+                    ("CachingIterator" | "RecursiveCachingIterator", "FULL_CACHE") => 256,
+                    ("RegexIterator" | "RecursiveRegexIterator", "MATCH")
+                    | ("OpenMode", "Read")
+                    | ("WriteMode", "OpenExisting")
+                    | ("SeekFrom", "Start")
+                    | ("RecursiveIteratorIterator", "LEAVES_ONLY") => 0,
+                    ("RegexIterator" | "RecursiveRegexIterator", "GET_MATCH")
+                    | ("OpenMode", "Write")
+                    | ("WriteMode", "Truncate")
+                    | ("SeekFrom", "Current")
+                    | ("CachingIterator" | "RecursiveCachingIterator", "CALL_TOSTRING")
+                    | ("RecursiveIteratorIterator", "SELF_FIRST") => 1,
+                    ("RegexIterator" | "RecursiveRegexIterator", "ALL_MATCHES")
+                    | ("OpenMode", "ReadWrite")
+                    | ("WriteMode", "Append")
+                    | ("SeekFrom", "End")
+                    | ("CachingIterator" | "RecursiveCachingIterator", "CATCH_GET_CHILD")
+                    | ("RecursiveIteratorIterator", "CHILD_FIRST") => 2,
+                    ("RegexIterator" | "RecursiveRegexIterator", "SPLIT")
+                    | ("OpenMode", "Append")
+                    | ("WriteMode", "Create") => 3,
+                    ("RegexIterator" | "RecursiveRegexIterator", "REPLACE")
+                    | ("OpenMode", "ReadWriteTruncate")
+                    | ("WriteMode", "CreateExclusive")
+                    | ("CachingIterator" | "RecursiveCachingIterator", "TOSTRING_USE_KEY") => 4,
+                    ("RegexIterator" | "RecursiveRegexIterator", "USE_KEY")
+                    | ("OpenMode", "ReadWriteAppend") => 5,
+                    ("OpenMode", "CreateExclusive") => 6,
                     _ => {
                         self.diagnostics.push(Diagnostic::error(
                             "name_resolution",
@@ -2944,7 +4725,17 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         return None;
                     }
                 };
-                if !matches!(class_name.as_str(), "OpenMode" | "SeekFrom") {
+                if !matches!(
+                    class_name.as_str(),
+                    "OpenMode"
+                        | "WriteMode"
+                        | "SeekFrom"
+                        | "CachingIterator"
+                        | "RecursiveCachingIterator"
+                        | "RecursiveIteratorIterator"
+                        | "RegexIterator"
+                        | "RecursiveRegexIterator"
+                ) {
                     self.diagnostics.push(Diagnostic::error(
                         "name_resolution",
                         "N0104",
@@ -2981,10 +4772,14 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 return self.lower_match_expression(subject, arms, expected, expression.span);
             }
         };
-        Some(TypedExpr {
+        let value = TypedExpr {
             kind,
             ty,
             span: expression.span,
+        };
+        Some(match expected {
+            Some(expected) => coerce_collection_iterator(value, expected, self.classes),
+            None => value,
         })
     }
 
@@ -3030,18 +4825,18 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                         ),
                     ));
                 }
-                if let Some(key) = literal_key(&condition.kind) {
-                    if let Some(previous) = literal_conditions.insert(key, condition.span) {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "typing",
-                                "T0703",
-                                condition.span,
-                                "duplicate literal match condition",
-                            )
-                            .with_label(previous, "first matching literal is here"),
-                        );
-                    }
+                if let Some(key) = literal_key(&condition.kind)
+                    && let Some(previous) = literal_conditions.insert(key, condition.span)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "typing",
+                            "T0703",
+                            condition.span,
+                            "duplicate literal match condition",
+                        )
+                        .with_label(previous, "first matching literal is here"),
+                    );
                 }
                 conditions.push(condition);
             }
@@ -3077,7 +4872,611 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         })
     }
 
-    fn lower_call(&mut self, name: &str, arguments: &[Argument], span: Span) -> Option<TypedExpr> {
+    fn positive_refinement(&self, condition: &Expr) -> Option<(LocalId, Type)> {
+        let (name, guard) = match &condition.kind {
+            ExprKind::Call { callee, arguments } if arguments.len() == 1 => {
+                let ExprKind::Name(name) = &callee.kind else {
+                    return None;
+                };
+                let ExprKind::Variable(variable) = &arguments[0].value.kind else {
+                    return None;
+                };
+                let guard = match name.as_str() {
+                    "is_string" => Type::String,
+                    "is_int" => Type::Int,
+                    "is_float" => Type::Float,
+                    "is_null" => Type::Null,
+                    "is_numeric" => Type::Union(vec![Type::Int, Type::Float, Type::String]),
+                    "is_vector" => Type::Vector(Box::new(Type::Mixed)),
+                    "is_map" => Type::Map(Box::new(Type::Mixed), Box::new(Type::Mixed)),
+                    _ => return None,
+                };
+                (variable, guard)
+            }
+            ExprKind::InstanceOf {
+                value, class_name, ..
+            } => {
+                let ExprKind::Variable(variable) = &value.kind else {
+                    return None;
+                };
+                let class = self.classes.get(class_name)?;
+                if !class.type_parameters.is_empty()
+                    || !matches!(class.kind, NominalKind::Class | NominalKind::Interface)
+                {
+                    return None;
+                }
+                (variable, Type::Object(class_name.clone()))
+            }
+            _ => return None,
+        };
+        let local = *self.names.get(name)?;
+        let current = self
+            .narrowed
+            .get(&local)
+            .unwrap_or(&self.locals[local.0 as usize].ty);
+        intersect_narrow(current, &guard, self.classes).map(|ty| (local, ty))
+    }
+
+    fn lower_collection_call(
+        &mut self,
+        name: &str,
+        arguments: &[Argument],
+        span: Span,
+        expected: Option<&Type>,
+    ) -> Option<TypedExpr> {
+        let (names, callback_index, builtin): (&[&str], Option<usize>, Builtin) = match name {
+            "vector_map" => (&["values", "callback"], Some(1), Builtin::VectorMap),
+            "vector_filter" => (&["values", "callback"], Some(1), Builtin::VectorFilter),
+            "vector_slice" => (&["values", "offset", "length"], None, Builtin::VectorSlice),
+            "vector_concat" => (&["first", "second"], None, Builtin::VectorConcat),
+            "map_transform" => (&["values", "callback"], Some(1), Builtin::MapTransform),
+            "map_filter" => (&["values", "callback"], Some(1), Builtin::MapFilter),
+            "map_merge" => (&["first", "second"], None, Builtin::MapMerge),
+            "iterator_apply" => (&["iterator", "callback"], Some(1), Builtin::IteratorApply),
+            _ => unreachable!(),
+        };
+        let mut slots = vec![None; names.len()];
+        let mut targets = Vec::new();
+        let mut positional = 0;
+        let mut named_seen = false;
+        for argument in arguments {
+            let target = if let Some(argument_name) = &argument.name {
+                named_seen = true;
+                names.iter().position(|name| *name == argument_name)
+            } else {
+                if named_seen {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0313",
+                        argument.span,
+                        "positional arguments cannot follow named arguments",
+                    ));
+                }
+                let index = positional;
+                positional += 1;
+                (index < names.len()).then_some(index)
+            };
+            let Some(target) = target else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0303",
+                    argument.span,
+                    format!("unexpected argument for `{name}`"),
+                ));
+                return None;
+            };
+            if slots[target].replace(argument).is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0315",
+                    argument.span,
+                    format!("argument `{}` is supplied more than once", names[target]),
+                ));
+                return None;
+            }
+            targets.push(target);
+        }
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.is_none() && !(name == "vector_slice" && index == 2) {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0304",
+                    span,
+                    format!("missing argument `{}` for `{name}`", names[index]),
+                ));
+                return None;
+            }
+        }
+        let mut values = vec![None; names.len()];
+        let callback_type = if let Some(index) = callback_index {
+            let callback = self.lower_expression(&slots[index]?.value, None)?;
+            let ty = callback.ty.clone();
+            values[index] = Some(callback);
+            let Type::Callable(parameters, result) = ty else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    slots[index]?.span,
+                    format!("`{name}` requires a typed callable"),
+                ));
+                return None;
+            };
+            if matches!(name, "vector_map" | "map_transform") && result.as_ref() == &Type::Void {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    slots[index]?.value.span,
+                    format!("`{name}` callback must return a value"),
+                ));
+                return None;
+            }
+            Some((parameters, *result))
+        } else {
+            None
+        };
+        let input_hint = match (name, callback_type.as_ref()) {
+            ("vector_map" | "vector_filter", Some((parameters, _))) if parameters.len() == 1 => {
+                Some(Type::Vector(Box::new(parameters[0].clone())))
+            }
+            ("map_transform" | "map_filter", Some((parameters, _))) if parameters.len() == 2 => {
+                Some(Type::Map(
+                    Box::new(parameters[1].clone()),
+                    Box::new(parameters[0].clone()),
+                ))
+            }
+            _ => expected.cloned(),
+        };
+        let first_syntax = &slots[0]?.value;
+        let first_is_empty = matches!(&first_syntax.kind, ExprKind::Vector(items) if items.is_empty())
+            || matches!(&first_syntax.kind, ExprKind::Map(items) if items.is_empty());
+        let binary = matches!(name, "vector_concat" | "map_merge");
+        if binary && first_is_empty && input_hint.is_none() {
+            values[1] = Some(self.lower_expression(&slots[1]?.value, None)?);
+        }
+        let first_expected = input_hint
+            .as_ref()
+            .or_else(|| values[1].as_ref().map(|value| &value.ty));
+        values[0] = Some(self.lower_expression(first_syntax, first_expected)?);
+        if binary && values[1].is_none() {
+            let input_type = values[0].as_ref().map(|value| &value.ty);
+            values[1] = Some(self.lower_expression(&slots[1]?.value, input_type)?);
+        }
+        if name == "vector_slice" {
+            values[1] = Some(self.lower_expression(&slots[1]?.value, Some(&Type::Int))?);
+            if let Some(argument) = slots[2] {
+                values[2] = Some(self.lower_expression(
+                    &argument.value,
+                    Some(&normalize_union(vec![Type::Int, Type::Null])),
+                )?);
+            }
+        }
+        let input = values[0].as_ref()?;
+        let input_ty = input.ty.clone();
+        let result_ty = match name {
+            "vector_map" | "vector_filter" | "vector_slice" | "vector_concat" => {
+                let Type::Vector(element) = &input_ty else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        input.span,
+                        format!("`{name}` requires `vector<T>`, found `{input_ty}`"),
+                    ));
+                    return None;
+                };
+                if name == "vector_concat" {
+                    self.expect_type(&input_ty, &values[1].as_ref()?.ty, values[1].as_ref()?.span);
+                }
+                if name == "vector_slice" {
+                    self.expect_type(
+                        &Type::Int,
+                        &values[1].as_ref()?.ty,
+                        values[1].as_ref()?.span,
+                    );
+                    if let Some(length) = &values[2] {
+                        self.expect_type(
+                            &normalize_union(vec![Type::Int, Type::Null]),
+                            &length.ty,
+                            length.span,
+                        );
+                    }
+                }
+                if let Some((parameters, result)) = &callback_type {
+                    if parameters.as_slice() != [element.as_ref().clone()] {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0302",
+                            slots[1]?.span,
+                            format!("`{name}` callback must accept `{element}`"),
+                        ));
+                    }
+                    if name == "vector_filter" {
+                        self.expect_type(&Type::Bool, result, slots[1]?.span);
+                    }
+                }
+                if name == "vector_map" {
+                    Type::Vector(Box::new(callback_type.as_ref()?.1.clone()))
+                } else {
+                    input_ty.clone()
+                }
+            }
+            "map_transform" | "map_filter" | "map_merge" => {
+                let Type::Map(key, value) = &input_ty else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        input.span,
+                        format!("`{name}` requires `map<K, V>`, found `{input_ty}`"),
+                    ));
+                    return None;
+                };
+                if name == "map_merge" {
+                    self.expect_type(&input_ty, &values[1].as_ref()?.ty, values[1].as_ref()?.span);
+                }
+                if let Some((parameters, result)) = &callback_type {
+                    if parameters.as_slice() != [value.as_ref().clone(), key.as_ref().clone()] {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0302",
+                            slots[1]?.span,
+                            format!("`{name}` callback must accept `({value}, {key})`"),
+                        ));
+                    }
+                    if name == "map_filter" {
+                        self.expect_type(&Type::Bool, result, slots[1]?.span);
+                    }
+                }
+                if name == "map_transform" {
+                    Type::Map(key.clone(), Box::new(callback_type.as_ref()?.1.clone()))
+                } else {
+                    input_ty.clone()
+                }
+            }
+            "iterator_apply" => {
+                let Some((key, value)) = iterator_types(&input_ty, self.classes) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        input.span,
+                        format!("`iterator_apply` requires `Iterator<K, V>`, found `{input_ty}`"),
+                    ));
+                    return None;
+                };
+                let parameter_type = Type::Nominal {
+                    name: "Iterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                };
+                values[0] = Some(coerce_collection_iterator(
+                    input.clone(),
+                    &parameter_type,
+                    self.classes,
+                ));
+                if let Some((parameters, result)) = &callback_type {
+                    if parameters.as_slice() != [value, key] {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0302",
+                            slots[1]?.span,
+                            "`iterator_apply` callback must accept the value and key",
+                        ));
+                    }
+                    self.expect_type(&Type::Bool, result, slots[1]?.span);
+                }
+                Type::Int
+            }
+            _ => unreachable!(),
+        };
+        let explicit = arguments
+            .iter()
+            .zip(targets)
+            .map(|(_, target)| BoundArgument {
+                target: ArgumentTarget::Parameter(target),
+                value: values[target].take().expect("argument was lowered"),
+            })
+            .collect();
+        let defaults = if name == "vector_slice" && slots[2].is_none() {
+            vec![BoundArgument {
+                target: ArgumentTarget::Parameter(2),
+                value: TypedExpr {
+                    kind: TypedExprKind::Null,
+                    ty: Type::Null,
+                    span,
+                },
+            }]
+        } else {
+            Vec::new()
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::Call {
+                callee: Callee::Builtin(builtin),
+                arguments: BoundArguments {
+                    explicit,
+                    defaults,
+                    parameter_count: names.len(),
+                    variadic_parameter: None,
+                    variadic_type: None,
+                },
+            },
+            ty: result_ty,
+            span,
+        })
+    }
+
+    fn lower_call(
+        &mut self,
+        name: &str,
+        arguments: &[Argument],
+        span: Span,
+        expected: Option<&Type>,
+    ) -> Option<TypedExpr> {
+        if name == "async" {
+            return self.lower_async_call(arguments, span);
+        }
+        if name == "await" {
+            let parameters = [
+                native_parameter("target", Type::Mixed, None, span),
+                native_parameter("cancellation", Type::Mixed, Some(ExprKind::Null), span),
+            ];
+            let bound = self.bind_arguments(name, arguments, &parameters, span);
+            let target = bound
+                .explicit
+                .iter()
+                .find(|argument| argument.target == ArgumentTarget::Parameter(0))?;
+            let result = instantiated_ancestor(&target.value.ty, "Completable", self.classes)
+                .and_then(|ty| match ty {
+                    Type::Nominal { arguments, .. } => arguments.into_iter().next(),
+                    _ => None,
+                });
+            let Some(result) = result else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    target.value.span,
+                    format!(
+                        "`await` requires `Completable<T>`, found `{}`",
+                        target.value.ty
+                    ),
+                ));
+                return None;
+            };
+            if let Some(cancellation) = bound
+                .explicit
+                .iter()
+                .find(|argument| argument.target == ArgumentTarget::Parameter(1))
+                && cancellation.value.ty != Type::Null
+                && instantiated_ancestor(&cancellation.value.ty, "Completable", self.classes)
+                    .is_none()
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0302",
+                    cancellation.value.span,
+                    "`await` cancellation source must be `Completable<T>` or null",
+                ));
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(Builtin::Await),
+                    arguments: bound,
+                },
+                ty: result,
+                span,
+            });
+        }
+        let async_function = match name {
+            "scheduler_register_default" => {
+                Some((Builtin::SchedulerRegisterDefault, vec![], Type::Void))
+            }
+            "scheduler_register" => Some((
+                Builtin::SchedulerRegister,
+                vec![native_parameter(
+                    "scheduler",
+                    Type::Object("SchedulerInterface".to_owned()),
+                    None,
+                    span,
+                )],
+                Type::Void,
+            )),
+            "scheduler_is_registered" => Some((Builtin::SchedulerIsRegistered, vec![], Type::Bool)),
+            "suspend" => Some((Builtin::Suspend, vec![], Type::Void)),
+            "delay" => Some((
+                Builtin::Delay,
+                vec![native_parameter("milliseconds", Type::Int, None, span)],
+                Type::Void,
+            )),
+            "timeout" => Some((
+                Builtin::Timeout,
+                vec![native_parameter("milliseconds", Type::Int, None, span)],
+                Type::Object("Timeout".to_owned()),
+            )),
+            _ => None,
+        };
+        if let Some((builtin, parameters, ty)) = async_function {
+            let arguments = self.bind_arguments(name, arguments, &parameters, span);
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    arguments,
+                },
+                ty,
+                span,
+            });
+        }
+        if matches!(name, "preg_match" | "preg_replace" | "preg_split") {
+            let mut parameters = vec![
+                native_parameter("pattern", Type::String, None, span),
+                native_parameter(
+                    if name == "preg_replace" {
+                        "replacement"
+                    } else {
+                        "subject"
+                    },
+                    Type::String,
+                    None,
+                    span,
+                ),
+            ];
+            if name == "preg_replace" {
+                parameters.push(native_parameter("subject", Type::String, None, span));
+                parameters.push(native_parameter(
+                    "limit",
+                    Type::Int,
+                    Some(ExprKind::Integer(-1)),
+                    span,
+                ));
+            } else if name == "preg_split" {
+                parameters.push(native_parameter(
+                    "limit",
+                    Type::Int,
+                    Some(ExprKind::Integer(-1)),
+                    span,
+                ));
+                parameters.push(native_parameter(
+                    "flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    span,
+                ));
+            } else {
+                parameters.push(native_parameter(
+                    "flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    span,
+                ));
+            }
+            let bound = self.bind_arguments(name, arguments, &parameters, span);
+            let flags = if name == "preg_replace" {
+                0
+            } else {
+                let index = if name == "preg_match" { 2 } else { 3 };
+                let value = bound
+                    .explicit
+                    .iter()
+                    .chain(&bound.defaults)
+                    .find(|argument| argument.target == ArgumentTarget::Parameter(index));
+                match value.map(|argument| &argument.value.kind) {
+                    Some(TypedExprKind::Integer(value)) if *value >= 0 => *value,
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T0319",
+                            span,
+                            "regex flags must be a non-negative integer constant",
+                        ));
+                        0
+                    }
+                }
+            };
+            let allowed = if name == "preg_match" {
+                256 | 512
+            } else {
+                1 | 2 | 4
+            };
+            if name != "preg_replace" && flags & !allowed != 0 {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0319",
+                    span,
+                    format!("unsupported regex flags {flags}"),
+                ));
+            }
+            let result = match name {
+                "preg_match" => {
+                    let capture = if flags & 256 != 0 {
+                        Type::Object("RegexCapture".to_owned())
+                    } else if flags & 512 != 0 {
+                        normalize_union(vec![Type::String, Type::Null])
+                    } else {
+                        Type::String
+                    };
+                    normalize_union(vec![
+                        Type::Map(Box::new(Type::String), Box::new(capture)),
+                        Type::Null,
+                    ])
+                }
+                "preg_split" => Type::Vector(Box::new(if flags & 4 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else {
+                    Type::String
+                })),
+                _ => Type::String,
+            };
+            let builtin = match name {
+                "preg_match" => Builtin::PregMatch,
+                "preg_split" => Builtin::PregSplit,
+                _ => Builtin::PregReplace,
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    arguments: bound,
+                },
+                ty: result,
+                span,
+            });
+        }
+        if matches!(name, "serialize" | "unserialize") {
+            let parameter_type = if name == "serialize" {
+                Type::Mixed
+            } else {
+                Type::String
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(if name == "serialize" {
+                        Builtin::Serialize
+                    } else {
+                        Builtin::Unserialize
+                    }),
+                    arguments: self.bind_arguments(
+                        name,
+                        arguments,
+                        &[native_parameter("value", parameter_type, None, span)],
+                        span,
+                    ),
+                },
+                ty: if name == "serialize" {
+                    Type::String
+                } else {
+                    Type::Mixed
+                },
+                span,
+            });
+        }
+        if matches!(
+            name,
+            "vector_map"
+                | "vector_filter"
+                | "vector_slice"
+                | "vector_concat"
+                | "map_transform"
+                | "map_filter"
+                | "map_merge"
+                | "iterator_apply"
+        ) {
+            return self.lower_collection_call(name, arguments, span, expected);
+        }
+        let guard = match name {
+            "is_string" => Some(Builtin::IsString),
+            "is_int" => Some(Builtin::IsInt),
+            "is_float" => Some(Builtin::IsFloat),
+            "is_null" => Some(Builtin::IsNull),
+            "is_numeric" => Some(Builtin::IsNumeric),
+            "is_vector" => Some(Builtin::IsVector),
+            "is_map" => Some(Builtin::IsMap),
+            _ => None,
+        };
+        if let Some(callee) = guard {
+            let parameters = vec![native_parameter("value", Type::Mixed, None, span)];
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(callee),
+                    arguments: self.bind_arguments(name, arguments, &parameters, span),
+                },
+                ty: Type::Bool,
+                span,
+            });
+        }
         if name == "var_dump" {
             let mut explicit = Vec::new();
             for (index, argument) in arguments.iter().enumerate() {
@@ -3118,7 +5517,8 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 if !matches!(
                     argument.value.ty,
                     Type::String | Type::Vector(_) | Type::Map(_, _)
-                ) {
+                ) && !type_is_subtype_of(&argument.value.ty, "Countable", self.classes)
+                {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0302",
@@ -3139,6 +5539,55 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 span,
             });
         }
+        if matches!(
+            name,
+            "iterator_count" | "iterator_to_vector" | "iterator_to_map"
+        ) {
+            let parameters = vec![native_parameter("iterator", Type::Mixed, None, span)];
+            let mut arguments = self.bind_arguments(name, arguments, &parameters, span);
+            let first = arguments.explicit.first_mut();
+            let iterator = first
+                .as_ref()
+                .and_then(|argument| iterator_types(&argument.value.ty, self.classes));
+            let Some((key, value)) = iterator else {
+                if let Some(argument) = first {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T0302",
+                        argument.value.span,
+                        format!(
+                            "`{name}` requires `Iterator<K, V>`, found `{}`",
+                            argument.value.ty
+                        ),
+                    ));
+                }
+                return None;
+            };
+            let parameter_type = Type::Nominal {
+                name: "Iterator".to_owned(),
+                arguments: vec![key.clone(), value.clone()],
+            };
+            let first = first.expect("iterator type came from argument");
+            first.value =
+                coerce_collection_iterator(first.value.clone(), &parameter_type, self.classes);
+            self.expect_type(&parameter_type, &first.value.ty, first.value.span);
+            let (builtin, ty) = match name {
+                "iterator_count" => (Builtin::IteratorCount, Type::Int),
+                "iterator_to_vector" => (Builtin::IteratorToVector, Type::Vector(Box::new(value))),
+                _ => (
+                    Builtin::IteratorToMap,
+                    Type::Map(Box::new(key), Box::new(value)),
+                ),
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::Call {
+                    callee: Callee::Builtin(builtin),
+                    arguments,
+                },
+                ty,
+                span,
+            });
+        }
         let Some(signature) = self.signatures.get(name).cloned() else {
             self.diagnostics.push(Diagnostic::error(
                 "name_resolution",
@@ -3151,10 +5600,106 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         let arguments = self.bind_arguments(name, arguments, &signature.parameters, span);
         Some(TypedExpr {
             kind: TypedExprKind::Call {
-                callee: Callee::Function(signature.id),
+                callee: signature
+                    .native_index
+                    .map_or(Callee::Function(signature.id), |index| {
+                        Callee::Builtin(Builtin::Native(index))
+                    }),
                 arguments,
             },
             ty: signature.return_type.clone(),
+            span,
+        })
+    }
+
+    fn lower_async_call(&mut self, arguments: &[Argument], span: Span) -> Option<TypedExpr> {
+        let Some(function) = arguments.first() else {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0304",
+                span,
+                "missing callable for `async`",
+            ));
+            return None;
+        };
+        if let Some(name) = &function.name
+            && name != "function"
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0314",
+                function.name_span.unwrap_or(function.span),
+                format!("unknown named argument `{name}` for `async`"),
+            ));
+        }
+        let callback = self.lower_expression(&function.value, None)?;
+        let Type::Callable(parameters, result) = &callback.ty else {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0302",
+                callback.span,
+                "`async` requires a statically typed callable",
+            ));
+            return None;
+        };
+        let parameters = parameters.clone();
+        let result = result.as_ref().clone();
+        if arguments.len() - 1 != parameters.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "typing",
+                "T0303",
+                span,
+                format!(
+                    "`async` callable expects {} arguments, found {}",
+                    parameters.len(),
+                    arguments.len() - 1
+                ),
+            ));
+        }
+        let mut explicit = vec![BoundArgument {
+            target: ArgumentTarget::Parameter(0),
+            value: callback,
+        }];
+        for (index, argument) in arguments.iter().enumerate().skip(1) {
+            if argument.name.is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0318",
+                    argument.name_span.unwrap_or(argument.span),
+                    "named arguments cannot target `async` callable arguments",
+                ));
+            } else if function.name.is_some() {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0313",
+                    argument.span,
+                    "positional arguments cannot follow named arguments",
+                ));
+            }
+            let value = self.lower_expression(&argument.value, parameters.get(index - 1))?;
+            if let Some(expected) = parameters.get(index - 1) {
+                self.expect_type(expected, &value.ty, value.span);
+            }
+            explicit.push(BoundArgument {
+                target: ArgumentTarget::Parameter(index),
+                value,
+            });
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::Call {
+                callee: Callee::Builtin(Builtin::Async),
+                arguments: BoundArguments {
+                    explicit,
+                    defaults: Vec::new(),
+                    parameter_count: arguments.len(),
+                    variadic_parameter: None,
+                    variadic_type: None,
+                },
+            },
+            ty: Type::Nominal {
+                name: "Coroutine".to_owned(),
+                arguments: vec![result],
+            },
             span,
         })
     }
@@ -3192,10 +5737,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                     Some(ExprKind::String(uri)) if uri == b"thp:/input" => {
                         Type::Object("ReadableStream".to_owned())
                     }
-                    Some(ExprKind::String(uri)) if uri.starts_with(b"php://temp") => {
-                        Type::Object("TempStream".to_owned())
-                    }
-                    _ => Type::Object("MemoryStream".to_owned()),
+                    _ => Type::Object("Stream".to_owned()),
                 };
                 (
                     Builtin::StreamsOpen,
@@ -3210,6 +5752,30 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 Builtin::FilesOpenRead,
                 vec![native_parameter("path", Type::String, None, span)],
                 Type::Object("ReadableFileStream".to_owned()),
+            ),
+            ("Files", "openWrite" | "openReadWrite") => (
+                if name == "openWrite" {
+                    Builtin::FilesOpenWrite
+                } else {
+                    Builtin::FilesOpenReadWrite
+                },
+                vec![
+                    native_parameter("path", Type::String, None, span),
+                    native_parameter(
+                        "mode",
+                        Type::Int,
+                        Some(ExprKind::Integer(i64::from(name == "openWrite"))),
+                        span,
+                    ),
+                ],
+                Type::Object(
+                    if name == "openWrite" {
+                        "WritableFileStream"
+                    } else {
+                        "ReadWriteFileStream"
+                    }
+                    .to_owned(),
+                ),
             ),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
@@ -3405,13 +5971,201 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         }
     }
 
+    fn infer_construction_type(
+        &mut self,
+        class: &ClassSignature,
+        arguments: &[Argument],
+        span: Span,
+    ) -> Option<Type> {
+        let Some(constructor) = class.methods.get("__construct").cloned() else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "typing",
+                    "T1011",
+                    span,
+                    format!("cannot infer type arguments for `{}`", class.name),
+                )
+                .with_note("provide explicit generic arguments"),
+            );
+            return None;
+        };
+        let parameters = &constructor.signature.parameters;
+        let variadic = parameters.iter().position(|parameter| parameter.variadic);
+        let mut next = 0;
+        let mut occupied = vec![false; parameters.len()];
+        let mut inferred = BTreeMap::<TypeParameterId, Type>::new();
+        let mut regex_mode = Some(0);
+        let mut regex_flags = Some(0);
+        let class_parameters = class
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect::<BTreeSet<_>>();
+        let mut conflict = false;
+        for argument in arguments {
+            let target = if let Some(name) = &argument.name {
+                parameters
+                    .iter()
+                    .position(|parameter| parameter.name == *name && !parameter.variadic)
+                    .map(ArgumentTarget::Parameter)
+            } else {
+                while next < parameters.len() && occupied[next] && !parameters[next].variadic {
+                    next += 1;
+                }
+                if next < parameters.len() && !parameters[next].variadic {
+                    let target = ArgumentTarget::Parameter(next);
+                    next += 1;
+                    Some(target)
+                } else {
+                    variadic.map(|_| ArgumentTarget::Variadic)
+                }
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            let pattern = match target {
+                ArgumentTarget::Parameter(index) => {
+                    occupied[index] = true;
+                    &parameters[index].ty
+                }
+                ArgumentTarget::Variadic => {
+                    let Type::Vector(element) = &parameters[variadic.expect("variadic exists")].ty
+                    else {
+                        continue;
+                    };
+                    element
+                }
+            };
+            let Some(value) = self.lower_expression(&argument.value, None) else {
+                continue;
+            };
+            if matches!(
+                class.name.as_str(),
+                "RegexIterator" | "RecursiveRegexIterator"
+            ) {
+                if target == ArgumentTarget::Parameter(2) {
+                    regex_mode = match value.kind {
+                        TypedExprKind::Integer(mode) => Some(mode),
+                        _ => None,
+                    };
+                } else if target == ArgumentTarget::Parameter(4) {
+                    regex_flags = match value.kind {
+                        TypedExprKind::Integer(flags) => Some(flags),
+                        _ => None,
+                    };
+                }
+            }
+            let actual = if matches!(
+                class.name.as_str(),
+                "RecursiveIteratorIterator"
+                    | "RecursiveCallbackFilterIterator"
+                    | "RecursiveRegexIterator"
+            ) && target == ArgumentTarget::Parameter(0)
+            {
+                instantiated_ancestor(&value.ty, "RecursiveIterator", self.classes)
+                    .unwrap_or(value.ty)
+            } else if class.name == "InfiniteIterator" && target == ArgumentTarget::Parameter(0) {
+                instantiated_ancestor(&value.ty, "IteratorAggregate", self.classes)
+                    .unwrap_or(value.ty)
+            } else if matches!(
+                class.name.as_str(),
+                "IteratorIterator"
+                    | "LimitIterator"
+                    | "InfiniteIterator"
+                    | "CachingIterator"
+                    | "FilterIterator"
+                    | "CallbackFilterIterator"
+                    | "RegexIterator"
+            ) && target == ArgumentTarget::Parameter(0)
+            {
+                iterator_types(&value.ty, self.classes)
+                    .map(|(key, value)| Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: vec![key, value],
+                    })
+                    .unwrap_or(value.ty)
+            } else {
+                value.ty
+            };
+            if !unify_inference(pattern, &actual, &class_parameters, &mut inferred) {
+                conflict = true;
+            }
+        }
+        if matches!(
+            class.name.as_str(),
+            "RegexIterator" | "RecursiveRegexIterator"
+        ) {
+            let mode = regex_mode.and_then(|mode| {
+                regex_flags.and_then(|flags| {
+                    regex_output_type(mode, flags, inferred.get(&class.type_parameters[1].id)?)
+                })
+            });
+            if let Some(output) = mode {
+                inferred.insert(class.type_parameters[2].id, output);
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T1020",
+                    span,
+                    "regex iterator mode and flags must be supported integer constants",
+                ));
+            }
+        }
+        let missing = class
+            .type_parameters
+            .iter()
+            .filter(|parameter| !inferred.contains_key(&parameter.id))
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>();
+        if conflict || !missing.is_empty() {
+            let reason = if conflict {
+                "constructor arguments infer conflicting generic types".to_owned()
+            } else {
+                format!(
+                    "constructor arguments do not determine {}",
+                    missing.join(", ")
+                )
+            };
+            self.diagnostics.push(
+                Diagnostic::error("typing", "T1011", span, reason)
+                    .with_note("provide explicit generic arguments"),
+            );
+            return None;
+        }
+        let arguments = class
+            .type_parameters
+            .iter()
+            .map(|parameter| inferred[&parameter.id].clone())
+            .collect::<Vec<_>>();
+        for (parameter, argument) in class.type_parameters.iter().zip(&arguments) {
+            if let Some(bound) = &parameter.bound {
+                let bound = substitute_type(bound, &inferred);
+                if !type_accepts(&bound, argument, self.classes) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1006",
+                        span,
+                        format!(
+                            "inferred type `{argument}` does not satisfy bound `{bound}` for `{}`",
+                            parameter.name
+                        ),
+                    ));
+                }
+            }
+        }
+        Some(Type::Nominal {
+            name: class.name.clone(),
+            arguments,
+        })
+    }
+
     fn lookup_property(
         &mut self,
         object_type: &Type,
         name: &str,
         span: Span,
     ) -> Option<(PropertyId, Type)> {
-        let Type::Object(class_name) = object_type else {
+        let Some(lookup_type) = nominal_lookup_type(object_type, self.classes) else {
             self.diagnostics.push(Diagnostic::error(
                 "typing",
                 "T0407",
@@ -3420,6 +6174,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             ));
             return None;
         };
+        let (class_name, _) = nominal_parts(&lookup_type).expect("lookup type is nominal");
         let Some(class) = self.classes.get(class_name) else {
             self.diagnostics.push(Diagnostic::error(
                 "typing",
@@ -3432,6 +6187,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         let Some(property) = class
             .properties
             .iter()
+            .rev()
             .find(|property| property.name == name)
         else {
             self.diagnostics.push(Diagnostic::error(
@@ -3450,7 +6206,15 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
             "property",
             name,
         );
-        Some((property.id, property.ty.clone()))
+        Some((
+            property.id,
+            instantiate_member_type(
+                &lookup_type,
+                property.declaring_class,
+                &property.ty,
+                self.classes,
+            ),
+        ))
     }
 
     fn owner_class(&self) -> Option<&ClassSignature> {
@@ -3537,7 +6301,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
                 }
             }
             BinaryOp::Equal | BinaryOp::StrictEqual | BinaryOp::NotEqual => {
-                if left.ty != right.ty {
+                if !types_overlap(&left.ty, &right.ty, self.classes) {
                     self.diagnostics.push(Diagnostic::error(
                         "typing",
                         "T0503",
@@ -3597,7 +6361,7 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
     }
 
     fn finish(self, body: Vec<Statement>) -> Function {
-        if self.return_type != Type::Void && !block_guarantees_exit(&body) {
+        if !self.generator && self.return_type != Type::Void && !block_guarantees_exit(&body) {
             self.diagnostics.push(Diagnostic::error(
                 "typing",
                 "T0009",
@@ -3611,15 +6375,46 @@ impl<'signatures, 'diagnostics> FunctionChecker<'signatures, 'diagnostics> {
         Function {
             id: self.id,
             name: self.name,
+            module_name: self.module_name,
             parameters: self.parameters,
+            parameter_metadata: self.parameter_metadata,
             locals: self.locals,
             return_type: self.return_type,
+            generator: self.generator,
             owner: self.owner,
             static_method: self.static_method,
             body,
             span: self.span,
         }
     }
+}
+
+fn block_has_yield(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match &statement.kind {
+        StmtKind::Yield { .. } => true,
+        StmtKind::If {
+            branches,
+            otherwise,
+        } => {
+            branches.iter().any(|(_, body)| block_has_yield(body))
+                || otherwise.as_ref().is_some_and(|body| block_has_yield(body))
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. }
+        | StmtKind::Using { body, .. }
+        | StmtKind::Block(body) => block_has_yield(body),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            block_has_yield(body)
+                || catches.iter().any(|clause| block_has_yield(&clause.body))
+                || finally.as_ref().is_some_and(|body| block_has_yield(body))
+        }
+        _ => false,
+    })
 }
 
 fn block_guarantees_exit(statements: &[Statement]) -> bool {
@@ -3652,6 +6447,7 @@ fn block_guarantees_exit(statements: &[Statement]) -> bool {
                             .all(|catch| block_guarantees_exit(&catch.body)))
             }
             StatementKind::Assign { .. }
+            | StatementKind::Yield { .. }
             | StatementKind::Echo(_)
             | StatementKind::While { .. }
             | StatementKind::For { .. }
@@ -3667,6 +6463,7 @@ fn block_guarantees_exit(statements: &[Statement]) -> bool {
 fn resolve_parameters(
     declaration: &FunctionDecl,
     classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<ParameterSignature> {
     let mut optional_seen = false;
@@ -3676,8 +6473,8 @@ fn resolve_parameters(
         .iter()
         .enumerate()
         .map(|(index, parameter)| {
-            let element_type =
-                resolve_type(&parameter.ty, classes, diagnostics).unwrap_or(Type::Mixed);
+            let element_type = resolve_type(&parameter.ty, classes, type_parameters, diagnostics)
+                .unwrap_or(Type::Mixed);
             if parameter.variadic {
                 if variadic_seen {
                     diagnostics.push(Diagnostic::error(
@@ -3712,6 +6509,18 @@ fn resolve_parameters(
                     "T0309",
                     parameter.span,
                     "a required parameter cannot follow a parameter with a default",
+                ));
+            }
+            if let Some(default) = &parameter.default
+                && exceeds_constant_nesting_limit(default, 0)
+            {
+                diagnostics.push(Diagnostic::error(
+                    "typing",
+                    "T0311",
+                    default.span,
+                    format!(
+                        "typed constant defaults may nest at most {MAX_CONSTANT_NESTING} collection levels"
+                    ),
                 ));
             }
             ParameterSignature {
@@ -3760,11 +6569,159 @@ fn is_default_constant(expression: &Expr) -> bool {
     }
 }
 
+fn exceeds_constant_nesting_limit(expression: &Expr, depth: usize) -> bool {
+    match &expression.kind {
+        ExprKind::Vector(values) => {
+            depth >= MAX_CONSTANT_NESTING
+                || values
+                    .iter()
+                    .any(|value| exceeds_constant_nesting_limit(value, depth + 1))
+        }
+        ExprKind::Map(entries) => {
+            depth >= MAX_CONSTANT_NESTING
+                || entries.iter().any(|entry| {
+                    exceeds_constant_nesting_limit(&entry.key, depth + 1)
+                        || exceeds_constant_nesting_limit(&entry.value, depth + 1)
+                })
+        }
+        ExprKind::Unary { operand, .. } => exceeds_constant_nesting_limit(operand, depth),
+        _ => false,
+    }
+}
+
+fn constant_value(expression: &Expr) -> Option<ConstantValue> {
+    match &expression.kind {
+        ExprKind::Integer(value) => Some(ConstantValue::Int(*value)),
+        ExprKind::Float(value) => Some(ConstantValue::Float(*value)),
+        ExprKind::Bool(value) => Some(ConstantValue::Bool(*value)),
+        ExprKind::Null => Some(ConstantValue::Null),
+        ExprKind::String(value) => Some(ConstantValue::String(value.clone())),
+        ExprKind::Vector(values) => Some(ConstantValue::Vector(
+            values.iter().map(constant_value).collect::<Option<_>>()?,
+        )),
+        ExprKind::Map(entries) => Some(ConstantValue::Map(
+            entries
+                .iter()
+                .map(|entry| Some((constant_value(&entry.key)?, constant_value(&entry.value)?)))
+                .collect::<Option<_>>()?,
+        )),
+        ExprKind::Unary { op, operand } => match (op, constant_value(operand)?) {
+            (UnaryOp::Negate, ConstantValue::Int(value)) => {
+                Some(ConstantValue::Int(value.checked_neg()?))
+            }
+            (UnaryOp::Negate, ConstantValue::Float(value)) => Some(ConstantValue::Float(-value)),
+            (UnaryOp::Not, ConstantValue::Bool(value)) => Some(ConstantValue::Bool(!value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn clause_assigns_local(clause: &ForClause, name: &str) -> bool {
+    matches!(&clause.kind, ForClauseKind::Assign { name: assigned, .. } if assigned == name)
+}
+
+fn block_assigns_local(body: &[Stmt], name: &str) -> bool {
+    body.iter().any(|statement| match &statement.kind {
+        StmtKind::Assign { name: assigned, .. } => assigned == name,
+        StmtKind::Block(body) | StmtKind::While { body, .. } => block_assigns_local(body, name),
+        StmtKind::If {
+            branches,
+            otherwise,
+        } => {
+            branches
+                .iter()
+                .any(|(_, body)| block_assigns_local(body, name))
+                || otherwise
+                    .as_ref()
+                    .is_some_and(|body| block_assigns_local(body, name))
+        }
+        StmtKind::For {
+            initializers,
+            conditions,
+            updates,
+            body,
+        } => {
+            initializers
+                .iter()
+                .chain(conditions)
+                .chain(updates)
+                .any(|clause| clause_assigns_local(clause, name))
+                || block_assigns_local(body, name)
+        }
+        StmtKind::Foreach {
+            key, value, body, ..
+        } => {
+            key.as_ref().is_some_and(|key| key.name == name)
+                || value.name == name
+                || block_assigns_local(body, name)
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            block_assigns_local(body, name)
+                || catches.iter().any(|clause| {
+                    clause.variable != name && block_assigns_local(&clause.body, name)
+                })
+                || finally
+                    .as_ref()
+                    .is_some_and(|body| block_assigns_local(body, name))
+        }
+        StmtKind::Using { variable, body, .. } => {
+            variable != name && block_assigns_local(body, name)
+        }
+        _ => false,
+    })
+}
+
 fn types_overlap(left: &Type, right: &Type, classes: &BTreeMap<String, ClassSignature>) -> bool {
     left == &Type::Mixed
         || right == &Type::Mixed
         || type_accepts(left, right, classes)
         || type_accepts(right, left, classes)
+}
+
+fn intersect_narrow(
+    current: &Type,
+    guard: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Option<Type> {
+    if current == &Type::Mixed {
+        return Some(guard.clone());
+    }
+    if let Type::Union(members) = current {
+        let narrowed = members
+            .iter()
+            .filter_map(|member| intersect_narrow(member, guard, classes))
+            .collect::<Vec<_>>();
+        return match narrowed.as_slice() {
+            [] => None,
+            [member] => Some(member.clone()),
+            _ => Some(Type::Union(narrowed)),
+        };
+    }
+    if let Type::Union(members) = guard {
+        return members
+            .iter()
+            .find_map(|member| intersect_narrow(current, member, classes));
+    }
+    if matches!((current, guard),
+        (Type::Vector(_), Type::Vector(element)) if element.as_ref() == &Type::Mixed
+    ) || matches!((current, guard),
+        (Type::Map(_, _), Type::Map(key, value))
+            if key.as_ref() == &Type::Mixed && value.as_ref() == &Type::Mixed
+    ) {
+        return Some(current.clone());
+    }
+    if type_accepts(guard, current, classes) {
+        Some(current.clone())
+    } else if type_accepts(current, guard, classes) {
+        Some(guard.clone())
+    } else {
+        None
+    }
 }
 
 fn type_accepts(
@@ -3775,6 +6732,16 @@ fn type_accepts(
     expected == &Type::Mixed
         || actual == &Type::Never
         || expected == actual
+        || matches!((expected, actual), (Type::Vector(element), Type::Vector(_)) if element.as_ref() == &Type::Mixed)
+        || matches!((expected, actual), (Type::Map(expected_key, expected_value), Type::Map(actual_key, _))
+            if expected_value.as_ref() == &Type::Mixed
+                && type_accepts(expected_key, actual_key, classes))
+        || matches!(actual, Type::Parameter { id, .. } if classes
+            .values()
+            .flat_map(|class| &class.type_parameters)
+            .find(|parameter| parameter.id == *id)
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| type_accepts(expected, bound, classes)))
         || matches!(
             actual,
             Type::Union(members)
@@ -3789,11 +6756,256 @@ fn type_accepts(
                     .iter()
                     .any(|member| type_accepts(member, actual, classes))
         )
-        || matches!(
-            (expected, actual),
-            (Type::Object(expected), Type::Object(actual))
-                if is_nominal_subtype(classes, actual, expected)
-        )
+        || nominal_type_accepts(expected, actual, classes)
+}
+
+fn nominal_type_accepts(
+    expected: &Type,
+    actual: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> bool {
+    let Some((expected_name, expected_arguments)) = nominal_parts(expected) else {
+        return false;
+    };
+    let Some((actual_name, _)) = nominal_parts(actual) else {
+        return false;
+    };
+    if expected_name == actual_name {
+        return expected == actual;
+    }
+    instantiated_ancestor(actual, expected_name, classes).is_some_and(|ancestor| {
+        nominal_parts(&ancestor).is_some_and(|(_, arguments)| arguments == expected_arguments)
+    })
+}
+
+fn nominal_parts(ty: &Type) -> Option<(&str, &[Type])> {
+    match ty {
+        Type::Object(name) => Some((name, &[])),
+        Type::Nominal { name, arguments } => Some((name, arguments)),
+        _ => None,
+    }
+}
+
+fn iterator_types(ty: &Type, classes: &BTreeMap<String, ClassSignature>) -> Option<(Type, Type)> {
+    let args = match ty {
+        Type::Vector(value) => return Some((Type::Int, value.as_ref().clone())),
+        Type::Map(key, value) => return Some((key.as_ref().clone(), value.as_ref().clone())),
+        _ => instantiated_ancestor(ty, "Iterator", classes)?,
+    };
+    let Type::Nominal { arguments, .. } = args else {
+        return None;
+    };
+    Some((arguments.first()?.clone(), arguments.get(1)?.clone()))
+}
+
+fn coerce_collection_iterator(
+    value: TypedExpr,
+    expected: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> TypedExpr {
+    let collection = match &value.ty {
+        Type::Vector(element) => Some((
+            "VectorIterator",
+            vec![element.as_ref().clone()],
+            vec![Type::Int, element.as_ref().clone()],
+        )),
+        Type::Map(key, element) => Some((
+            "MapIterator",
+            vec![key.as_ref().clone(), element.as_ref().clone()],
+            vec![key.as_ref().clone(), element.as_ref().clone()],
+        )),
+        _ => None,
+    };
+    let Some((name, arguments, iterator_args)) = collection else {
+        return value;
+    };
+    let iterator = Type::Nominal {
+        name: name.to_owned(),
+        arguments,
+    };
+    let target = Type::Nominal {
+        name: "Iterator".to_owned(),
+        arguments: iterator_args.clone(),
+    };
+    let traversable = Type::Nominal {
+        name: "Traversable".to_owned(),
+        arguments: iterator_args,
+    };
+    let branches = match expected {
+        Type::Union(members) => members.as_slice(),
+        _ => std::slice::from_ref(expected),
+    };
+    if branches
+        .iter()
+        .filter(|branch| {
+            type_accepts(branch, &target, classes) || type_accepts(branch, &traversable, classes)
+        })
+        .count()
+        != 1
+        || type_accepts(expected, &value.ty, classes)
+    {
+        return value;
+    }
+    let span = value.span;
+    TypedExpr {
+        kind: TypedExprKind::Call {
+            callee: Callee::Builtin(Builtin::IteratorFromCollection),
+            arguments: BoundArguments {
+                explicit: vec![BoundArgument {
+                    target: ArgumentTarget::Parameter(0),
+                    value,
+                }],
+                defaults: vec![],
+                parameter_count: 1,
+                variadic_parameter: None,
+                variadic_type: None,
+            },
+        },
+        ty: iterator,
+        span,
+    }
+}
+
+fn iterator_target_args(ty: &Type) -> Option<(&Type, &Type)> {
+    match ty {
+        Type::Nominal { name, arguments }
+            if matches!(name.as_str(), "Iterator" | "Traversable" | "Generator") =>
+        {
+            Some((arguments.first()?, arguments.get(1)?))
+        }
+        Type::Union(members) => {
+            let mut targets = members.iter().filter_map(iterator_target_args);
+            let target = targets.next()?;
+            targets.next().is_none().then_some(target)
+        }
+        _ => None,
+    }
+}
+
+fn generator_target_args(ty: &Type) -> Option<(&Type, &Type)> {
+    match ty {
+        Type::Nominal { name, .. } if matches!(name.as_str(), "Iterator" | "Generator") => {
+            iterator_target_args(ty)
+        }
+        _ => None,
+    }
+}
+
+fn nominal_lookup_type(ty: &Type, classes: &BTreeMap<String, ClassSignature>) -> Option<Type> {
+    match ty {
+        Type::Object(_) | Type::Nominal { .. } => Some(ty.clone()),
+        Type::Union(members) => {
+            let mut non_null = members.iter().filter(|member| **member != Type::Null);
+            let only = non_null.next()?;
+            non_null
+                .next()
+                .is_none()
+                .then(|| only.clone())
+                .and_then(|only| nominal_lookup_type(&only, classes))
+        }
+        Type::Parameter { id, .. } => classes
+            .values()
+            .flat_map(|class| &class.type_parameters)
+            .find(|parameter| parameter.id == *id)
+            .and_then(|parameter| parameter.bound.clone()),
+        _ => None,
+    }
+}
+
+fn instantiated_ancestor(
+    actual: &Type,
+    expected_name: &str,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Option<Type> {
+    fn visit(
+        actual: &Type,
+        expected_name: &str,
+        classes: &BTreeMap<String, ClassSignature>,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        let (actual_name, actual_arguments) = nominal_parts(actual)?;
+        if actual_name == expected_name {
+            return Some(actual.clone());
+        }
+        let class = classes.get(actual_name)?;
+        if !visiting.insert(actual_name.to_owned()) {
+            return None;
+        }
+        let substitutions = class
+            .type_parameters
+            .iter()
+            .zip(actual_arguments)
+            .map(|(parameter, argument)| (parameter.id, argument.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let ancestor = class
+            .parent_type
+            .iter()
+            .chain(&class.interface_types)
+            .map(|edge| substitute_type(edge, &substitutions))
+            .find_map(|edge| visit(&edge, expected_name, classes, visiting));
+        visiting.remove(actual_name);
+        ancestor
+    }
+
+    visit(actual, expected_name, classes, &mut BTreeSet::new())
+}
+
+fn instantiated_interface_closure(
+    class: &ClassSignature,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Vec<Type> {
+    fn visit(
+        ty: &Type,
+        classes: &BTreeMap<String, ClassSignature>,
+        output: &mut Vec<Type>,
+        depth: usize,
+    ) {
+        if depth > classes.len() {
+            return;
+        }
+        let Some((name, arguments)) = nominal_parts(ty) else {
+            return;
+        };
+        let Some(class) = classes.get(name) else {
+            return;
+        };
+        let substitutions = class
+            .type_parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.id, argument.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if class.kind == NominalKind::Interface {
+            output.push(ty.clone());
+        }
+        if let Some(parent) = &class.parent_type {
+            let parent = substitute_type(parent, &substitutions);
+            visit(&parent, classes, output, depth + 1);
+        }
+        for interface in &class.interface_types {
+            let interface = substitute_type(interface, &substitutions);
+            visit(&interface, classes, output, depth + 1);
+        }
+    }
+
+    let mut output = Vec::new();
+    let declaration = declaration_type(class);
+    let (_, arguments) = nominal_parts(&declaration).expect("declaration type is nominal");
+    let substitutions = class
+        .type_parameters
+        .iter()
+        .zip(arguments)
+        .map(|(parameter, argument)| (parameter.id, argument.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(parent) = &class.parent_type {
+        let parent = substitute_type(parent, &substitutions);
+        visit(&parent, classes, &mut output, 0);
+    }
+    for interface in &class.interface_types {
+        let interface = substitute_type(interface, &substitutions);
+        visit(&interface, classes, &mut output, 0);
+    }
+    output
 }
 
 fn type_is_subtype_of(
@@ -3803,6 +7015,13 @@ fn type_is_subtype_of(
 ) -> bool {
     match actual {
         Type::Object(actual) => is_nominal_subtype(classes, actual, expected),
+        Type::Nominal { name, .. } => is_nominal_subtype(classes, name, expected),
+        Type::Parameter { id, .. } => classes
+            .values()
+            .flat_map(|class| &class.type_parameters)
+            .find(|parameter| parameter.id == *id)
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| type_is_subtype_of(bound, expected, classes)),
         Type::Union(members) => members
             .iter()
             .all(|member| type_is_subtype_of(member, expected, classes)),
@@ -3815,23 +7034,7 @@ fn is_nominal_subtype(
     actual: &str,
     expected: &str,
 ) -> bool {
-    if actual == expected {
-        return true;
-    }
-    let Some(actual) = classes.get(actual) else {
-        return false;
-    };
-    if actual
-        .interfaces
-        .iter()
-        .any(|interface| interface == expected)
-    {
-        return true;
-    }
-    actual
-        .parent
-        .as_deref()
-        .is_some_and(|parent| is_nominal_subtype(classes, parent, expected))
+    instantiated_ancestor(&Type::Object(actual.to_owned()), expected, classes).is_some()
 }
 
 fn is_class_id_subtype(
@@ -3870,24 +7073,156 @@ fn loop_clause_type(clause: &LoopClause) -> &Type {
     }
 }
 
+fn collect_expr_variables(expression: &Expr, names: &mut BTreeSet<String>) {
+    match &expression.kind {
+        ExprKind::Variable(name) => {
+            names.insert(name.clone());
+        }
+        ExprKind::Vector(values) => {
+            for value in values {
+                collect_expr_variables(value, names);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for entry in entries {
+                collect_expr_variables(&entry.key, names);
+                collect_expr_variables(&entry.value, names);
+            }
+        }
+        ExprKind::Unary { operand, .. } => collect_expr_variables(operand, names),
+        ExprKind::Binary { left, right, .. } => {
+            collect_expr_variables(left, names);
+            collect_expr_variables(right, names);
+        }
+        ExprKind::Call { callee, arguments } => {
+            collect_expr_variables(callee, names);
+            for argument in arguments {
+                collect_expr_variables(&argument.value, names);
+            }
+        }
+        ExprKind::Index { collection, index } => {
+            collect_expr_variables(collection, names);
+            collect_expr_variables(index, names);
+        }
+        ExprKind::New {
+            target, arguments, ..
+        } => {
+            if let NewTarget::Dynamic(value) = target {
+                collect_expr_variables(value, names);
+            }
+            for argument in arguments {
+                collect_expr_variables(&argument.value, names);
+            }
+        }
+        ExprKind::Property { object, .. } | ExprKind::MethodCall { object, .. } => {
+            collect_expr_variables(object, names);
+            if let ExprKind::MethodCall { arguments, .. } = &expression.kind {
+                for argument in arguments {
+                    collect_expr_variables(&argument.value, names);
+                }
+            }
+        }
+        ExprKind::StaticCall { arguments, .. } => {
+            for argument in arguments {
+                collect_expr_variables(&argument.value, names);
+            }
+        }
+        ExprKind::InstanceOf { value, .. } => collect_expr_variables(value, names),
+        ExprKind::Match { subject, arms } => {
+            collect_expr_variables(subject, names);
+            for arm in arms {
+                for condition in &arm.conditions {
+                    collect_expr_variables(condition, names);
+                }
+                collect_expr_variables(&arm.value, names);
+            }
+        }
+        ExprKind::Closure {
+            parameters,
+            captures,
+            implicit_captures,
+            body,
+            ..
+        } => {
+            names.extend(captures.iter().cloned());
+            if *implicit_captures {
+                let mut inner = BTreeSet::new();
+                for statement in body {
+                    if let StmtKind::Return(Some(value)) = &statement.kind {
+                        collect_expr_variables(value, &mut inner);
+                    }
+                }
+                names.extend(
+                    inner
+                        .into_iter()
+                        .filter(|name| !parameters.iter().any(|parameter| parameter.name == *name)),
+                );
+            }
+        }
+        ExprKind::Integer(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Null
+        | ExprKind::String(_)
+        | ExprKind::Name(_)
+        | ExprKind::ClassConstant { .. } => {}
+    }
+}
+
 fn resolve_type(
     syntax: &TypeSyntax,
     classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
     diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Type> {
+    resolve_type_with_bound_check(syntax, classes, type_parameters, diagnostics, true)
+}
+
+fn resolve_type_with_bound_check(
+    syntax: &TypeSyntax,
+    classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
+    diagnostics: &mut Vec<Diagnostic>,
+    check_bounds: bool,
 ) -> Option<Type> {
     match &syntax.kind {
         TypeSyntaxKind::Nullable(inner) => {
-            let inner = resolve_type(inner, classes, diagnostics)?;
+            let inner = resolve_type_with_bound_check(
+                inner,
+                classes,
+                type_parameters,
+                diagnostics,
+                check_bounds,
+            )?;
             Some(normalize_union(vec![inner, Type::Null]))
         }
         TypeSyntaxKind::Union(members) => Some(normalize_union(
             members
                 .iter()
-                .filter_map(|member| resolve_type(member, classes, diagnostics))
+                .filter_map(|member| {
+                    resolve_type_with_bound_check(
+                        member,
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )
+                })
                 .collect(),
         )),
         TypeSyntaxKind::Named { name, arguments } => {
             let arity = arguments.len();
+            if let Some(parameter) = type_parameters.get(name) {
+                if arity != 0 {
+                    diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1001",
+                        syntax.span,
+                        format!("type parameter `{name}` does not accept arguments"),
+                    ));
+                }
+                return Some(parameter.clone());
+            }
             let primitive = match name.as_str() {
                 "int" => Some(Type::Int),
                 "float" => Some(Type::Float),
@@ -3911,15 +7246,56 @@ fn resolve_type(
                 return Some(primitive);
             }
             match name.as_str() {
-                "vector" if arity == 1 => Some(Type::Vector(Box::new(resolve_type(
-                    &arguments[0],
-                    classes,
-                    diagnostics,
-                )?))),
+                "vector" if arity == 1 => {
+                    Some(Type::Vector(Box::new(resolve_type_with_bound_check(
+                        &arguments[0],
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )?)))
+                }
                 "map" if arity == 2 => Some(Type::Map(
-                    Box::new(resolve_type(&arguments[0], classes, diagnostics)?),
-                    Box::new(resolve_type(&arguments[1], classes, diagnostics)?),
+                    Box::new(resolve_type_with_bound_check(
+                        &arguments[0],
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )?),
+                    Box::new(resolve_type_with_bound_check(
+                        &arguments[1],
+                        classes,
+                        type_parameters,
+                        diagnostics,
+                        check_bounds,
+                    )?),
                 )),
+                "callable" if arity >= 1 => {
+                    let mut types = arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            resolve_type_with_bound_check(
+                                argument,
+                                classes,
+                                type_parameters,
+                                diagnostics,
+                                check_bounds,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let result = types.pop()?;
+                    Some(Type::Callable(types, Box::new(result)))
+                }
+                "callable" => {
+                    diagnostics.push(Diagnostic::error(
+                        "typing",
+                        "T1002",
+                        syntax.span,
+                        "`callable` requires parameter types followed by a return type",
+                    ));
+                    None
+                }
                 "vector" | "map" => {
                     let expected = if name == "vector" { 1 } else { 2 };
                     diagnostics.push(Diagnostic::error(
@@ -3932,17 +7308,9 @@ fn resolve_type(
                     ));
                     None
                 }
-                _ if arity == 0
-                    && classes
-                        .get(name)
-                        .is_some_and(|class| class.kind != NominalKind::Trait) =>
-                {
-                    Some(Type::Object(name.clone()))
-                }
-                _ if arity == 0
-                    && classes
-                        .get(name)
-                        .is_some_and(|class| class.kind == NominalKind::Trait) =>
+                _ if classes
+                    .get(name)
+                    .is_some_and(|class| class.kind == NominalKind::Trait) =>
                 {
                     diagnostics.push(Diagnostic::error(
                         "typing",
@@ -3953,16 +7321,370 @@ fn resolve_type(
                     None
                 }
                 _ => {
-                    diagnostics.push(Diagnostic::error(
-                        "typing",
-                        "T1003",
-                        syntax.span,
-                        format!("unknown type `{name}`"),
-                    ));
-                    None
+                    let Some(class) = classes.get(name) else {
+                        diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1003",
+                            syntax.span,
+                            format!("unknown type `{name}`"),
+                        ));
+                        return None;
+                    };
+                    if arity != class.type_parameters.len() {
+                        diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1002",
+                            syntax.span,
+                            format!(
+                                "type `{name}` expects {} generic arguments, found {arity}",
+                                class.type_parameters.len()
+                            ),
+                        ));
+                        return None;
+                    }
+                    if arity == 0 {
+                        return Some(Type::Object(name.clone()));
+                    }
+                    let resolved = arguments
+                        .iter()
+                        .filter_map(|argument| {
+                            resolve_type_with_bound_check(
+                                argument,
+                                classes,
+                                type_parameters,
+                                diagnostics,
+                                check_bounds,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if resolved.len() != arguments.len() {
+                        return None;
+                    }
+                    for (index, argument) in resolved.iter().enumerate() {
+                        if type_contains_void(argument)
+                            && !(matches!(name.as_str(), "Awaitable" | "Completable" | "Coroutine")
+                                && *argument == Type::Void)
+                        {
+                            diagnostics.push(Diagnostic::error(
+                                "typing",
+                                "T1005",
+                                arguments[index].span,
+                                "generic type arguments cannot contain `void`",
+                            ));
+                        }
+                    }
+                    let substitutions = class
+                        .type_parameters
+                        .iter()
+                        .zip(&resolved)
+                        .map(|(parameter, argument)| (parameter.id, argument.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    if check_bounds {
+                        for (parameter, argument) in class.type_parameters.iter().zip(&resolved) {
+                            if let Some(bound) = &parameter.bound {
+                                let bound = substitute_type(bound, &substitutions);
+                                if !type_accepts(&bound, argument, classes) {
+                                    diagnostics.push(Diagnostic::error(
+                                        "typing",
+                                        "T1006",
+                                        syntax.span,
+                                        format!(
+                                            "type argument `{argument}` does not satisfy bound `{bound}` for `{}`",
+                                            parameter.name
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some(Type::Nominal {
+                        name: name.clone(),
+                        arguments: resolved,
+                    })
                 }
             }
         }
+    }
+}
+
+fn resolve_nominal_ref(
+    reference: &NominalRef,
+    classes: &BTreeMap<String, ClassSignature>,
+    type_parameters: &BTreeMap<String, Type>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Type> {
+    resolve_type(
+        &TypeSyntax {
+            kind: TypeSyntaxKind::Named {
+                name: reference.name.clone(),
+                arguments: reference.arguments.clone(),
+            },
+            span: reference.span,
+        },
+        classes,
+        type_parameters,
+        diagnostics,
+    )
+}
+
+fn validate_type_argument_bounds(
+    ty: &Type,
+    span: Span,
+    classes: &BTreeMap<String, ClassSignature>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match ty {
+        Type::Vector(element) => {
+            validate_type_argument_bounds(element, span, classes, diagnostics);
+        }
+        Type::Map(key, value) => {
+            validate_type_argument_bounds(key, span, classes, diagnostics);
+            validate_type_argument_bounds(value, span, classes, diagnostics);
+        }
+        Type::Callable(parameters, result) => {
+            for parameter in parameters {
+                validate_type_argument_bounds(parameter, span, classes, diagnostics);
+            }
+            validate_type_argument_bounds(result, span, classes, diagnostics);
+        }
+        Type::Union(members) => {
+            for member in members {
+                validate_type_argument_bounds(member, span, classes, diagnostics);
+            }
+        }
+        Type::Nominal { name, arguments } => {
+            for argument in arguments {
+                validate_type_argument_bounds(argument, span, classes, diagnostics);
+            }
+            let Some(class) = classes.get(name) else {
+                return;
+            };
+            let substitutions = class
+                .type_parameters
+                .iter()
+                .zip(arguments)
+                .map(|(parameter, argument)| (parameter.id, argument.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for (parameter, argument) in class.type_parameters.iter().zip(arguments) {
+                if let Some(bound) = &parameter.bound {
+                    let bound = substitute_type(bound, &substitutions);
+                    if !type_accepts(&bound, argument, classes) {
+                        diagnostics.push(Diagnostic::error(
+                            "typing",
+                            "T1006",
+                            span,
+                            format!(
+                                "type argument `{argument}` does not satisfy bound `{bound}` for `{}`",
+                                parameter.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Null
+        | Type::Void
+        | Type::Never
+        | Type::Mixed
+        | Type::Object(_)
+        | Type::Parameter { .. } => {}
+    }
+}
+
+fn type_parameter_environment(parameters: &[TypeParameter]) -> BTreeMap<String, Type> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            (
+                parameter.name.clone(),
+                Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn declaration_type(class: &ClassSignature) -> Type {
+    if class.type_parameters.is_empty() {
+        Type::Object(class.name.clone())
+    } else {
+        Type::Nominal {
+            name: class.name.clone(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|parameter| Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn type_contains_void(ty: &Type) -> bool {
+    match ty {
+        Type::Void => true,
+        Type::Vector(element) => type_contains_void(element),
+        Type::Map(key, value) => type_contains_void(key) || type_contains_void(value),
+        Type::Callable(parameters, _) => parameters.iter().any(type_contains_void),
+        Type::Union(members) => members.iter().any(type_contains_void),
+        Type::Nominal { arguments, .. } => arguments.iter().any(type_contains_void),
+        _ => false,
+    }
+}
+
+fn substitute_type(ty: &Type, substitutions: &BTreeMap<TypeParameterId, Type>) -> Type {
+    match ty {
+        Type::Parameter { id, .. } => substitutions.get(id).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Vector(element) => Type::Vector(Box::new(substitute_type(element, substitutions))),
+        Type::Map(key, value) => Type::Map(
+            Box::new(substitute_type(key, substitutions)),
+            Box::new(substitute_type(value, substitutions)),
+        ),
+        Type::Callable(parameters, result) => Type::Callable(
+            parameters
+                .iter()
+                .map(|parameter| substitute_type(parameter, substitutions))
+                .collect(),
+            Box::new(substitute_type(result, substitutions)),
+        ),
+        Type::Union(members) => normalize_union(
+            members
+                .iter()
+                .map(|member| substitute_type(member, substitutions))
+                .collect(),
+        ),
+        Type::Nominal { name, arguments } => Type::Nominal {
+            name: name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_type(argument, substitutions))
+                .collect(),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn substitutions_for_ancestor(
+    receiver: &Type,
+    declaring_class: ClassId,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> BTreeMap<TypeParameterId, Type> {
+    let mut substitutions = BTreeMap::new();
+    if let Some((receiver_name, receiver_arguments)) = nominal_parts(receiver)
+        && let Some(receiver_class) = classes.get(receiver_name)
+    {
+        substitutions.extend(
+            receiver_class
+                .type_parameters
+                .iter()
+                .zip(receiver_arguments)
+                .map(|(parameter, argument)| (parameter.id, argument.clone())),
+        );
+    }
+    let Some(declaring) = classes.values().find(|class| class.id == declaring_class) else {
+        return substitutions;
+    };
+    let Some(ancestor) = instantiated_ancestor(receiver, &declaring.name, classes) else {
+        return substitutions;
+    };
+    let Some((_, arguments)) = nominal_parts(&ancestor) else {
+        return substitutions;
+    };
+    substitutions.extend(
+        declaring
+            .type_parameters
+            .iter()
+            .zip(arguments)
+            .map(|(parameter, argument)| (parameter.id, argument.clone())),
+    );
+    substitutions
+}
+
+fn instantiate_member_type(
+    receiver: &Type,
+    declaring_class: ClassId,
+    member_type: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) -> Type {
+    substitute_type(
+        member_type,
+        &substitutions_for_ancestor(receiver, declaring_class, classes),
+    )
+}
+
+fn instantiate_method_signature(
+    method: &mut MethodSignature,
+    receiver: &Type,
+    classes: &BTreeMap<String, ClassSignature>,
+) {
+    let substitutions = substitutions_for_ancestor(receiver, method.declaring_class, classes);
+    for parameter in &mut method.signature.parameters {
+        parameter.ty = substitute_type(&parameter.ty, &substitutions);
+    }
+    method.signature.return_type = substitute_type(&method.signature.return_type, &substitutions);
+}
+
+fn unify_inference(
+    pattern: &Type,
+    actual: &Type,
+    class_parameters: &BTreeSet<TypeParameterId>,
+    inferred: &mut BTreeMap<TypeParameterId, Type>,
+) -> bool {
+    match pattern {
+        Type::Parameter { id, .. } if class_parameters.contains(id) => {
+            if matches!(actual, Type::Mixed | Type::Union(_)) {
+                return true;
+            }
+            if type_contains_void(actual) {
+                return false;
+            }
+            if let Some(previous) = inferred.get(id) {
+                previous == actual
+            } else {
+                inferred.insert(*id, actual.clone());
+                true
+            }
+        }
+        Type::Vector(pattern) => {
+            matches!(actual, Type::Vector(actual) if unify_inference(pattern, actual, class_parameters, inferred))
+        }
+        Type::Map(pattern_key, pattern_value) => matches!(
+            actual,
+            Type::Map(actual_key, actual_value)
+                if unify_inference(pattern_key, actual_key, class_parameters, inferred)
+                    && unify_inference(pattern_value, actual_value, class_parameters, inferred)
+        ),
+        Type::Callable(pattern_parameters, pattern_result) => matches!(actual,
+            Type::Callable(actual_parameters, actual_result)
+                if pattern_parameters.len() == actual_parameters.len()
+                    && pattern_parameters.iter().zip(actual_parameters).all(|(pattern, actual)|
+                        unify_inference(pattern, actual, class_parameters, inferred))
+                    && unify_inference(pattern_result, actual_result, class_parameters, inferred)),
+        Type::Nominal {
+            name: pattern_name,
+            arguments: pattern_arguments,
+        } => {
+            let Some((actual_name, actual_arguments)) = nominal_parts(actual) else {
+                return true;
+            };
+            pattern_name == actual_name
+                && pattern_arguments.len() == actual_arguments.len()
+                && pattern_arguments
+                    .iter()
+                    .zip(actual_arguments)
+                    .all(|(pattern, actual)| {
+                        unify_inference(pattern, actual, class_parameters, inferred)
+                    })
+        }
+        _ => true,
     }
 }
 
@@ -3977,13 +7699,287 @@ type NativeNominalSpec<'name> = (
 
 fn native_nominals() -> BTreeMap<String, ClassSignature> {
     let specs: &[NativeNominalSpec<'_>] = &[
+        (
+            "Traversable",
+            NominalKind::Interface,
+            true,
+            false,
+            None,
+            &[],
+        ),
+        (
+            "Iterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Traversable"),
+            &[],
+        ),
+        (
+            "IteratorAggregate",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Traversable"),
+            &[],
+        ),
+        (
+            "SeekableIterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Iterator"),
+            &[],
+        ),
+        (
+            "OuterIterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Iterator"),
+            &[],
+        ),
+        (
+            "VectorIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "Generator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "MapIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "EmptyIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "IteratorIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["OuterIterator"],
+        ),
+        (
+            "LimitIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["OuterIterator", "SeekableIterator"],
+        ),
+        (
+            "InfiniteIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["OuterIterator"],
+        ),
+        (
+            "AppendIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "CachingIterator",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["OuterIterator", "MapAccess", "Countable", "Stringable"],
+        ),
+        (
+            "RecursiveIterator",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Iterator"),
+            &[],
+        ),
+        ("RecursiveEntry", NominalKind::Class, false, true, None, &[]),
+        (
+            "RecursiveIteratorIterator",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "RecursiveCachingIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("CachingIterator"),
+            &["RecursiveIterator"],
+        ),
+        (
+            "FixedSequence",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "MapAccess", "Countable"],
+        ),
+        (
+            "LinkedList",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "Queue",
+            NominalKind::Class,
+            false,
+            true,
+            Some("LinkedList"),
+            &[],
+        ),
+        (
+            "Stack",
+            NominalKind::Class,
+            false,
+            true,
+            Some("LinkedList"),
+            &[],
+        ),
+        (
+            "MaxHeap",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "MinHeap",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "PriorityQueue",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "TypedMap",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "ObjectStorage",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["IteratorAggregate", "Countable"],
+        ),
+        (
+            "FilterIterator",
+            NominalKind::Class,
+            true,
+            false,
+            None,
+            &["OuterIterator"],
+        ),
+        ("RegexCapture", NominalKind::Class, false, true, None, &[]),
+        (
+            "RegexIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "RecursiveRegexIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["RecursiveIterator"],
+        ),
+        (
+            "CallbackFilterIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("FilterIterator"),
+            &[],
+        ),
+        (
+            "RecursiveFilterIterator",
+            NominalKind::Class,
+            true,
+            false,
+            Some("FilterIterator"),
+            &["RecursiveIterator"],
+        ),
+        (
+            "ParentIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RecursiveFilterIterator"),
+            &[],
+        ),
+        (
+            "RecursiveCallbackFilterIterator",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RecursiveFilterIterator"),
+            &[],
+        ),
         ("Closeable", NominalKind::Interface, true, false, None, &[]),
+        (
+            "Stream",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Closeable"),
+            &[],
+        ),
         (
             "ReadableStream",
             NominalKind::Interface,
             true,
             false,
-            Some("Closeable"),
+            Some("Stream"),
             &[],
         ),
         (
@@ -3991,7 +7987,7 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             NominalKind::Interface,
             true,
             false,
-            Some("Closeable"),
+            Some("Stream"),
             &[],
         ),
         (
@@ -3999,10 +7995,22 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             NominalKind::Interface,
             true,
             false,
-            Some("Closeable"),
+            Some("Stream"),
             &[],
         ),
-        ("Throwable", NominalKind::Interface, true, false, None, &[]),
+        (
+            "Throwable",
+            NominalKind::Interface,
+            true,
+            false,
+            None,
+            &["Stringable"],
+        ),
+        ("Option", NominalKind::Class, false, true, None, &[]),
+        ("TraceLine", NominalKind::Class, false, true, None, &[]),
+        ("Countable", NominalKind::Interface, true, false, None, &[]),
+        ("Stringable", NominalKind::Interface, true, false, None, &[]),
+        ("MapAccess", NominalKind::Interface, true, false, None, &[]),
         (
             "MemoryStream",
             NominalKind::Class,
@@ -4022,14 +8030,103 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         ("Streams", NominalKind::Class, false, true, None, &[]),
         ("Files", NominalKind::Class, false, true, None, &[]),
         (
+            "SplFileInfo",
+            NominalKind::Class,
+            false,
+            false,
+            None,
+            &["Stringable"],
+        ),
+        (
+            "SplFileObject",
+            NominalKind::Class,
+            false,
+            false,
+            Some("SplFileInfo"),
+            &["SeekableIterator"],
+        ),
+        (
+            "DirectoryIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["SeekableIterator", "Stringable"],
+        ),
+        (
+            "FilesystemIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator"],
+        ),
+        (
+            "RecursiveDirectoryIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["RecursiveIterator"],
+        ),
+        (
+            "GlobIterator",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Iterator", "Countable"],
+        ),
+        (
             "ReadableFileStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["ReadableStream", "SeekableStream"],
+        ),
+        (
+            "RequestInputStream",
             NominalKind::Class,
             false,
             true,
             None,
             &["ReadableStream"],
         ),
+        (
+            "ReadableUriStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["ReadableStream", "SeekableStream"],
+        ),
+        (
+            "WritableUriStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["WritableStream", "SeekableStream"],
+        ),
+        (
+            "WritableFileStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["WritableStream", "SeekableStream"],
+        ),
+        (
+            "ReadWriteFileStream",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["ReadableStream", "WritableStream", "SeekableStream"],
+        ),
         ("OpenMode", NominalKind::Class, false, true, None, &[]),
+        ("WriteMode", NominalKind::Class, false, true, None, &[]),
         ("SeekFrom", NominalKind::Class, false, true, None, &[]),
         (
             "Exception",
@@ -4103,6 +8200,264 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Some("Error"),
             &[],
         ),
+        (
+            "TypeError",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Error"),
+            &[],
+        ),
+        (
+            "ArgumentCountError",
+            NominalKind::Class,
+            false,
+            false,
+            Some("TypeError"),
+            &[],
+        ),
+        (
+            "ReflectionException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Exception"),
+            &[],
+        ),
+        (
+            "LogicException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Exception"),
+            &[],
+        ),
+        (
+            "BadFunctionCallException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "BadMethodCallException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("BadFunctionCallException"),
+            &[],
+        ),
+        (
+            "DomainException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "InvalidArgumentException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "LengthException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "OutOfRangeException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("LogicException"),
+            &[],
+        ),
+        (
+            "RuntimeException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("Exception"),
+            &[],
+        ),
+        (
+            "OutOfBoundsException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "OverflowException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "RangeException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "UnderflowException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "UnexpectedValueException",
+            NominalKind::Class,
+            false,
+            false,
+            Some("RuntimeException"),
+            &[],
+        ),
+        ("ReflectionType", NominalKind::Class, true, false, None, &[]),
+        (
+            "ReflectionNamedType",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionType"),
+            &[],
+        ),
+        (
+            "ReflectionUnionType",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionType"),
+            &[],
+        ),
+        (
+            "ReflectionClass",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &[],
+        ),
+        (
+            "ReflectionFunctionAbstract",
+            NominalKind::Class,
+            true,
+            false,
+            None,
+            &[],
+        ),
+        (
+            "ReflectionFunction",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionFunctionAbstract"),
+            &[],
+        ),
+        (
+            "ReflectionMethod",
+            NominalKind::Class,
+            false,
+            true,
+            Some("ReflectionFunctionAbstract"),
+            &[],
+        ),
+        (
+            "ReflectionProperty",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &[],
+        ),
+        (
+            "ReflectionParameter",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &[],
+        ),
+        ("Awaitable", NominalKind::Interface, true, false, None, &[]),
+        (
+            "Completable",
+            NominalKind::Interface,
+            true,
+            false,
+            Some("Awaitable"),
+            &[],
+        ),
+        (
+            "SchedulerInterface",
+            NominalKind::Interface,
+            true,
+            false,
+            None,
+            &[],
+        ),
+        (
+            "Coroutine",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Completable"],
+        ),
+        (
+            "Timeout",
+            NominalKind::Class,
+            false,
+            true,
+            None,
+            &["Completable"],
+        ),
+        (
+            "CancellationException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "WaitCancelledException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "TimeoutException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
+        (
+            "AsyncDeadlockException",
+            NominalKind::Class,
+            false,
+            true,
+            Some("RuntimeException"),
+            &[],
+        ),
     ];
     let mut classes = specs
         .iter()
@@ -4120,15 +8475,26 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
                         kind: *kind,
                         abstract_class: *abstract_class,
                         final_class: *final_class,
+                        module_name: "@native".to_owned(),
+                        type_parameters: Vec::new(),
+                        type_parameter_syntax: Vec::new(),
                         parent: parent.map(ToOwned::to_owned),
+                        parent_syntax: None,
+                        parent_type: parent.map(|name| Type::Object(name.to_owned())),
                         interfaces: interfaces
                             .iter()
                             .map(|interface| (*interface).to_owned())
+                            .collect(),
+                        interface_syntax: Vec::new(),
+                        interface_types: interfaces
+                            .iter()
+                            .map(|interface| Type::Object((*interface).to_owned()))
                             .collect(),
                         trait_uses: Vec::new(),
                         declared_properties: Vec::new(),
                         declared_property_initializers: Vec::new(),
                         declared_methods: BTreeMap::new(),
+                        declared_method_order: Vec::new(),
                         properties: Vec::new(),
                         property_initializers: Vec::new(),
                         methods: BTreeMap::new(),
@@ -4142,9 +8508,2081 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         )
         .collect::<BTreeMap<_, _>>();
 
+    {
+        let class = classes
+            .get_mut("RegexCapture")
+            .expect("native RegexCapture exists");
+        for (index, (name, ty)) in [
+            ("__text", normalize_union(vec![Type::String, Type::Null])),
+            ("__offset", Type::Int),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            class.declared_properties.push(Property {
+                id: PropertyId(u32::try_from(index).expect("capture property index fits")),
+                name: name.to_owned(),
+                ty,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
+    }
+    add_native_method(
+        &mut classes,
+        "RegexCapture",
+        "text",
+        Some(Builtin::RegexCaptureText),
+        false,
+        vec![],
+        normalize_union(vec![Type::String, Type::Null]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RegexCapture",
+        "offset",
+        Some(Builtin::RegexCaptureOffset),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+
+    for name in [
+        "Traversable",
+        "Iterator",
+        "IteratorAggregate",
+        "SeekableIterator",
+        "OuterIterator",
+        "RecursiveIterator",
+        "VectorIterator",
+        "Generator",
+        "MapIterator",
+        "EmptyIterator",
+        "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "AppendIterator",
+        "CachingIterator",
+        "RecursiveIterator",
+        "RecursiveEntry",
+        "RecursiveIteratorIterator",
+        "RecursiveCachingIterator",
+        "FilterIterator",
+        "CallbackFilterIterator",
+        "RecursiveFilterIterator",
+        "ParentIterator",
+        "RecursiveCallbackFilterIterator",
+        "RegexIterator",
+        "RecursiveRegexIterator",
+        "Option",
+        "FixedSequence",
+        "LinkedList",
+        "Queue",
+        "Stack",
+        "MaxHeap",
+        "MinHeap",
+        "PriorityQueue",
+        "TypedMap",
+        "ObjectStorage",
+        "MapAccess",
+    ] {
+        let class = classes
+            .get_mut(name)
+            .expect("iterator prelude nominal exists");
+        let parameters: &[&str] = if matches!(name, "RegexIterator" | "RecursiveRegexIterator") {
+            &["K", "TIn", "TOut"]
+        } else if matches!(
+            name,
+            "VectorIterator"
+                | "Option"
+                | "FixedSequence"
+                | "LinkedList"
+                | "Queue"
+                | "Stack"
+                | "MaxHeap"
+                | "MinHeap"
+                | "PriorityQueue"
+                | "ObjectStorage"
+        ) {
+            &["T"]
+        } else if matches!(
+            name,
+            "RecursiveIterator"
+                | "RecursiveEntry"
+                | "RecursiveIteratorIterator"
+                | "RecursiveCachingIterator"
+                | "RecursiveFilterIterator"
+                | "ParentIterator"
+                | "RecursiveCallbackFilterIterator"
+        ) {
+            &["K", "T"]
+        } else {
+            &["K", "V"]
+        };
+        class.type_parameters = parameters
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, parameter_name)| TypeParameter {
+                id: TypeParameterId {
+                    owner: class.id,
+                    index: u32::try_from(index).expect("prelude parameter count fits u32"),
+                },
+                name: parameter_name.to_owned(),
+                bound: None,
+                span: Span::empty(0),
+            })
+            .collect();
+    }
+    for name in [
+        "Iterator",
+        "IteratorAggregate",
+        "SeekableIterator",
+        "OuterIterator",
+        "RecursiveIterator",
+    ] {
+        let class = classes
+            .get_mut(name)
+            .expect("iterator prelude nominal exists");
+        let arguments = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.parent_type = Some(Type::Nominal {
+            name: if matches!(
+                name,
+                "OuterIterator" | "SeekableIterator" | "RecursiveIterator"
+            ) {
+                "Iterator"
+            } else {
+                "Traversable"
+            }
+            .to_owned(),
+            arguments: if name == "RecursiveIterator" {
+                vec![
+                    arguments[0].clone(),
+                    Type::Nominal {
+                        name: "RecursiveEntry".to_owned(),
+                        arguments: arguments.clone(),
+                    },
+                ]
+            } else {
+                arguments
+            },
+        });
+    }
+
+    for name in ["RegexIterator", "RecursiveRegexIterator"] {
+        let recursive = name == "RecursiveRegexIterator";
+        let class = classes.get_mut(name).expect("native regex iterator exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|parameter| Type::Parameter {
+                id: parameter.id,
+                name: parameter.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.interface_types = vec![Type::Nominal {
+            name: if recursive {
+                "RecursiveIterator"
+            } else {
+                "Iterator"
+            }
+            .to_owned(),
+            arguments: vec![params[0].clone(), params[2].clone()],
+        }];
+        for (index, (property, ty)) in [
+            (
+                "__inner",
+                Type::Nominal {
+                    name: if recursive {
+                        "RecursiveIterator"
+                    } else {
+                        "Iterator"
+                    }
+                    .to_owned(),
+                    arguments: vec![params[0].clone(), params[1].clone()],
+                },
+            ),
+            ("__pattern", Type::String),
+            ("__mode", Type::Int),
+            ("__invert", Type::Bool),
+            ("__preg_flags", Type::Int),
+            ("__replacement", Type::String),
+            ("__ready", Type::Bool),
+            ("__current", Type::Mixed),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            class.declared_properties.push(Property {
+                id: PropertyId(u32::try_from(index).expect("regex property index fits")),
+                name: property.to_owned(),
+                ty,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
+        let inner = Type::Nominal {
+            name: if recursive {
+                "RecursiveIterator"
+            } else {
+                "Iterator"
+            }
+            .to_owned(),
+            arguments: vec![params[0].clone(), params[1].clone()],
+        };
+        let output = if recursive {
+            Type::Nominal {
+                name: "RecursiveEntry".to_owned(),
+                arguments: vec![params[0].clone(), params[2].clone()],
+            }
+        } else {
+            params[2].clone()
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(Builtin::RegexIteratorConstruct),
+            false,
+            vec![
+                native_parameter("iterator", inner.clone(), None, Span::empty(0)),
+                native_parameter("pattern", Type::String, None, Span::empty(0)),
+                native_parameter(
+                    "mode",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "invert",
+                    Type::Bool,
+                    Some(ExprKind::Bool(false)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "preg_flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "replacement",
+                    Type::String,
+                    Some(ExprKind::String(Vec::new())),
+                    Span::empty(0),
+                ),
+            ],
+            Type::Void,
+            false,
+        );
+        for (method, builtin, ty) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            ("key", Builtin::IteratorKey, params[0].clone()),
+            ("value", Builtin::IteratorValue, output),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                ty,
+                false,
+            );
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "getInnerIterator",
+            Some(Builtin::RegexIteratorGetInner),
+            false,
+            vec![],
+            inner,
+            false,
+        );
+        for (method, builtin, ty) in [
+            ("getRegex", Builtin::RegexIteratorGetRegex, Type::String),
+            ("getMode", Builtin::RegexIteratorGetMode, Type::Int),
+            (
+                "getPregFlags",
+                Builtin::RegexIteratorGetPregFlags,
+                Type::Int,
+            ),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                ty,
+                false,
+            );
+        }
+    }
+
+    for name in [
+        "VectorIterator",
+        "Generator",
+        "MapIterator",
+        "EmptyIterator",
+        "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "AppendIterator",
+        "CachingIterator",
+        "RecursiveIteratorIterator",
+        "FilterIterator",
+    ] {
+        let class = classes.get_mut(name).expect("native iterator exists");
+        let parameters = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let arguments = if name == "VectorIterator" {
+            vec![Type::Int, parameters[0].clone()]
+        } else {
+            parameters
+        };
+        class.interface_types = vec![Type::Nominal {
+            name: if matches!(
+                name,
+                "IteratorIterator"
+                    | "LimitIterator"
+                    | "InfiniteIterator"
+                    | "CachingIterator"
+                    | "FilterIterator"
+            ) {
+                "OuterIterator"
+            } else {
+                "Iterator"
+            }
+            .to_owned(),
+            arguments,
+        }];
+        if name == "LimitIterator" {
+            class.interface_types.push(Type::Nominal {
+                name: "SeekableIterator".to_owned(),
+                arguments: class
+                    .type_parameters
+                    .iter()
+                    .map(|p| Type::Parameter {
+                        id: p.id,
+                        name: p.name.clone(),
+                    })
+                    .collect(),
+            });
+        }
+        if name == "CachingIterator" {
+            class.interface_types.extend([
+                Type::Nominal {
+                    name: "MapAccess".to_owned(),
+                    arguments: class
+                        .type_parameters
+                        .iter()
+                        .map(|p| Type::Parameter {
+                            id: p.id,
+                            name: p.name.clone(),
+                        })
+                        .collect(),
+                },
+                Type::Object("Countable".to_owned()),
+                Type::Object("Stringable".to_owned()),
+            ]);
+        }
+    }
+    {
+        let class = classes
+            .get_mut("FixedSequence")
+            .expect("fixed sequence exists");
+        let element = Type::Parameter {
+            id: class.type_parameters[0].id,
+            name: class.type_parameters[0].name.clone(),
+        };
+        let slot = normalize_union(vec![element, Type::Null]);
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, slot.clone()],
+            },
+            Type::Nominal {
+                name: "MapAccess".to_owned(),
+                arguments: vec![Type::Int, slot],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes.get_mut("LinkedList").expect("linked list exists");
+        let element = Type::Parameter {
+            id: class.type_parameters[0].id,
+            name: class.type_parameters[0].name.clone(),
+        };
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, element],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    for name in ["Queue", "Stack"] {
+        let class = classes.get_mut(name).expect("list adapter exists");
+        class.parent_type = Some(Type::Nominal {
+            name: "LinkedList".to_owned(),
+            arguments: vec![Type::Parameter {
+                id: class.type_parameters[0].id,
+                name: class.type_parameters[0].name.clone(),
+            }],
+        });
+    }
+    for name in ["MaxHeap", "MinHeap", "PriorityQueue"] {
+        let class = classes.get_mut(name).expect("native heap exists");
+        let element = Type::Parameter {
+            id: class.type_parameters[0].id,
+            name: class.type_parameters[0].name.clone(),
+        };
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, element],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes.get_mut("TypedMap").expect("typed map exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: params,
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes
+            .get_mut("ObjectStorage")
+            .expect("object storage exists");
+        class.interface_types = vec![
+            Type::Nominal {
+                name: "IteratorAggregate".to_owned(),
+                arguments: vec![Type::Int, Type::Mixed],
+            },
+            Type::Object("Countable".to_owned()),
+        ];
+    }
+    {
+        let class = classes
+            .get_mut("RecursiveCachingIterator")
+            .expect("recursive caching iterator exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.parent_type = Some(Type::Nominal {
+            name: "CachingIterator".to_owned(),
+            arguments: vec![
+                params[0].clone(),
+                Type::Nominal {
+                    name: "RecursiveEntry".to_owned(),
+                    arguments: params.clone(),
+                },
+            ],
+        });
+        class.interface_types = vec![Type::Nominal {
+            name: "RecursiveIterator".to_owned(),
+            arguments: params,
+        }];
+    }
+    {
+        let class = classes
+            .get_mut("CallbackFilterIterator")
+            .expect("callback iterator exists");
+        class.parent_type = Some(Type::Nominal {
+            name: "FilterIterator".to_owned(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|p| Type::Parameter {
+                    id: p.id,
+                    name: p.name.clone(),
+                })
+                .collect(),
+        });
+    }
+    {
+        let class = classes
+            .get_mut("RecursiveFilterIterator")
+            .expect("recursive filter exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        class.parent_type = Some(Type::Nominal {
+            name: "FilterIterator".to_owned(),
+            arguments: vec![
+                params[0].clone(),
+                Type::Nominal {
+                    name: "RecursiveEntry".to_owned(),
+                    arguments: params.clone(),
+                },
+            ],
+        });
+        class.interface_types = vec![Type::Nominal {
+            name: "RecursiveIterator".to_owned(),
+            arguments: params,
+        }];
+    }
+    for name in ["ParentIterator", "RecursiveCallbackFilterIterator"] {
+        let class = classes
+            .get_mut(name)
+            .expect("recursive filter adapter exists");
+        class.parent_type = Some(Type::Nominal {
+            name: "RecursiveFilterIterator".to_owned(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|p| Type::Parameter {
+                    id: p.id,
+                    name: p.name.clone(),
+                })
+                .collect(),
+        });
+    }
+    for name in ["FilterIterator", "CallbackFilterIterator"] {
+        let class = classes.get_mut(name).expect("filter iterator exists");
+        let params = class
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let properties = if name == "FilterIterator" {
+            vec![
+                (
+                    "__inner",
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: params.clone(),
+                    },
+                ),
+                ("__ready", Type::Bool),
+            ]
+        } else {
+            vec![(
+                "__callback",
+                Type::Callable(
+                    vec![params[1].clone(), params[0].clone()],
+                    Box::new(Type::Bool),
+                ),
+            )]
+        };
+        for (property_name, ty) in properties {
+            class.declared_properties.push(Property {
+                id: PropertyId(
+                    u32::try_from(class.declared_properties.len())
+                        .expect("native property count fits u32"),
+                ),
+                name: property_name.to_owned(),
+                ty,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
+    }
+    for (name, slots) in [
+        ("CachingIterator", 10),
+        ("LinkedList", 1),
+        ("RecursiveIteratorIterator", 10),
+    ] {
+        let class = classes.get_mut(name).expect("native class exists");
+        for slot in 0..slots {
+            class.declared_properties.push(Property {
+                id: PropertyId(slot),
+                name: format!("__native_slot_{slot}"),
+                ty: Type::Mixed,
+                visibility: Visibility::Private,
+                declaring_class: class.id,
+                default: None,
+                origin_trait: None,
+                span: Span::empty(0),
+            });
+            class.declared_property_initializers.push(None);
+        }
+    }
+
     let nullable_throwable =
         normalize_union(vec![Type::Object("Throwable".to_owned()), Type::Null]);
     let throwable_vector = Type::Vector(Box::new(Type::Object("Throwable".to_owned())));
+    let trace_vector = Type::Vector(Box::new(Type::Object("TraceLine".to_owned())));
+    for (name, ty) in [
+        ("function", Type::String),
+        ("line", Type::Int),
+        ("file", Type::String),
+        ("class", Type::String),
+        ("object", Type::Mixed),
+        ("type", Type::String),
+        ("args", Type::Mixed),
+    ] {
+        let class = classes
+            .get_mut("TraceLine")
+            .expect("native TraceLine exists");
+        class.declared_properties.push(Property {
+            id: PropertyId(u32::try_from(class.declared_properties.len()).unwrap()),
+            name: name.to_owned(),
+            ty,
+            visibility: Visibility::Public,
+            declaring_class: class.id,
+            default: None,
+            origin_trait: None,
+            span: Span::empty(0),
+        });
+        class.declared_property_initializers.push(None);
+    }
+    add_native_method(
+        &mut classes,
+        "TraceLine",
+        "__construct",
+        Some(Builtin::TraceLineConstruct),
+        false,
+        vec![
+            native_parameter("function", Type::String, None, Span::empty(0)),
+            native_parameter("line", Type::Int, None, Span::empty(0)),
+            native_parameter("file", Type::String, None, Span::empty(0)),
+            native_parameter("class", Type::String, None, Span::empty(0)),
+            native_parameter("object", Type::Mixed, None, Span::empty(0)),
+            native_parameter("type", Type::String, None, Span::empty(0)),
+            native_parameter("args", Type::Mixed, None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    let option_parameter = &classes["Option"].type_parameters[0];
+    let option_value = Type::Parameter {
+        id: option_parameter.id,
+        name: "T".to_owned(),
+    };
+    let option_type = Type::Nominal {
+        name: "Option".to_owned(),
+        arguments: vec![option_value.clone()],
+    };
+    for (name, ty) in [("__present", Type::Bool), ("__value", option_value.clone())] {
+        let class = classes.get_mut("Option").expect("native Option exists");
+        class.declared_properties.push(Property {
+            id: PropertyId(u32::try_from(class.declared_properties.len()).unwrap()),
+            name: name.to_owned(),
+            ty,
+            visibility: Visibility::Private,
+            declaring_class: class.id,
+            default: None,
+            origin_trait: None,
+            span: Span::empty(0),
+        });
+        class.declared_property_initializers.push(None);
+    }
+    add_native_method(
+        &mut classes,
+        "Option",
+        "some",
+        Some(Builtin::OptionSome),
+        true,
+        vec![native_parameter(
+            "value",
+            option_value.clone(),
+            None,
+            Span::empty(0),
+        )],
+        option_type.clone(),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "none",
+        Some(Builtin::OptionNone),
+        true,
+        vec![],
+        option_type,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "isSome",
+        Some(Builtin::OptionIsSome),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "isNone",
+        Some(Builtin::OptionIsNone),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Option",
+        "get",
+        Some(Builtin::OptionGet),
+        false,
+        vec![],
+        option_value,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Countable",
+        "count",
+        None,
+        false,
+        vec![],
+        Type::Int,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Stringable",
+        "__toString",
+        None,
+        false,
+        vec![],
+        Type::String,
+        true,
+    );
+    let map_access_params = classes["MapAccess"].type_parameters.clone();
+    let map_key = Type::Parameter {
+        id: map_access_params[0].id,
+        name: "K".to_owned(),
+    };
+    let map_value = Type::Parameter {
+        id: map_access_params[1].id,
+        name: "V".to_owned(),
+    };
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetExists",
+        None,
+        false,
+        vec![native_parameter(
+            "offset",
+            map_key.clone(),
+            None,
+            Span::empty(0),
+        )],
+        Type::Bool,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetGet",
+        None,
+        false,
+        vec![native_parameter(
+            "offset",
+            map_key.clone(),
+            None,
+            Span::empty(0),
+        )],
+        map_value.clone(),
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetSet",
+        None,
+        false,
+        vec![
+            native_parameter(
+                "offset",
+                normalize_union(vec![map_key.clone(), Type::Null]),
+                None,
+                Span::empty(0),
+            ),
+            native_parameter("value", map_value, None, Span::empty(0)),
+        ],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "MapAccess",
+        "offsetUnset",
+        None,
+        false,
+        vec![native_parameter("offset", map_key, None, Span::empty(0))],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "rewind",
+        None,
+        false,
+        vec![],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "valid",
+        None,
+        false,
+        vec![],
+        Type::Bool,
+        true,
+    );
+    let iterator_parameters = classes["Iterator"].type_parameters.clone();
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "key",
+        None,
+        false,
+        vec![],
+        Type::Parameter {
+            id: iterator_parameters[0].id,
+            name: "K".to_owned(),
+        },
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "value",
+        None,
+        false,
+        vec![],
+        Type::Parameter {
+            id: iterator_parameters[1].id,
+            name: "V".to_owned(),
+        },
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "Iterator",
+        "advance",
+        None,
+        false,
+        vec![],
+        Type::Void,
+        true,
+    );
+    let aggregate_parameters = classes["IteratorAggregate"].type_parameters.clone();
+    add_native_method(
+        &mut classes,
+        "IteratorAggregate",
+        "getIterator",
+        None,
+        false,
+        vec![],
+        Type::Nominal {
+            name: "Traversable".to_owned(),
+            arguments: aggregate_parameters
+                .iter()
+                .map(|parameter| Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                })
+                .collect(),
+        },
+        true,
+    );
+    let outer_parameters = classes["OuterIterator"].type_parameters.clone();
+    let outer_args = outer_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect();
+    add_native_method(
+        &mut classes,
+        "OuterIterator",
+        "getInnerIterator",
+        None,
+        false,
+        vec![],
+        Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: outer_args,
+        },
+        true,
+    );
+    for name in [
+        "VectorIterator",
+        "MapIterator",
+        "EmptyIterator",
+        "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "AppendIterator",
+        "CachingIterator",
+    ] {
+        let parameters = classes[name].type_parameters.clone();
+        let params = parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let constructor_args = match name {
+            "VectorIterator" => vec![native_parameter(
+                "values",
+                Type::Vector(Box::new(params[0].clone())),
+                None,
+                Span::empty(0),
+            )],
+            "MapIterator" => vec![native_parameter(
+                "values",
+                Type::Map(Box::new(params[0].clone()), Box::new(params[1].clone())),
+                None,
+                Span::empty(0),
+            )],
+            "IteratorIterator" => vec![native_parameter(
+                "iterator",
+                Type::Nominal {
+                    name: "Iterator".to_owned(),
+                    arguments: params.clone(),
+                },
+                None,
+                Span::empty(0),
+            )],
+            "LimitIterator" => vec![
+                native_parameter(
+                    "iterator",
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: params.clone(),
+                    },
+                    None,
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "offset",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "limit",
+                    Type::Int,
+                    Some(ExprKind::Integer(-1)),
+                    Span::empty(0),
+                ),
+            ],
+            "InfiniteIterator" => vec![native_parameter(
+                "source",
+                Type::Nominal {
+                    name: "IteratorAggregate".to_owned(),
+                    arguments: params.clone(),
+                },
+                None,
+                Span::empty(0),
+            )],
+            "CachingIterator" => vec![
+                native_parameter(
+                    "iterator",
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: params.clone(),
+                    },
+                    None,
+                    Span::empty(0),
+                ),
+                native_parameter(
+                    "flags",
+                    Type::Int,
+                    Some(ExprKind::Integer(1)),
+                    Span::empty(0),
+                ),
+            ],
+            _ => vec![],
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(Builtin::IteratorConstruct),
+            false,
+            constructor_args,
+            Type::Void,
+            false,
+        );
+        for (method, builtin, result) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            (
+                "key",
+                Builtin::IteratorKey,
+                if name == "VectorIterator" {
+                    Type::Int
+                } else {
+                    params[0].clone()
+                },
+            ),
+            (
+                "value",
+                Builtin::IteratorValue,
+                if name == "VectorIterator" {
+                    params[0].clone()
+                } else {
+                    params[1].clone()
+                },
+            ),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    {
+        let params = classes["Generator"].type_parameters.clone();
+        for (method, builtin, result) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            (
+                "key",
+                Builtin::IteratorKey,
+                Type::Parameter {
+                    id: params[0].id,
+                    name: "K".to_owned(),
+                },
+            ),
+            (
+                "value",
+                Builtin::IteratorValue,
+                Type::Parameter {
+                    id: params[1].id,
+                    name: "V".to_owned(),
+                },
+            ),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+            ("getReturn", Builtin::GeneratorGetReturn, Type::Mixed),
+            ("close", Builtin::GeneratorClose, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                "Generator",
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    for name in [
+        "IteratorIterator",
+        "LimitIterator",
+        "InfiniteIterator",
+        "CachingIterator",
+    ] {
+        let params = classes[name]
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        add_native_method(
+            &mut classes,
+            name,
+            "getInnerIterator",
+            Some(Builtin::IteratorGetInner),
+            false,
+            vec![],
+            Type::Nominal {
+                name: "Iterator".to_owned(),
+                arguments: params,
+            },
+            false,
+        );
+    }
+    for name in ["ParentIterator", "RecursiveCallbackFilterIterator"] {
+        let params = classes[name]
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let entry = Type::Nominal {
+            name: "RecursiveEntry".to_owned(),
+            arguments: params.clone(),
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "accept",
+            Some(if name == "ParentIterator" {
+                Builtin::ParentAccept
+            } else {
+                Builtin::RecursiveCallbackAccept
+            }),
+            false,
+            vec![
+                native_parameter("value", entry.clone(), None, Span::empty(0)),
+                native_parameter("key", params[0].clone(), None, Span::empty(0)),
+            ],
+            Type::Bool,
+            false,
+        );
+        if name == "RecursiveCallbackFilterIterator" {
+            add_native_method(
+                &mut classes,
+                name,
+                "__construct",
+                Some(Builtin::RecursiveCallbackConstruct),
+                false,
+                vec![
+                    native_parameter(
+                        "iterator",
+                        Type::Nominal {
+                            name: "RecursiveIterator".to_owned(),
+                            arguments: params.clone(),
+                        },
+                        None,
+                        Span::empty(0),
+                    ),
+                    native_parameter(
+                        "callback",
+                        Type::Callable(vec![entry, params[0].clone()], Box::new(Type::Bool)),
+                        None,
+                        Span::empty(0),
+                    ),
+                ],
+                Type::Void,
+                false,
+            );
+        }
+    }
+    add_native_method(
+        &mut classes,
+        "LimitIterator",
+        "seek",
+        Some(Builtin::LimitSeek),
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "SeekableIterator",
+        "seek",
+        None,
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "LimitIterator",
+        "getPosition",
+        Some(Builtin::LimitGetPosition),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+    let append_params = classes["AppendIterator"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let append_inner = Type::Nominal {
+        name: "Iterator".to_owned(),
+        arguments: append_params.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "AppendIterator",
+        "append",
+        Some(Builtin::AppendAdd),
+        false,
+        vec![native_parameter(
+            "iterator",
+            append_inner.clone(),
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    let cache_params = classes["CachingIterator"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let cache_key = cache_params[0].clone();
+    let cache_value = cache_params[1].clone();
+    for (name, builtin, result) in [
+        ("hasNext", Builtin::CachingHasNext, Type::Bool),
+        ("count", Builtin::CachingCount, Type::Int),
+        (
+            "getCache",
+            Builtin::CachingGetCache,
+            Type::Map(Box::new(cache_key.clone()), Box::new(cache_value.clone())),
+        ),
+        ("getFlags", Builtin::CachingGetFlags, Type::Int),
+        ("__toString", Builtin::CachingToString, Type::String),
+    ] {
+        add_native_method(
+            &mut classes,
+            "CachingIterator",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "CachingIterator",
+        "setFlags",
+        Some(Builtin::CachingSetFlags),
+        false,
+        vec![native_parameter("flags", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        ("offsetExists", Builtin::CachingOffsetExists, Type::Bool),
+        ("offsetGet", Builtin::CachingOffsetGet, cache_value.clone()),
+        ("offsetUnset", Builtin::CachingOffsetUnset, Type::Void),
+    ] {
+        add_native_method(
+            &mut classes,
+            "CachingIterator",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "offset",
+                cache_key.clone(),
+                None,
+                Span::empty(0),
+            )],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "CachingIterator",
+        "offsetSet",
+        Some(Builtin::CachingOffsetSet),
+        false,
+        vec![
+            native_parameter(
+                "offset",
+                normalize_union(vec![cache_key, Type::Null]),
+                None,
+                Span::empty(0),
+            ),
+            native_parameter("value", cache_value, None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    let fixed_param = &classes["FixedSequence"].type_parameters[0];
+    let fixed_element = normalize_union(vec![
+        Type::Parameter {
+            id: fixed_param.id,
+            name: fixed_param.name.clone(),
+        },
+        Type::Null,
+    ]);
+    add_native_method(
+        &mut classes,
+        "FixedSequence",
+        "__construct",
+        Some(Builtin::FixedConstruct),
+        false,
+        vec![native_parameter(
+            "size",
+            Type::Int,
+            Some(ExprKind::Integer(0)),
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        ("getSize", Builtin::FixedGetSize, Type::Int),
+        ("count", Builtin::FixedGetSize, Type::Int),
+        (
+            "getIterator",
+            Builtin::FixedGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: vec![Type::Int, fixed_element.clone()],
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "FixedSequence",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "FixedSequence",
+        "setSize",
+        Some(Builtin::FixedSetSize),
+        false,
+        vec![native_parameter("size", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        ("offsetExists", Builtin::FixedOffsetExists, Type::Bool),
+        ("offsetGet", Builtin::FixedOffsetGet, fixed_element.clone()),
+        ("offsetUnset", Builtin::FixedOffsetUnset, Type::Void),
+    ] {
+        add_native_method(
+            &mut classes,
+            "FixedSequence",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "FixedSequence",
+        "offsetSet",
+        Some(Builtin::FixedOffsetSet),
+        false,
+        vec![
+            native_parameter(
+                "offset",
+                normalize_union(vec![Type::Int, Type::Null]),
+                None,
+                Span::empty(0),
+            ),
+            native_parameter("value", fixed_element, None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    let list_param = &classes["LinkedList"].type_parameters[0];
+    let list_element = Type::Parameter {
+        id: list_param.id,
+        name: list_param.name.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "LinkedList",
+        "__construct",
+        Some(Builtin::ListConstruct),
+        false,
+        vec![],
+        Type::Void,
+        false,
+    );
+    for (name, builtin) in [
+        ("push", Builtin::ListPush),
+        ("unshift", Builtin::ListUnshift),
+    ] {
+        add_native_method(
+            &mut classes,
+            "LinkedList",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "value",
+                list_element.clone(),
+                None,
+                Span::empty(0),
+            )],
+            Type::Void,
+            false,
+        );
+    }
+    for (name, builtin) in [
+        ("pop", Builtin::ListPop),
+        ("shift", Builtin::ListShift),
+        ("top", Builtin::ListTop),
+        ("bottom", Builtin::ListBottom),
+    ] {
+        add_native_method(
+            &mut classes,
+            "LinkedList",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            list_element.clone(),
+            false,
+        );
+    }
+    for (name, builtin, result) in [
+        ("count", Builtin::ListCount, Type::Int),
+        ("isEmpty", Builtin::ListIsEmpty, Type::Bool),
+        (
+            "toVector",
+            Builtin::ListToVector,
+            Type::Vector(Box::new(list_element.clone())),
+        ),
+        (
+            "getIterator",
+            Builtin::ListGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: vec![Type::Int, list_element.clone()],
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "LinkedList",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    let queue_param = &classes["Queue"].type_parameters[0];
+    let queue_element = Type::Parameter {
+        id: queue_param.id,
+        name: queue_param.name.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "Queue",
+        "enqueue",
+        Some(Builtin::ListPush),
+        false,
+        vec![native_parameter(
+            "value",
+            queue_element.clone(),
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "Queue",
+        "dequeue",
+        Some(Builtin::ListShift),
+        false,
+        vec![],
+        queue_element,
+        false,
+    );
+    for name in ["MaxHeap", "MinHeap", "PriorityQueue"] {
+        let param = &classes[name].type_parameters[0];
+        let element = Type::Parameter {
+            id: param.id,
+            name: param.name.clone(),
+        };
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(Builtin::HeapConstruct),
+            false,
+            vec![],
+            Type::Void,
+            false,
+        );
+        let mut insert_params = vec![native_parameter(
+            "value",
+            element.clone(),
+            None,
+            Span::empty(0),
+        )];
+        if name == "PriorityQueue" {
+            insert_params.push(native_parameter(
+                "priority",
+                Type::Int,
+                None,
+                Span::empty(0),
+            ));
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "insert",
+            Some(Builtin::HeapInsert),
+            false,
+            insert_params,
+            Type::Void,
+            false,
+        );
+        for (method, builtin, result) in [
+            ("top", Builtin::HeapTop, element.clone()),
+            ("extract", Builtin::HeapExtract, element.clone()),
+            ("count", Builtin::HeapCount, Type::Int),
+            ("isEmpty", Builtin::HeapIsEmpty, Type::Bool),
+            (
+                "getIterator",
+                Builtin::HeapGetIterator,
+                Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, element.clone()],
+                },
+            ),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    let map_params = classes["TypedMap"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    add_native_method(
+        &mut classes,
+        "TypedMap",
+        "__construct",
+        Some(Builtin::TypedMapConstruct),
+        false,
+        vec![],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "TypedMap",
+        "set",
+        Some(Builtin::TypedMapSet),
+        false,
+        vec![
+            native_parameter("key", map_params[0].clone(), None, Span::empty(0)),
+            native_parameter("value", map_params[1].clone(), None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        (
+            "get",
+            Builtin::TypedMapGet,
+            normalize_union(vec![map_params[1].clone(), Type::Null]),
+        ),
+        ("contains", Builtin::TypedMapContains, Type::Bool),
+        ("remove", Builtin::TypedMapRemove, Type::Bool),
+    ] {
+        add_native_method(
+            &mut classes,
+            "TypedMap",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "key",
+                map_params[0].clone(),
+                None,
+                Span::empty(0),
+            )],
+            result,
+            false,
+        );
+    }
+    for (name, builtin, result) in [
+        ("count", Builtin::TypedMapCount, Type::Int),
+        (
+            "toMap",
+            Builtin::TypedMapToMap,
+            Type::Map(
+                Box::new(map_params[0].clone()),
+                Box::new(map_params[1].clone()),
+            ),
+        ),
+        (
+            "getIterator",
+            Builtin::TypedMapGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: map_params.clone(),
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "TypedMap",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    let storage_param = &classes["ObjectStorage"].type_parameters[0];
+    let storage_value = Type::Parameter {
+        id: storage_param.id,
+        name: storage_param.name.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "ObjectStorage",
+        "__construct",
+        Some(Builtin::ObjectStorageConstruct),
+        false,
+        vec![],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "ObjectStorage",
+        "attach",
+        Some(Builtin::ObjectStorageAttach),
+        false,
+        vec![
+            native_parameter("object", Type::Mixed, None, Span::empty(0)),
+            native_parameter("data", storage_value.clone(), None, Span::empty(0)),
+        ],
+        Type::Void,
+        false,
+    );
+    for (name, builtin, result) in [
+        (
+            "get",
+            Builtin::ObjectStorageGet,
+            normalize_union(vec![storage_value, Type::Null]),
+        ),
+        ("contains", Builtin::ObjectStorageContains, Type::Bool),
+        ("detach", Builtin::ObjectStorageDetach, Type::Bool),
+    ] {
+        add_native_method(
+            &mut classes,
+            "ObjectStorage",
+            name,
+            Some(builtin),
+            false,
+            vec![native_parameter(
+                "object",
+                Type::Mixed,
+                None,
+                Span::empty(0),
+            )],
+            result,
+            false,
+        );
+    }
+    for (name, builtin, result) in [
+        ("count", Builtin::ObjectStorageCount, Type::Int),
+        (
+            "getIterator",
+            Builtin::ObjectStorageGetIterator,
+            Type::Nominal {
+                name: "Traversable".to_owned(),
+                arguments: vec![Type::Int, Type::Mixed],
+            },
+        ),
+    ] {
+        add_native_method(
+            &mut classes,
+            "ObjectStorage",
+            name,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    let key_param = &classes["RecursiveEntry"].type_parameters[0];
+    let entry_key = Type::Parameter {
+        id: key_param.id,
+        name: key_param.name.clone(),
+    };
+    let entry_param = &classes["RecursiveEntry"].type_parameters[1];
+    let entry_value = Type::Parameter {
+        id: entry_param.id,
+        name: entry_param.name.clone(),
+    };
+    let entry_children = normalize_union(vec![
+        Type::Nominal {
+            name: "RecursiveIterator".to_owned(),
+            arguments: vec![entry_key, entry_value.clone()],
+        },
+        Type::Null,
+    ]);
+    add_native_method(
+        &mut classes,
+        "RecursiveEntry",
+        "__construct",
+        Some(Builtin::RecursiveEntryConstruct),
+        false,
+        vec![
+            native_parameter("value", entry_value.clone(), None, Span::empty(0)),
+            native_parameter(
+                "children",
+                entry_children.clone(),
+                Some(ExprKind::Null),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveEntry",
+        "value",
+        Some(Builtin::RecursiveEntryValue),
+        false,
+        vec![],
+        entry_value,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveEntry",
+        "children",
+        Some(Builtin::RecursiveEntryChildren),
+        false,
+        vec![],
+        entry_children,
+        false,
+    );
+    let walk_params = classes["RecursiveIteratorIterator"]
+        .type_parameters
+        .iter()
+        .map(|p| Type::Parameter {
+            id: p.id,
+            name: p.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let recursive_source = Type::Nominal {
+        name: "RecursiveIterator".to_owned(),
+        arguments: walk_params.clone(),
+    };
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "__construct",
+        Some(Builtin::RecursiveWalkConstruct),
+        false,
+        vec![
+            native_parameter("iterator", recursive_source.clone(), None, Span::empty(0)),
+            native_parameter(
+                "mode",
+                Type::Int,
+                Some(ExprKind::Integer(0)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    for (method, builtin, result) in [
+        ("rewind", Builtin::IteratorRewind, Type::Void),
+        ("valid", Builtin::IteratorValid, Type::Bool),
+        ("key", Builtin::IteratorKey, walk_params[0].clone()),
+        ("value", Builtin::IteratorValue, walk_params[1].clone()),
+        ("advance", Builtin::IteratorAdvance, Type::Void),
+    ] {
+        add_native_method(
+            &mut classes,
+            "RecursiveIteratorIterator",
+            method,
+            Some(builtin),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "setMaxDepth",
+        Some(Builtin::RecursiveWalkSetMaxDepth),
+        false,
+        vec![native_parameter(
+            "max_depth",
+            Type::Int,
+            Some(ExprKind::Integer(-1)),
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getMaxDepth",
+        Some(Builtin::RecursiveWalkGetMaxDepth),
+        false,
+        vec![],
+        normalize_union(vec![Type::Int, Type::Bool]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getDepth",
+        Some(Builtin::RecursiveWalkGetDepth),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getSubIterator",
+        Some(Builtin::RecursiveWalkGetSubIterator),
+        false,
+        vec![native_parameter(
+            "level",
+            normalize_union(vec![Type::Int, Type::Null]),
+            Some(ExprKind::Null),
+            Span::empty(0),
+        )],
+        normalize_union(vec![recursive_source.clone(), Type::Null]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveIteratorIterator",
+        "getRecursiveIterator",
+        Some(Builtin::RecursiveWalkGetRecursiveIterator),
+        false,
+        vec![],
+        recursive_source,
+        false,
+    );
+    for name in [
+        "beginIteration",
+        "beginChildren",
+        "endChildren",
+        "endIteration",
+        "nextElement",
+    ] {
+        add_native_method(
+            &mut classes,
+            "RecursiveIteratorIterator",
+            name,
+            Some(Builtin::RecursiveWalkHook),
+            false,
+            vec![],
+            Type::Void,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "AppendIterator",
+        "getIteratorIndex",
+        Some(Builtin::AppendGetIndex),
+        false,
+        vec![],
+        normalize_union(vec![Type::Int, Type::Null]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "AppendIterator",
+        "getArrayIterator",
+        Some(Builtin::AppendGetIterator),
+        false,
+        vec![],
+        Type::Nominal {
+            name: "VectorIterator".to_owned(),
+            arguments: vec![append_inner],
+        },
+        false,
+    );
+    for name in ["FilterIterator", "CallbackFilterIterator"] {
+        let params = classes[name]
+            .type_parameters
+            .iter()
+            .map(|p| Type::Parameter {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let inner = Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: params.clone(),
+        };
+        let mut constructor = vec![native_parameter(
+            "iterator",
+            inner.clone(),
+            None,
+            Span::empty(0),
+        )];
+        if name == "CallbackFilterIterator" {
+            constructor.push(native_parameter(
+                "callback",
+                Type::Callable(
+                    vec![params[1].clone(), params[0].clone()],
+                    Box::new(Type::Bool),
+                ),
+                None,
+                Span::empty(0),
+            ));
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "__construct",
+            Some(if name == "CallbackFilterIterator" {
+                Builtin::CallbackFilterConstruct
+            } else {
+                Builtin::IteratorConstruct
+            }),
+            false,
+            constructor,
+            Type::Void,
+            false,
+        );
+        for (method, builtin, result) in [
+            ("rewind", Builtin::IteratorRewind, Type::Void),
+            ("valid", Builtin::IteratorValid, Type::Bool),
+            ("key", Builtin::IteratorKey, params[0].clone()),
+            ("value", Builtin::IteratorValue, params[1].clone()),
+            ("advance", Builtin::IteratorAdvance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                name,
+                method,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+        add_native_method(
+            &mut classes,
+            name,
+            "getInnerIterator",
+            Some(Builtin::IteratorGetInner),
+            false,
+            vec![],
+            inner,
+            false,
+        );
+        add_native_method(
+            &mut classes,
+            name,
+            "accept",
+            (name == "CallbackFilterIterator").then_some(Builtin::CallbackFilterAccept),
+            false,
+            vec![
+                native_parameter("value", params[1].clone(), None, Span::empty(0)),
+                native_parameter("key", params[0].clone(), None, Span::empty(0)),
+            ],
+            Type::Bool,
+            name == "FilterIterator",
+        );
+    }
     add_native_method(
         &mut classes,
         "Throwable",
@@ -4185,6 +10623,24 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         throwable_vector.clone(),
         true,
     );
+    for (name, result) in [
+        ("getFile", Type::String),
+        ("getLine", Type::Int),
+        ("getTrace", trace_vector.clone()),
+        ("getTraceAsString", Type::String),
+        ("__toString", Type::String),
+    ] {
+        add_native_method(
+            &mut classes,
+            "Throwable",
+            name,
+            None,
+            false,
+            vec![],
+            result,
+            true,
+        );
+    }
     add_native_method(
         &mut classes,
         "Closeable",
@@ -4205,9 +10661,46 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         Type::Bool,
         true,
     );
+    for (name, builtin) in [
+        ("isReadable", Builtin::StreamIsReadable),
+        ("isWritable", Builtin::StreamIsWritable),
+        ("isSeekable", Builtin::StreamIsSeekable),
+    ] {
+        add_native_method(
+            &mut classes,
+            "Stream",
+            name,
+            None,
+            false,
+            vec![],
+            Type::Bool,
+            true,
+        );
+        for class in [
+            "MemoryStream",
+            "TempStream",
+            "ReadableFileStream",
+            "WritableFileStream",
+            "ReadWriteFileStream",
+            "RequestInputStream",
+            "ReadableUriStream",
+            "WritableUriStream",
+        ] {
+            add_native_method(
+                &mut classes,
+                class,
+                name,
+                Some(builtin),
+                false,
+                vec![],
+                Type::Bool,
+                false,
+            );
+        }
+    }
     add_native_method(
         &mut classes,
-        "ReadableStream",
+        "SeekableStream",
         "tell",
         None,
         false,
@@ -4253,6 +10746,16 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
     add_native_method(
         &mut classes,
         "WritableStream",
+        "write",
+        None,
+        false,
+        vec![native_parameter("data", Type::String, None, Span::empty(0))],
+        Type::Int,
+        true,
+    );
+    add_native_method(
+        &mut classes,
+        "WritableStream",
         "writeAll",
         None,
         false,
@@ -4267,17 +10770,30 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
     );
     add_native_method(
         &mut classes,
+        "WritableStream",
+        "flush",
+        None,
+        false,
+        vec![],
+        Type::Void,
+        true,
+    );
+    add_native_method(
+        &mut classes,
         "SeekableStream",
         "seek",
         None,
         false,
-        vec![native_parameter(
-            "position",
-            Type::Int,
-            None,
-            Span::empty(0),
-        )],
-        Type::Void,
+        vec![
+            native_parameter("offset", Type::Int, None, Span::empty(0)),
+            native_parameter(
+                "from",
+                Type::Int,
+                Some(ExprKind::Integer(0)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Int,
         true,
     );
 
@@ -4351,6 +10867,28 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             throwable_vector.clone(),
             false,
         );
+        for (name, builtin, result) in [
+            ("getFile", Builtin::ExceptionGetFile, Type::String),
+            ("getLine", Builtin::ExceptionGetLine, Type::Int),
+            ("getTrace", Builtin::ExceptionGetTrace, trace_vector.clone()),
+            (
+                "getTraceAsString",
+                Builtin::ExceptionGetTraceAsString,
+                Type::String,
+            ),
+            ("__toString", Builtin::ExceptionToString, Type::String),
+        ] {
+            add_native_method(
+                &mut classes,
+                class,
+                name,
+                Some(builtin),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
     }
     add_native_method(
         &mut classes,
@@ -4373,7 +10911,16 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
         false,
     );
 
-    for class in ["MemoryStream", "TempStream", "ReadableFileStream"] {
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "ReadableFileStream",
+        "WritableFileStream",
+        "ReadWriteFileStream",
+        "RequestInputStream",
+        "ReadableUriStream",
+        "WritableUriStream",
+    ] {
         add_native_method(
             &mut classes,
             class,
@@ -4394,16 +10941,15 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Type::Bool,
             false,
         );
-        add_native_method(
-            &mut classes,
-            class,
-            "tell",
-            Some(Builtin::StreamTell),
-            false,
-            vec![],
-            Type::Int,
-            false,
-        );
+    }
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "ReadableFileStream",
+        "ReadWriteFileStream",
+        "RequestInputStream",
+        "ReadableUriStream",
+    ] {
         add_native_method(
             &mut classes,
             class,
@@ -4440,7 +10986,33 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             false,
         );
     }
-    for class in ["MemoryStream", "TempStream"] {
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "WritableFileStream",
+        "ReadWriteFileStream",
+        "WritableUriStream",
+    ] {
+        add_native_method(
+            &mut classes,
+            class,
+            "write",
+            Some(Builtin::StreamWrite),
+            false,
+            vec![native_parameter("data", Type::String, None, Span::empty(0))],
+            Type::Int,
+            false,
+        );
+        add_native_method(
+            &mut classes,
+            class,
+            "flush",
+            Some(Builtin::StreamFlush),
+            false,
+            vec![],
+            Type::Void,
+            false,
+        );
         add_native_method(
             &mut classes,
             class,
@@ -4456,23 +11028,1086 @@ fn native_nominals() -> BTreeMap<String, ClassSignature> {
             Type::Void,
             false,
         );
+    }
+    for class in [
+        "MemoryStream",
+        "TempStream",
+        "ReadableFileStream",
+        "WritableFileStream",
+        "ReadWriteFileStream",
+        "ReadableUriStream",
+        "WritableUriStream",
+    ] {
+        add_native_method(
+            &mut classes,
+            class,
+            "tell",
+            Some(Builtin::StreamTell),
+            false,
+            vec![],
+            Type::Int,
+            false,
+        );
         add_native_method(
             &mut classes,
             class,
             "seek",
             Some(Builtin::StreamSeek),
             false,
-            vec![native_parameter(
-                "position",
-                Type::Int,
-                None,
-                Span::empty(0),
-            )],
-            Type::Void,
+            vec![
+                native_parameter("offset", Type::Int, None, Span::empty(0)),
+                native_parameter(
+                    "from",
+                    Type::Int,
+                    Some(ExprKind::Integer(0)),
+                    Span::empty(0),
+                ),
+            ],
+            Type::Int,
             false,
         );
     }
+    {
+        let class = classes
+            .get_mut("SplFileInfo")
+            .expect("native file info exists");
+        class.declared_properties.push(Property {
+            id: PropertyId(0),
+            name: "__path".to_owned(),
+            ty: Type::String,
+            visibility: Visibility::Private,
+            declaring_class: class.id,
+            default: None,
+            origin_trait: None,
+            span: Span::empty(0),
+        });
+        class.declared_property_initializers.push(None);
+    }
     classes
+        .get_mut("SplFileObject")
+        .expect("native file iterator exists")
+        .interface_types = vec![Type::Nominal {
+        name: "SeekableIterator".to_owned(),
+        arguments: vec![Type::Int, Type::String],
+    }];
+    classes
+        .get_mut("DirectoryIterator")
+        .expect("native directory iterator exists")
+        .interface_types = vec![
+        Type::Nominal {
+            name: "SeekableIterator".to_owned(),
+            arguments: vec![Type::Int, Type::Object("SplFileInfo".to_owned())],
+        },
+        Type::Object("Stringable".to_owned()),
+    ];
+    classes
+        .get_mut("FilesystemIterator")
+        .expect("native filesystem iterator exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Iterator".to_owned(),
+        arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+    }];
+    classes
+        .get_mut("RecursiveDirectoryIterator")
+        .expect("native recursive directory iterator exists")
+        .interface_types = vec![Type::Nominal {
+        name: "RecursiveIterator".to_owned(),
+        arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+    }];
+    classes
+        .get_mut("GlobIterator")
+        .expect("native glob iterator exists")
+        .interface_types = vec![
+        Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+        },
+        Type::Object("Countable".to_owned()),
+    ];
+    let file_info_string = normalize_union(vec![Type::String, Type::Bool]);
+    let file_info_int = normalize_union(vec![Type::Int, Type::Bool]);
+    add_native_method(
+        &mut classes,
+        "SplFileInfo",
+        "__construct",
+        Some(Builtin::FileInfo(FileInfoBuiltin::Construct)),
+        false,
+        vec![native_parameter(
+            "filename",
+            Type::String,
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    for (name, operation) in [
+        ("getPath", FileInfoBuiltin::Path),
+        ("getPathname", FileInfoBuiltin::Pathname),
+        ("getFilename", FileInfoBuiltin::Filename),
+        ("getExtension", FileInfoBuiltin::Extension),
+        ("__toString", FileInfoBuiltin::ToString),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            Type::String,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "SplFileInfo",
+        "getBasename",
+        Some(Builtin::FileInfo(FileInfoBuiltin::Basename)),
+        false,
+        vec![native_parameter(
+            "suffix",
+            Type::String,
+            Some(ExprKind::String(Vec::new())),
+            Span::empty(0),
+        )],
+        Type::String,
+        false,
+    );
+    for (name, operation) in [
+        ("getRealPath", FileInfoBuiltin::RealPath),
+        ("getLinkTarget", FileInfoBuiltin::LinkTarget),
+        ("getType", FileInfoBuiltin::Type),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            file_info_string.clone(),
+            false,
+        );
+    }
+    for (name, operation) in [
+        ("isFile", FileInfoBuiltin::IsFile),
+        ("isDir", FileInfoBuiltin::IsDir),
+        ("isLink", FileInfoBuiltin::IsLink),
+        ("isReadable", FileInfoBuiltin::IsReadable),
+        ("isWritable", FileInfoBuiltin::IsWritable),
+        ("isExecutable", FileInfoBuiltin::IsExecutable),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            Type::Bool,
+            false,
+        );
+    }
+    for (name, operation) in [
+        ("getSize", FileInfoBuiltin::Size),
+        ("getATime", FileInfoBuiltin::ATime),
+        ("getMTime", FileInfoBuiltin::MTime),
+        ("getCTime", FileInfoBuiltin::CTime),
+        ("getPerms", FileInfoBuiltin::Perms),
+        ("getOwner", FileInfoBuiltin::Owner),
+        ("getGroup", FileInfoBuiltin::Group),
+        ("getInode", FileInfoBuiltin::Inode),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileInfo",
+            name,
+            Some(Builtin::FileInfo(operation)),
+            false,
+            vec![],
+            file_info_int.clone(),
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "SplFileObject",
+        "__construct",
+        Some(Builtin::FileObject(FileObjectBuiltin::Construct)),
+        false,
+        vec![native_parameter(
+            "filename",
+            Type::String,
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    for (name, operation, result) in [
+        ("rewind", FileObjectBuiltin::Rewind, Type::Void),
+        ("valid", FileObjectBuiltin::Valid, Type::Bool),
+        ("key", FileObjectBuiltin::Key, Type::Int),
+        ("value", FileObjectBuiltin::Value, Type::String),
+        ("advance", FileObjectBuiltin::Advance, Type::Void),
+        ("fgets", FileObjectBuiltin::Fgets, Type::String),
+        ("eof", FileObjectBuiltin::Eof, Type::Bool),
+        ("ftell", FileObjectBuiltin::Ftell, Type::Int),
+    ] {
+        add_native_method(
+            &mut classes,
+            "SplFileObject",
+            name,
+            Some(Builtin::FileObject(operation)),
+            false,
+            vec![],
+            result,
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "SplFileObject",
+        "seek",
+        Some(Builtin::FileObject(FileObjectBuiltin::Seek)),
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "SplFileObject",
+        "fread",
+        Some(Builtin::FileObject(FileObjectBuiltin::Fread)),
+        false,
+        vec![native_parameter("length", Type::Int, None, Span::empty(0))],
+        normalize_union(vec![Type::String, Type::Bool]),
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructDirectory)),
+        false,
+        vec![native_parameter(
+            "directory",
+            Type::String,
+            None,
+            Span::empty(0),
+        )],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructFilesystem)),
+        false,
+        vec![
+            native_parameter("directory", Type::String, None, Span::empty(0)),
+            native_parameter(
+                "skipDots",
+                Type::Bool,
+                Some(ExprKind::Bool(true)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "followSymlinks",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "unixPaths",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructRecursive)),
+        false,
+        vec![
+            native_parameter("directory", Type::String, None, Span::empty(0)),
+            native_parameter(
+                "skipDots",
+                Type::Bool,
+                Some(ExprKind::Bool(true)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "followSymlinks",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "unixPaths",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "GlobIterator",
+        "__construct",
+        Some(Builtin::Directory(DirectoryBuiltin::ConstructGlob)),
+        false,
+        vec![
+            native_parameter("pattern", Type::String, None, Span::empty(0)),
+            native_parameter(
+                "followSymlinks",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+            native_parameter(
+                "unixPaths",
+                Type::Bool,
+                Some(ExprKind::Bool(false)),
+                Span::empty(0),
+            ),
+        ],
+        Type::Void,
+        false,
+    );
+    for class in [
+        "DirectoryIterator",
+        "FilesystemIterator",
+        "RecursiveDirectoryIterator",
+        "GlobIterator",
+    ] {
+        for (name, operation, result) in [
+            ("rewind", DirectoryBuiltin::Rewind, Type::Void),
+            ("valid", DirectoryBuiltin::Valid, Type::Bool),
+            ("advance", DirectoryBuiltin::Advance, Type::Void),
+        ] {
+            add_native_method(
+                &mut classes,
+                class,
+                name,
+                Some(Builtin::Directory(operation)),
+                false,
+                vec![],
+                result,
+                false,
+            );
+        }
+    }
+    for class in ["DirectoryIterator", "FilesystemIterator", "GlobIterator"] {
+        add_native_method(
+            &mut classes,
+            class,
+            "value",
+            Some(Builtin::Directory(DirectoryBuiltin::Value)),
+            false,
+            vec![],
+            Type::Object("SplFileInfo".to_owned()),
+            false,
+        );
+    }
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyInt)),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "GlobIterator",
+        "key",
+        Some(Builtin::Directory(DirectoryBuiltin::KeyPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "value",
+        Some(Builtin::Directory(DirectoryBuiltin::RecursiveValue)),
+        false,
+        vec![],
+        Type::Nominal {
+            name: "RecursiveEntry".to_owned(),
+            arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+        },
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "seek",
+        Some(Builtin::Directory(DirectoryBuiltin::Seek)),
+        false,
+        vec![native_parameter("offset", Type::Int, None, Span::empty(0))],
+        Type::Void,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "isDot",
+        Some(Builtin::Directory(DirectoryBuiltin::IsDot)),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "DirectoryIterator",
+        "__toString",
+        Some(Builtin::Directory(DirectoryBuiltin::ToString)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "skipsDots",
+        Some(Builtin::Directory(DirectoryBuiltin::SkipsDots)),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "FilesystemIterator",
+        "followsSymlinks",
+        Some(Builtin::Directory(DirectoryBuiltin::FollowsSymlinks)),
+        false,
+        vec![],
+        Type::Bool,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "getSubPath",
+        Some(Builtin::Directory(DirectoryBuiltin::GetSubPath)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "RecursiveDirectoryIterator",
+        "getSubPathname",
+        Some(Builtin::Directory(DirectoryBuiltin::GetSubPathname)),
+        false,
+        vec![],
+        Type::String,
+        false,
+    );
+    add_native_method(
+        &mut classes,
+        "GlobIterator",
+        "count",
+        Some(Builtin::Directory(DirectoryBuiltin::Count)),
+        false,
+        vec![],
+        Type::Int,
+        false,
+    );
+    add_reflection_api(&mut classes);
+    add_async_api(&mut classes);
+    classes
+}
+
+fn add_async_api(classes: &mut BTreeMap<String, ClassSignature>) {
+    let span = Span::empty(0);
+    for name in ["Awaitable", "Completable", "Coroutine"] {
+        let class = classes.get_mut(name).expect("async nominal exists");
+        class.type_parameters.push(TypeParameter {
+            id: TypeParameterId {
+                owner: class.id,
+                index: 0,
+            },
+            name: "T".to_owned(),
+            bound: None,
+            span,
+        });
+    }
+    let complete_parameter = Type::Parameter {
+        id: classes["Completable"].type_parameters[0].id,
+        name: "T".to_owned(),
+    };
+    let coroutine_parameter = Type::Parameter {
+        id: classes["Coroutine"].type_parameters[0].id,
+        name: "T".to_owned(),
+    };
+    classes
+        .get_mut("Completable")
+        .expect("async nominal exists")
+        .parent_type = Some(Type::Nominal {
+        name: "Awaitable".to_owned(),
+        arguments: vec![complete_parameter.clone()],
+    });
+    classes
+        .get_mut("Coroutine")
+        .expect("async nominal exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Completable".to_owned(),
+        arguments: vec![coroutine_parameter.clone()],
+    }];
+    classes
+        .get_mut("Timeout")
+        .expect("async nominal exists")
+        .interface_types = vec![Type::Nominal {
+        name: "Completable".to_owned(),
+        arguments: vec![Type::Mixed],
+    }];
+    let callback = Type::Callable(vec![], Box::new(Type::Void));
+    let notify = vec![native_parameter("notify", callback.clone(), None, span)];
+    for (name, result) in [
+        ("Completable", complete_parameter),
+        ("Coroutine", coroutine_parameter),
+        ("Timeout", Type::Mixed),
+    ] {
+        let abstract_method = name == "Completable";
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineCancel),
+            "Timeout" => Some(Builtin::TimeoutCancel),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "cancel",
+            operation,
+            false,
+            vec![],
+            Type::Void,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineIsCompleted),
+            "Timeout" => Some(Builtin::TimeoutIsCompleted),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "isCompleted",
+            operation,
+            false,
+            vec![],
+            Type::Bool,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineIsCancelled),
+            "Timeout" => Some(Builtin::TimeoutIsCancelled),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "isCancelled",
+            operation,
+            false,
+            vec![],
+            Type::Bool,
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineSubscribe),
+            "Timeout" => Some(Builtin::TimeoutSubscribe),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "subscribe",
+            operation,
+            false,
+            notify.clone(),
+            callback.clone(),
+            abstract_method,
+        );
+        let operation = match name {
+            "Coroutine" => Some(Builtin::CoroutineResult),
+            "Timeout" => Some(Builtin::TimeoutResult),
+            _ => None,
+        };
+        add_native_method(
+            classes,
+            name,
+            "result",
+            operation,
+            false,
+            vec![],
+            result,
+            abstract_method,
+        );
+    }
+    for (method, builtin) in [
+        ("getId", Builtin::CoroutineGetId),
+        ("isStarted", Builtin::CoroutineIsStarted),
+        ("isQueued", Builtin::CoroutineIsQueued),
+        ("isRunning", Builtin::CoroutineIsRunning),
+        ("isSuspended", Builtin::CoroutineIsSuspended),
+    ] {
+        add_native_method(
+            classes,
+            "Coroutine",
+            method,
+            Some(builtin),
+            false,
+            vec![],
+            if method == "getId" {
+                Type::Int
+            } else {
+                Type::Bool
+            },
+            false,
+        );
+    }
+    add_native_method(
+        classes,
+        "SchedulerInterface",
+        "chooseNext",
+        None,
+        false,
+        vec![native_parameter(
+            "ready",
+            Type::Vector(Box::new(Type::Int)),
+            None,
+            span,
+        )],
+        Type::Int,
+        true,
+    );
+}
+
+fn add_reflection_api(classes: &mut BTreeMap<String, ClassSignature>) {
+    use ReflectionBuiltin as R;
+
+    let object = |name: &str| Type::Object(name.to_owned());
+    let nullable = |name: &str| normalize_union(vec![object(name), Type::Null]);
+    let vector = |name: &str| Type::Vector(Box::new(object(name)));
+    let arguments = normalize_union(vec![
+        Type::Vector(Box::new(Type::Mixed)),
+        Type::Map(Box::new(Type::String), Box::new(Type::Mixed)),
+    ]);
+    let empty_arguments = Some(ExprKind::Vector(Vec::new()));
+    let p = |name: &str, ty: Type, default: Option<ExprKind>| {
+        native_parameter(name, ty, default, Span::empty(0))
+    };
+    let mut add = |class: &str,
+                   name: &str,
+                   operation: R,
+                   static_method: bool,
+                   parameters: Vec<ParameterSignature>,
+                   result: Type| {
+        add_native_method(
+            classes,
+            class,
+            name,
+            Some(Builtin::Reflection(operation)),
+            static_method,
+            parameters,
+            result,
+            false,
+        );
+    };
+
+    for (name, operation, parameters, result) in [
+        ("allowsNull", R::TypeAllowsNull, vec![], Type::Bool),
+        (
+            "getDisplayName",
+            R::TypeGetDisplayName,
+            vec![],
+            Type::String,
+        ),
+        (
+            "equals",
+            R::TypeEquals,
+            vec![p("other", object("ReflectionType"), None)],
+            Type::Bool,
+        ),
+        (
+            "isAssignableFrom",
+            R::TypeIsAssignableFrom,
+            vec![p("other", object("ReflectionType"), None)],
+            Type::Bool,
+        ),
+    ] {
+        add("ReflectionType", name, operation, false, parameters, result);
+    }
+    for (name, operation, result) in [
+        ("getName", R::NamedTypeGetName, Type::String),
+        ("isBuiltin", R::NamedTypeIsBuiltin, Type::Bool),
+        ("isTypeParameter", R::NamedTypeIsTypeParameter, Type::Bool),
+        (
+            "getTypeArguments",
+            R::NamedTypeGetTypeArguments,
+            vector("ReflectionType"),
+        ),
+    ] {
+        add(
+            "ReflectionNamedType",
+            name,
+            operation,
+            false,
+            vec![],
+            result,
+        );
+    }
+    add(
+        "ReflectionUnionType",
+        "getTypes",
+        R::UnionTypeGetTypes,
+        false,
+        vec![],
+        vector("ReflectionType"),
+    );
+
+    add(
+        "ReflectionClass",
+        "__construct",
+        R::ClassConstruct,
+        false,
+        vec![p("objectOrClass", Type::Mixed, None)],
+        Type::Void,
+    );
+    for (name, operation, result) in [
+        ("getName", R::ClassGetName, Type::String),
+        ("getShortName", R::ClassGetShortName, Type::String),
+        ("getNamespaceName", R::ClassGetNamespaceName, Type::String),
+        ("getModuleName", R::ClassGetModuleName, Type::String),
+        ("getType", R::ClassGetType, nullable("ReflectionNamedType")),
+        ("isAbstract", R::ClassIsAbstract, Type::Bool),
+        ("isFinal", R::ClassIsFinal, Type::Bool),
+        ("isInterface", R::ClassIsInterface, Type::Bool),
+        ("isTrait", R::ClassIsTrait, Type::Bool),
+        ("isInternal", R::ClassIsInternal, Type::Bool),
+        ("isUserDefined", R::ClassIsUserDefined, Type::Bool),
+        ("isInstantiable", R::ClassIsInstantiable, Type::Bool),
+        (
+            "getParentClass",
+            R::ClassGetParentClass,
+            nullable("ReflectionClass"),
+        ),
+        (
+            "getInterfaces",
+            R::ClassGetInterfaces,
+            vector("ReflectionClass"),
+        ),
+        ("getTraits", R::ClassGetTraits, vector("ReflectionClass")),
+        (
+            "getConstructor",
+            R::ClassGetConstructor,
+            nullable("ReflectionMethod"),
+        ),
+        (
+            "getDeclaredMethods",
+            R::ClassGetDeclaredMethods,
+            vector("ReflectionMethod"),
+        ),
+        ("getMethods", R::ClassGetMethods, vector("ReflectionMethod")),
+        (
+            "getDeclaredProperties",
+            R::ClassGetDeclaredProperties,
+            vector("ReflectionProperty"),
+        ),
+        (
+            "getProperties",
+            R::ClassGetProperties,
+            vector("ReflectionProperty"),
+        ),
+    ] {
+        add("ReflectionClass", name, operation, false, vec![], result);
+    }
+    for (name, operation, result) in [
+        (
+            "getDeclaredMethod",
+            R::ClassGetDeclaredMethod,
+            nullable("ReflectionMethod"),
+        ),
+        ("getMethod", R::ClassGetMethod, object("ReflectionMethod")),
+        ("hasMethod", R::ClassHasMethod, Type::Bool),
+        (
+            "getDeclaredProperty",
+            R::ClassGetDeclaredProperty,
+            object("ReflectionProperty"),
+        ),
+        (
+            "getProperty",
+            R::ClassGetProperty,
+            nullable("ReflectionProperty"),
+        ),
+        ("hasProperty", R::ClassHasProperty, Type::Bool),
+    ] {
+        add(
+            "ReflectionClass",
+            name,
+            operation,
+            false,
+            vec![p("name", Type::String, None)],
+            result,
+        );
+    }
+    add(
+        "ReflectionClass",
+        "newInstanceArgs",
+        R::ClassNewInstanceArgs,
+        false,
+        vec![p("arguments", arguments.clone(), empty_arguments.clone())],
+        Type::Mixed,
+    );
+
+    for (name, operation, result) in [
+        ("getName", R::CallableGetName, Type::String),
+        ("getShortName", R::CallableGetShortName, Type::String),
+        (
+            "getNamespaceName",
+            R::CallableGetNamespaceName,
+            Type::String,
+        ),
+        ("getModuleName", R::CallableGetModuleName, Type::String),
+        (
+            "getNumberOfParameters",
+            R::CallableGetNumberOfParameters,
+            Type::Int,
+        ),
+        (
+            "getNumberOfRequiredParameters",
+            R::CallableGetNumberOfRequiredParameters,
+            Type::Int,
+        ),
+        (
+            "getParameters",
+            R::CallableGetParameters,
+            vector("ReflectionParameter"),
+        ),
+        (
+            "getReturnType",
+            R::CallableGetReturnType,
+            object("ReflectionType"),
+        ),
+        ("isVariadic", R::CallableIsVariadic, Type::Bool),
+        ("isInternal", R::CallableIsInternal, Type::Bool),
+        ("isUserDefined", R::CallableIsUserDefined, Type::Bool),
+    ] {
+        add(
+            "ReflectionFunctionAbstract",
+            name,
+            operation,
+            false,
+            vec![],
+            result,
+        );
+    }
+    add(
+        "ReflectionFunction",
+        "__construct",
+        R::FunctionConstruct,
+        false,
+        vec![p("function", Type::String, None)],
+        Type::Void,
+    );
+    add(
+        "ReflectionFunction",
+        "invokeArgs",
+        R::FunctionInvokeArgs,
+        false,
+        vec![p("arguments", arguments.clone(), empty_arguments.clone())],
+        Type::Mixed,
+    );
+
+    for (name, operation, result) in [
+        (
+            "getDeclaringClass",
+            R::MethodGetDeclaringClass,
+            object("ReflectionClass"),
+        ),
+        (
+            "getOriginTrait",
+            R::MethodGetOriginTrait,
+            nullable("ReflectionClass"),
+        ),
+        (
+            "getOriginMethod",
+            R::MethodGetOriginMethod,
+            nullable("ReflectionMethod"),
+        ),
+        ("isPublic", R::MethodIsPublic, Type::Bool),
+        ("isProtected", R::MethodIsProtected, Type::Bool),
+        ("isPrivate", R::MethodIsPrivate, Type::Bool),
+        ("isStatic", R::MethodIsStatic, Type::Bool),
+        ("isAbstract", R::MethodIsAbstract, Type::Bool),
+        ("isFinal", R::MethodIsFinal, Type::Bool),
+        ("isConstructor", R::MethodIsConstructor, Type::Bool),
+    ] {
+        add("ReflectionMethod", name, operation, false, vec![], result);
+    }
+    add(
+        "ReflectionMethod",
+        "__construct",
+        R::MethodConstruct,
+        false,
+        vec![
+            p("objectOrClass", Type::Mixed, None),
+            p("method", Type::String, None),
+        ],
+        Type::Void,
+    );
+    add(
+        "ReflectionMethod",
+        "invokeArgs",
+        R::MethodInvokeArgs,
+        false,
+        vec![
+            p("receiver", Type::Mixed, None),
+            p("arguments", arguments.clone(), empty_arguments.clone()),
+        ],
+        Type::Mixed,
+    );
+
+    for (name, operation, result) in [
+        ("getName", R::PropertyGetName, Type::String),
+        (
+            "getDeclaringClass",
+            R::PropertyGetDeclaringClass,
+            object("ReflectionClass"),
+        ),
+        (
+            "getOriginTrait",
+            R::PropertyGetOriginTrait,
+            nullable("ReflectionClass"),
+        ),
+        ("getType", R::PropertyGetType, object("ReflectionType")),
+        ("hasDefaultValue", R::PropertyHasDefaultValue, Type::Bool),
+        ("getDefaultValue", R::PropertyGetDefaultValue, Type::Mixed),
+        ("isPublic", R::PropertyIsPublic, Type::Bool),
+        ("isProtected", R::PropertyIsProtected, Type::Bool),
+        ("isPrivate", R::PropertyIsPrivate, Type::Bool),
+        ("isStatic", R::PropertyIsStatic, Type::Bool),
+    ] {
+        add("ReflectionProperty", name, operation, false, vec![], result);
+    }
+    add(
+        "ReflectionProperty",
+        "__construct",
+        R::PropertyConstruct,
+        false,
+        vec![
+            p("objectOrClass", Type::Mixed, None),
+            p("property", Type::String, None),
+        ],
+        Type::Void,
+    );
+    add(
+        "ReflectionProperty",
+        "getValue",
+        R::PropertyGetValue,
+        false,
+        vec![p("receiver", Type::Mixed, None)],
+        Type::Mixed,
+    );
+    add(
+        "ReflectionProperty",
+        "setValue",
+        R::PropertySetValue,
+        false,
+        vec![
+            p("receiver", Type::Mixed, None),
+            p("value", Type::Mixed, None),
+        ],
+        Type::Void,
+    );
+
+    for (name, operation, result) in [
+        ("getName", R::ParameterGetName, Type::String),
+        ("getPosition", R::ParameterGetPosition, Type::Int),
+        ("getType", R::ParameterGetType, object("ReflectionType")),
+        (
+            "getDeclaringFunction",
+            R::ParameterGetDeclaringFunction,
+            object("ReflectionFunctionAbstract"),
+        ),
+        (
+            "isDefaultValueAvailable",
+            R::ParameterIsDefaultValueAvailable,
+            Type::Bool,
+        ),
+        ("getDefaultValue", R::ParameterGetDefaultValue, Type::Mixed),
+        ("isOptional", R::ParameterIsOptional, Type::Bool),
+        ("isVariadic", R::ParameterIsVariadic, Type::Bool),
+    ] {
+        add(
+            "ReflectionParameter",
+            name,
+            operation,
+            false,
+            vec![],
+            result,
+        );
+    }
+    add(
+        "ReflectionParameter",
+        "__construct",
+        R::ParameterConstruct,
+        false,
+        vec![
+            p(
+                "function",
+                normalize_union(vec![Type::String, Type::Vector(Box::new(Type::Mixed))]),
+                None,
+            ),
+            p(
+                "parameter",
+                normalize_union(vec![Type::Int, Type::String]),
+                None,
+            ),
+        ],
+        Type::Void,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4490,11 +12125,13 @@ fn add_native_method(
         .get_mut(class_name)
         .expect("native nominal metadata names an existing type");
     let span = Span::empty(0);
+    class.declared_method_order.push(name.to_owned());
     class.declared_methods.insert(
         name.to_owned(),
         MethodSignature {
             signature: Signature {
                 id: FunctionId(u32::MAX),
+                native_index: None,
                 parameters,
                 return_type,
                 span,
@@ -4511,6 +12148,62 @@ fn add_native_method(
             span,
         },
     );
+}
+
+fn parameter_metadata(parameter: &ParameterSignature) -> ParameterMetadata {
+    ParameterMetadata {
+        name: parameter.name.clone(),
+        ty: if parameter.variadic {
+            match &parameter.ty {
+                Type::Vector(element) => element.as_ref().clone(),
+                _ => parameter.ty.clone(),
+            }
+        } else {
+            parameter.ty.clone()
+        },
+        default: parameter.default.as_ref().and_then(constant_value),
+        variadic: parameter.variadic,
+    }
+}
+
+fn method_metadata(
+    name: &str,
+    method: &MethodSignature,
+    class_ids: &BTreeMap<String, ClassId>,
+) -> Method {
+    Method {
+        name: name.to_owned(),
+        callee: method.callee,
+        slot: method.slot,
+        declaring_class: method.declaring_class,
+        visibility: method.visibility,
+        static_method: method.static_method,
+        abstract_method: method.abstract_method,
+        final_method: method.final_method,
+        parameter_types: method
+            .signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.ty.clone())
+            .collect(),
+        parameters: method
+            .signature
+            .parameters
+            .iter()
+            .map(parameter_metadata)
+            .collect(),
+        return_type: method.signature.return_type.clone(),
+        origin_trait: method
+            .origin_trait
+            .as_ref()
+            .and_then(|name| class_ids.get(name))
+            .copied(),
+        origin_name: method
+            .source
+            .as_ref()
+            .map_or_else(|| name.to_owned(), |source| source.function.name.clone()),
+        span: method.span,
+    }
 }
 
 const fn nominal_kind_name(kind: NominalKind) -> &'static str {
@@ -4617,6 +12310,45 @@ fn normalize_union(members: Vec<Type>) -> Type {
     }
 }
 
+fn regex_output_type(mode: i64, flags: i64, input: &Type) -> Option<Type> {
+    let allowed = match mode {
+        0 | 4 | 5 => 0,
+        1 | 2 => 256 | 512,
+        3 => 1 | 2 | 4,
+        _ => return None,
+    };
+    if flags < 0 || flags & !allowed != 0 {
+        return None;
+    }
+    if mode != 5 && input != &Type::String {
+        return None;
+    }
+    let captures = || {
+        Type::Map(
+            Box::new(Type::String),
+            Box::new(if flags & 256 != 0 {
+                Type::Object("RegexCapture".to_owned())
+            } else if flags & 512 != 0 {
+                normalize_union(vec![Type::Null, Type::String])
+            } else {
+                Type::String
+            }),
+        )
+    };
+    Some(match mode {
+        0 | 5 => input.clone(),
+        1 => captures(),
+        2 => Type::Vector(Box::new(captures())),
+        3 => Type::Vector(Box::new(if flags & 4 != 0 {
+            Type::Object("RegexCapture".to_owned())
+        } else {
+            Type::String
+        })),
+        4 => Type::String,
+        _ => return None,
+    })
+}
+
 fn count_expressions(statements: &[Statement]) -> usize {
     statements
         .iter()
@@ -4626,6 +12358,9 @@ fn count_expressions(statements: &[Statement]) -> usize {
             | StatementKind::Echo(value)
             | StatementKind::Throw(value) => count_expression(value),
             StatementKind::Return(value) => value.as_ref().map_or(0, count_expression),
+            StatementKind::Yield { key, value } => {
+                key.as_ref().map_or(0, count_expression) + count_expression(value)
+            }
             StatementKind::If {
                 branches,
                 otherwise,
@@ -4690,6 +12425,10 @@ fn count_expression(expression: &TypedExpr) -> usize {
             count_expression(left) + count_expression(right)
         }
         TypedExprKind::Call { arguments, .. } => count_bound_arguments(arguments),
+        TypedExprKind::Closure { captures, .. } => captures.iter().map(count_expression).sum(),
+        TypedExprKind::CallValue { callee, arguments } => {
+            count_expression(callee) + arguments.iter().map(count_expression).sum::<usize>()
+        }
         TypedExprKind::DirectMethod {
             receiver,
             arguments,
@@ -4729,8 +12468,19 @@ fn count_expression(expression: &TypedExpr) -> usize {
                 .sum::<usize>()
                 + count_bound_arguments(arguments)
         }
+        TypedExprKind::DynamicNew {
+            target, arguments, ..
+        } => {
+            count_expression(target)
+                + arguments
+                    .iter()
+                    .map(|argument| count_expression(&argument.value))
+                    .sum::<usize>()
+        }
+        TypedExprKind::CheckedNarrow { value, .. } | TypedExprKind::InstanceOf { value, .. } => {
+            count_expression(value)
+        }
         TypedExprKind::Property { object, .. } => count_expression(object),
-        TypedExprKind::InstanceOf { value, .. } => count_expression(value),
         TypedExprKind::Match { subject, arms } => {
             count_expression(subject)
                 + arms
@@ -4775,10 +12525,10 @@ fn count_loop_clause(clause: &LoopClause) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use thp_diagnostics::SourceFile;
-    use thp_syntax::parse;
+    use thp_diagnostics::{SourceFile, Span};
+    use thp_syntax::{Expr, ExprKind, StmtKind, parse};
 
-    use super::{Type, lower};
+    use super::{MAX_CONSTANT_NESTING, Type, lower};
 
     fn typecheck(source: &str) -> super::LowerOutput {
         let source = SourceFile::new("test.thp", source);
@@ -4793,6 +12543,281 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect()
+    }
+
+    #[test]
+    fn iterator_function_reports_unknown_argument_once() {
+        assert_eq!(
+            diagnostic_codes("<?thp\niterator_count($missing);"),
+            vec!["N0101"]
+        );
+    }
+
+    fn check_default_nesting(levels: usize) -> (Vec<thp_diagnostics::Diagnostic>, Span, Span) {
+        let source = SourceFile::new(
+            "test.thp",
+            "<?thp\nclass Box { public mixed $value = null; }\nfunction example(mixed $value = true): void {}",
+        );
+        let mut parsed = parse(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut property_span = None;
+        let mut parameter_span = None;
+        for statement in &mut parsed.program.statements {
+            let default = match &mut statement.kind {
+                StmtKind::Class(class) => {
+                    let default = class.properties[0].initializer.as_mut().unwrap();
+                    property_span = Some(default.span);
+                    default
+                }
+                StmtKind::Function(function) => {
+                    let default = function.parameters[0].default.as_mut().unwrap();
+                    parameter_span = Some(default.span);
+                    default
+                }
+                _ => continue,
+            };
+            for _ in 0..levels {
+                let span = default.span;
+                let value = std::mem::replace(
+                    default,
+                    Expr {
+                        kind: ExprKind::Null,
+                        span,
+                    },
+                );
+                *default = Expr {
+                    kind: ExprKind::Vector(vec![value]),
+                    span,
+                };
+            }
+        }
+        let mut checker =
+            super::TypeChecker::new(&parsed.program, &std::collections::BTreeMap::new(), &[]);
+        checker.collect_nominal_names(&parsed.program);
+        checker.collect_signatures(&parsed.program);
+        (
+            checker.diagnostics,
+            property_span.unwrap(),
+            parameter_span.unwrap(),
+        )
+    }
+
+    #[test]
+    fn typed_constant_defaults_enforce_the_collection_nesting_limit() {
+        let (accepted, _, _) = check_default_nesting(MAX_CONSTANT_NESTING);
+        assert!(accepted.is_empty(), "{accepted:?}");
+
+        let (rejected, property_span, parameter_span) =
+            check_default_nesting(MAX_CONSTANT_NESTING + 1);
+        let diagnostics = rejected
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "T0311")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.message == "typed constant defaults may nest at most 128 collection levels"
+        }));
+        let locations = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.labels[0].span)
+            .collect::<Vec<_>>();
+        assert!(locations.contains(&property_span));
+        assert!(locations.contains(&parameter_span));
+    }
+
+    #[test]
+    fn generic_classes_infer_and_substitute_members() {
+        let output = typecheck(
+            r"<?thp
+interface Value<T> {
+    public function value(): T;
+}
+class Box<T> implements Value<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+$box = new Box(42);
+$value: int = $box->value();
+",
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let main = output.module.function(output.module.entry);
+        assert!(matches!(
+            &main.locals[0].ty,
+            Type::Nominal { name, arguments }
+                if name == "Box" && arguments == &[Type::Int]
+        ));
+    }
+
+    #[test]
+    fn generics_enforce_arity_invariance_bounds_and_inference_conflicts() {
+        let codes = diagnostic_codes(
+            r"<?thp
+class Animal {}
+class Dog extends Animal {}
+class Cage<T extends Animal> {
+    public function __construct(T $first, T $second) {}
+}
+$raw: Cage = new Cage<int>(1, 1);
+$dogs: Cage<Dog> = new Cage<Animal>(new Animal(), new Animal());
+$conflict = new Cage(new Dog(), new Animal());
+",
+        );
+        assert!(codes.contains(&"T1002"));
+        assert!(codes.contains(&"T1006"));
+        assert!(codes.contains(&"T0005"));
+        assert!(codes.contains(&"T1011"));
+
+        let declaration_errors = diagnostic_codes(
+            "<?thp\nclass Duplicate<T, T> {}\nclass Unknown<T extends Missing> {}",
+        );
+        assert!(declaration_errors.contains(&"N0010"));
+        assert!(declaration_errors.contains(&"T1003"));
+    }
+
+    #[test]
+    fn generic_hierarchies_compose_substitutions_and_reject_conflicts() {
+        let output = typecheck(
+            r#"<?thp
+interface Root<T> { public function value(): T; }
+interface Left<T> extends Root<T> {}
+class Base<T> implements Left<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+class Child<U> extends Base<U> {}
+class Strings extends Child<string> {}
+$strings = new Strings("ok");
+$root: Root<string> = $strings;
+$value: string = $root->value();
+"#,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+
+        let codes = diagnostic_codes(
+            r"<?thp
+interface Root<T> {}
+interface IntRoot extends Root<int> {}
+interface StringRoot extends Root<string> {}
+abstract class Ambiguous implements IntRoot, StringRoot {}
+",
+        );
+        assert!(codes.contains(&"T1012"));
+    }
+
+    #[test]
+    fn iterator_prelude_enforces_concrete_strategy_rules() {
+        let direct = diagnostic_codes("<?thp\nclass Direct implements Traversable<int, string> {}");
+        assert!(direct.contains(&"T1013"));
+
+        let redundant = diagnostic_codes(
+            "<?thp\nabstract class Cursor implements Iterator<int, string> {}\nclass DirectToo extends Cursor implements Traversable<int, string> {}",
+        );
+        assert!(redundant.contains(&"T1013"));
+
+        let dual = diagnostic_codes(
+            r"<?thp
+abstract class Both implements Iterator<int, string>, IteratorAggregate<int, string> {}
+class Concrete extends Both {}
+",
+        );
+        assert!(dual.contains(&"T1014"));
+
+        let deferred =
+            typecheck("<?thp\nabstract class Deferred implements Traversable<int, string> {}");
+        assert!(
+            deferred.diagnostics.is_empty(),
+            "{:?}",
+            deferred.diagnostics
+        );
+    }
+
+    #[test]
+    fn foreach_accepts_typed_iterators_and_aggregates() {
+        let output = typecheck(
+            r#"<?thp
+class Cursor implements Iterator<int, string> {
+    public function rewind(): void {}
+    public function valid(): bool { return false; }
+    public function key(): int { return 0; }
+    public function value(): string { return ""; }
+    public function advance(): void {}
+}
+class Values implements IteratorAggregate<int, string> {
+    public function getIterator(): Traversable<int, string> { return new Cursor(); }
+}
+function consume(Traversable<int, string> $items): void {
+    foreach ($items as $key => $value) {
+        $typedKey: int = $key;
+        $typedValue: string = $value;
+    }
+}
+foreach (new Cursor() as $key => $value) {}
+foreach (new Values() as $value) {}
+consume(new Values());
+"#,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+
+        let codes = diagnostic_codes(
+            "<?thp\nclass Plain {}\n$nullable: Traversable<int, string>|null = null;\nforeach (new Plain() as $plain) {}\nforeach (\"text\" as $character) {}\nforeach (1 as $number) {}\nforeach ($nullable as $item) {}",
+        );
+        assert_eq!(codes.iter().filter(|code| **code == "T0610").count(), 4);
+    }
+
+    #[test]
+    fn bounded_parameters_allow_members_but_unbounded_parameters_do_not() {
+        let bounded = typecheck(
+            r"<?thp
+interface Named { public function name(): string; }
+interface Source<T extends Named> {}
+class Wrapped<U extends Source<T>, T extends Named> {}
+class Reader<T extends Named> {
+    public function read(T $value): string { return $value->name(); }
+}
+",
+        );
+        assert!(bounded.diagnostics.is_empty(), "{:?}", bounded.diagnostics);
+        let unbounded = diagnostic_codes(
+            r"<?thp
+class Reader<T> {
+    public function read(T $value): string { return $value->name(); }
+}
+",
+        );
+        assert!(unbounded.contains(&"T0402"));
+    }
+
+    #[test]
+    fn constructor_inference_handles_nesting_named_and_variadic_arguments() {
+        let output = typecheck(
+            r#"<?thp
+class Pack<T, U> {
+    public function __construct(vector<T> $items, map<string, U> $labels, T ...$rest) {}
+}
+$named = new Pack(labels: {"one" => "first"}, items: [1]);
+$variadic = new Pack([2], {"two" => "second"}, 3, 4);
+"#,
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let main = output.module.function(output.module.entry);
+        for local in &main.locals[..2] {
+            assert!(matches!(
+                &local.ty,
+                Type::Nominal { name, arguments }
+                    if name == "Pack" && arguments == &[Type::Int, Type::String]
+            ));
+        }
+
+        let underdetermined = diagnostic_codes(
+            r"<?thp
+class Box<T> { public function __construct(vector<T> $items = []) {} }
+$box = new Box();
+",
+        );
+        assert!(underdetermined.contains(&"T1011"));
     }
 
     #[test]
@@ -4948,6 +12973,22 @@ class Reopened extends Closed {}
     }
 
     #[test]
+    fn cyclic_generic_inheritance_does_not_overflow_subtyping() {
+        let codes = diagnostic_codes(
+            r"<?thp
+class A<T> extends B<T> {}
+class B<T> extends A<T> {}
+class C<T> {}
+$value: C<int> = new B<int>();
+throw new B<int>();
+",
+        );
+        assert!(codes.contains(&"T0011"));
+        assert!(codes.contains(&"T0005"));
+        assert!(codes.contains(&"T0008"));
+    }
+
+    #[test]
     fn diagnoses_conflicting_requirements_incomplete_classes_and_overrides() {
         let codes = diagnostic_codes(
             r#"<?thp
@@ -4978,6 +13019,39 @@ class ChildType extends ParentType {
     }
 
     #[test]
+    fn foundational_contracts_reject_missing_or_wrong_methods_and_untyped_none() {
+        let codes = diagnostic_codes(
+            r#"<?thp
+class InvalidCount implements Countable {
+    public function count(): string { return "wrong"; }
+}
+class InvalidString implements Stringable {
+    public function __toString(): int { return 1; }
+}
+class MissingMap implements MapAccess<string, int> {}
+$none = Option::none();
+"#,
+        );
+        assert!(
+            codes.iter().filter(|code| **code == "T0022").count() >= 2,
+            "{codes:?}"
+        );
+        assert!(codes.contains(&"T0024"), "{codes:?}");
+        assert!(codes.contains(&"T1002"), "{codes:?}");
+    }
+
+    #[test]
+    fn option_some_lowers_its_argument_once() {
+        assert_eq!(
+            diagnostic_codes("<?thp\nOption::some($missing);"),
+            vec!["N0101"]
+        );
+        let output = typecheck("<?thp\nOption::some(fn(int $value): int => $value);");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(output.module.functions.len(), 2);
+    }
+
+    #[test]
     fn diagnoses_visibility_property_and_trait_conflicts() {
         let codes = diagnostic_codes(
             r#"<?thp
@@ -5003,8 +13077,6 @@ echo $parent->hidden();
 "#,
         );
         assert!(codes.contains(&"T0027"));
-        assert!(codes.contains(&"T0021"));
-        assert!(codes.contains(&"T0028"));
         assert!(codes.contains(&"T0414"));
     }
 
@@ -5029,5 +13101,41 @@ using ($plain = new Plain()) {}
         assert!(codes.contains(&"T0008"));
         assert!(codes.contains(&"T0451"));
         assert!(codes.contains(&"T0601"));
+    }
+
+    #[test]
+    fn dynamic_new_requires_direct_string_narrowing_and_restores_types() {
+        let codes = diagnostic_codes(
+            r#"<?thp
+class Item { private function __construct() {} public final function value(): string { return "ok"; } }
+$class: mixed = "Item";
+if (is_string($class)) { $item = new $class(); }
+$outside = new $class();
+if (is_string($class) && true) { $composed = new $class(); }
+$number: int = 1;
+$invalid = new $number();
+$static = new Item();
+"#,
+        );
+        assert_eq!(codes.iter().filter(|code| **code == "T0415").count(), 3);
+        assert!(codes.contains(&"T0414"));
+    }
+
+    #[test]
+    fn loop_writes_invalidate_outer_guards_before_repeated_reads() {
+        for statement in [
+            "while (true) { text($value); $value = 1; }",
+            "for (; true;) { text($value); if (true) { $value = 1; } }",
+            "for (; true; $value = 1) { text($value); }",
+            "foreach ([1] as $value) { text($value); }",
+            "foreach ([1] as $value => $item) { text($value); }",
+        ] {
+            let source = format!(
+                "<?thp\nfunction text(string $value): void {{}}\n\
+                 $value: int|string = \"text\";\n\
+                 if (is_string($value)) {{ {statement} }}"
+            );
+            assert!(diagnostic_codes(&source).contains(&"T0005"), "{statement}");
+        }
     }
 }

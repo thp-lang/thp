@@ -12,14 +12,12 @@ returns:
   description: Formats the current entry according to flags.
 errors:
   - description:
-      No additional runtime failure beyond parameter validation and failures
-      propagated by delegated operations is specified.
+      Fails on an exhausted cursor or a selected value that is neither a
+      scalar nor Stringable.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.CachingIterator
 visibility: public

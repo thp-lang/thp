@@ -17,11 +17,9 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
-version: "0.1"
+availability: implemented
+notice: This experimental contract is implemented in the standalone compiler and VM.
+version: "0.5"
 owner: std.spl.EmptyIterator
 visibility: public
 modifiers: []
@@ -38,7 +36,7 @@ This operation does not change receiver state unless the description explicitly 
 ## Example
 
 ```thp
-$instance = new EmptyIterator();
+$instance = new EmptyIterator<int, string>();
 ```
 
 The call uses the signature and defaults documented above.

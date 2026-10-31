@@ -7,6 +7,33 @@ import { renderPage } from "../../src/view/pages.js";
 const root = path.resolve(import.meta.dirname, "../..");
 
 describe("documentation site model", () => {
+  it("marks every Throwable class hierarchy as an exception", async () => {
+    const model = await createModel({ root, basePath: "/typed-php/" });
+    const page = model.pages.find(
+      (item) => item.source.data.id === "std.baseTypes.Throwable",
+    )!;
+    const html = renderPage(model, page);
+    const sidebarLink = (route: string, name: string, kind: string) =>
+      `<a class="symbol-link" href="/typed-php${route}"><span class="symbol-kind-icon symbol-kind-${kind}" data-symbol-kind="${kind}" aria-hidden="true">${kind === "exception" ? "X" : "C"}</span><span class="sidebar-symbol-name">${name}</span></a>`;
+
+    expect(html).toContain(
+      sidebarLink("/std/base-types/exception/", "Exception", "exception"),
+    );
+    expect(html).toContain(
+      sidebarLink("/std/base-types/error/", "Error", "exception"),
+    );
+    expect(html).toContain(
+      sidebarLink(
+        "/std/base-types/unhandled-match-error/",
+        "UnhandledMatchError",
+        "exception",
+      ),
+    );
+    expect(html).toContain(
+      sidebarLink("/std/base-types/trace-line/", "TraceLine", "class"),
+    );
+  });
+
   it("resolves the complete SplQueue synopsis to canonical owners", async () => {
     const model = await createModel({ root });
     const queue = model.types.get("std.spl.SplQueue")!;
@@ -135,12 +162,12 @@ describe("documentation site model", () => {
     const byKind = (kind: string) =>
       standardLibraryPages.filter((page) => page.source.data.kind === kind);
 
-    expect(standardLibraryPages).toHaveLength(456);
-    expect(byKind("module")).toHaveLength(9);
-    expect(byKind("class").length + byKind("interface").length).toBe(91);
+    expect(standardLibraryPages).toHaveLength(661);
+    expect(byKind("module")).toHaveLength(10);
+    expect(byKind("class").length + byKind("interface").length).toBe(122);
     expect(byKind("enum")).toHaveLength(3);
-    expect(byKind("method")).toHaveLength(330);
-    expect(byKind("function")).toHaveLength(23);
+    expect(byKind("method")).toHaveLength(488);
+    expect(byKind("function")).toHaveLength(38);
     expect(
       byKind("module").map((page) => [page.source.data.id, page.route]),
     ).toEqual([
@@ -152,6 +179,7 @@ describe("documentation site model", () => {
       ["std.filesystem", "/std/filesystem/"],
       ["std.index", "/std/"],
       ["std.iterators", "/std/iterators/"],
+      ["std.reflection", "/std/reflection/"],
       ["std.streams", "/std/streams/"],
     ]);
     expect(model.config.navigation).toContainEqual({
@@ -320,7 +348,7 @@ describe("documentation site model", () => {
       basePath: "/",
       siteUrl: "https://example.github.io",
     });
-    expect(rootModel.pages).toHaveLength(491);
+    expect(rootModel.pages).toHaveLength(701);
     const subpathModel = await build({
       root,
       basePath: "/typed-php/",
@@ -446,7 +474,7 @@ describe("documentation site model", () => {
         return a.source.data.nav.order - b.source.data.nav.order;
       });
 
-    expect(languagePages).toHaveLength(19);
+    expect(languagePages).toHaveLength(20);
     expect(languagePages.map((page) => page.source.data.title)).toEqual([
       "Overview",
       "Basic syntax",
@@ -459,6 +487,7 @@ describe("documentation site model", () => {
       "Functions",
       "Classes and objects",
       "Namespaces",
+      "Reflection",
       "Enumerations",
       "Errors",
       "Exceptions",
@@ -547,7 +576,9 @@ describe("documentation site model", () => {
       (page) => page.source.data.id === "docs.home",
     )!;
     const homeHtml = renderPage(model, home);
-    expect(homeHtml).toContain('<h2 id="internals">Internals</h2>');
+    expect(homeHtml).toContain(
+      '<h2 id="choose-your-path">Choose your path</h2>',
+    );
     expect(homeHtml).toContain('href="/typed-php/internals/overview/"');
     expect(homeHtml).not.toContain('href="/typed-php/#project"');
   });

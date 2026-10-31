@@ -22,10 +22,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: This adapter executes through the common Iterator<K, V> cursor protocol.
 version: "0.1"
 ---
 
@@ -40,6 +38,9 @@ version: "0.1"
 ## Behavior
 
 Traversal skips the initial offset and yields at most `$limit` values; `-1` means no upper limit. Positions are relative to the limited view.
+
+`seek()` rewinds and advances the wrapped iterator to the requested view
+position. It fails if that position is not available.
 
 ## Errors
 

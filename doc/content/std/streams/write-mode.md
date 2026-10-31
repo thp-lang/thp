@@ -16,11 +16,8 @@ cases:
   - Create
   - CreateExclusive
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: All five modes execute in both writable file factories.
 version: "0.1"
 ---
 

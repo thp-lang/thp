@@ -19,10 +19,8 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: implemented
+notice: This experimental recursive filter is implemented with a typed callback.
 version: "0.1"
 ---
 
@@ -37,7 +35,8 @@ version: "0.1"
 ## Behavior
 
 The callback decides whether an entry is yielded. It receives the complete
-entry, so it may inspect both `value()` and whether `children()` is present.
+entry and its key, so it may inspect both `value()` and whether `children()`
+is present. The same callback is applied to child iterators.
 
 ## Errors
 
@@ -46,7 +45,7 @@ Construction validates the parameters shown above. Cursor operations propagate f
 ## Example
 
 ```thp
-$visible = new RecursiveCallbackFilterIterator<int, Node>($tree, function (RecursiveEntry<Node> $entry): bool {
+$visible = new RecursiveCallbackFilterIterator<int, Node>($tree, function (RecursiveEntry<int, Node> $entry, int $key): bool {
     return !$entry->value()->hidden;
 });
 ```

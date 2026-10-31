@@ -14,11 +14,8 @@ cases:
   - Current
   - End
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: Start, Current, and End origins execute on seekable native streams.
 version: "0.1"
 ---
 

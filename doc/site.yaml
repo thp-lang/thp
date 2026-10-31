@@ -4,12 +4,10 @@ github: https://github.com/thp-lang/thp
 navigation:
   - label: Learn
     href: /learn/getting-started/
-  - label: Implemented Language
+  - label: Language
     href: /language/overview/
   - label: Runtime/API
     href: /std/
-  - label: Design Proposals
-    href: /language/attributes/
   - label: Internals
     href: /internals/overview/
 modules:
@@ -45,7 +43,7 @@ modules:
     typeGroup: Types
   data-structures:
     name: Data structures
-    summary: Generic containers, observers, autoloading, and object utilities.
+    summary: Generic containers, observers, and object utilities.
     order: 60
     typeGroup: Types
   extensions:
@@ -57,4 +55,9 @@ modules:
     name: Streams
     summary: Stream resources, filters, and transport operations.
     order: 70
+    typeGroup: Types
+  reflection:
+    name: Reflection
+    summary: Runtime descriptors for linked types and declarations.
+    order: 75
     typeGroup: Types

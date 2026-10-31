@@ -10,8 +10,8 @@ interfaces: []
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This THP contract is proposed and is not yet implemented in this repository.
+availability: implemented
+notice: The compiler and reference VM implement this experimental contract.
 version: "0.1"
 ---
 
@@ -22,6 +22,9 @@ version: "0.1"
 `__toString()` returns the object's textual representation. A class that
 declares `__toString()` satisfies `Stringable` implicitly, although declaring
 the interface explicitly makes the intent clear.
+The implicit method must be public, take no arguments, return `string`, and be
+an instance method. Explicit method calls perform string conversion; automatic
+`echo` or concatenation conversion of objects is not part of this contract.
 
 ## Example
 

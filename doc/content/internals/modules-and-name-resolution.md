@@ -49,6 +49,15 @@ public declarations into a `ModuleInterface`. An interface records canonical
 exports and an interface hash without requiring dependent modules to inspect
 the implementation body.
 
+The canonical signature includes generic parameter names and bounds,
+instantiated parents and interfaces, properties, constructors, and method
+signatures. Parameter names remain local to their declaration: they are never
+namespace-qualified or emitted as dependency edges. A generic signature or
+bound edit changes the interface hash and invalidates consumers, while a
+method-body-only edit retains interface reuse. The interface artifact format is
+versioned, checksummed, and validated against its expected deterministic
+payload before reuse.
+
 All interfaces feed an `ExportIndex`. Duplicate canonical exports are reported
 with both source locations. The index distinguishes type and function
 declarations, matching THP's separate import kinds.

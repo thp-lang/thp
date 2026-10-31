@@ -19,11 +19,8 @@ errors:
 related:
   - std.streams.Files
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: The compiler and VM implement read-only local-file opening and typed failures.
 version: "0.1"
 owner: std.streams.Files
 visibility: public

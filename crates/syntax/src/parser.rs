@@ -5,9 +5,9 @@ use thp_diagnostics::{Diagnostic, SourceFile, Span};
 use crate::{
     Argument, BinaryOp, Block, CatchClause, ClassDecl, Expr, ExprKind, ForClause, ForClauseKind,
     FunctionDecl, InterfaceDecl, LexOutput, LoopBinding, MapEntry, MatchArm, MethodDecl, NameRef,
-    NamespaceDecl, Parameter, Program, PropertyDecl, QualifiedName, ScopeTarget, Stmt, StmtKind,
-    Token, TokenKind, TraitAdaptation, TraitDecl, TraitUse, TypeSyntax, TypeSyntaxKind, UnaryOp,
-    UseDecl, UseKind, Visibility, lex,
+    NamespaceDecl, NewTarget, NominalRef, Parameter, Program, PropertyDecl, QualifiedName,
+    ScopeTarget, Stmt, StmtKind, Token, TokenKind, TraitAdaptation, TraitDecl, TraitUse,
+    TypeParameterDecl, TypeSyntax, TypeSyntaxKind, UnaryOp, UseDecl, UseKind, Visibility, lex,
 };
 
 type ParsedMembers = (Vec<TraitUse>, Vec<PropertyDecl>, Vec<MethodDecl>, Span);
@@ -17,6 +17,86 @@ pub struct ParseOutput {
     pub program: Program,
     pub tokens: Vec<Token>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TypeParseOutput {
+    pub ty: Option<TypeSyntax>,
+    pub consumed: Span,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Parses one THP type at the start of `span`, leaving any following text alone.
+pub fn parse_type_prefix(source: &SourceFile, span: Span) -> TypeParseOutput {
+    let start = span.start as usize;
+    let end = (span.end as usize).min(source.len());
+    if start > end || !source.text().is_char_boundary(start) || !source.text().is_char_boundary(end)
+    {
+        return TypeParseOutput {
+            ty: None,
+            consumed: source.empty_span(start.min(source.len())),
+            diagnostics: vec![Diagnostic::error(
+                "parsing",
+                "P0901",
+                source.empty_span(start.min(source.len())),
+                "type span must lie on UTF-8 boundaries",
+            )],
+        };
+    }
+    let fragment = SourceFile::new(source.path(), &source.text()[start..end]);
+    let lexed = lex(&fragment);
+    let mut tokens = lexed.tokens;
+    shift_tokens(&mut tokens, start);
+    let mut lexical_diagnostics = lexed.diagnostics;
+    shift_diagnostics(&mut lexical_diagnostics, start);
+    let mut parser = Parser {
+        source: source.text(),
+        tokens: &tokens,
+        current: 0,
+        diagnostics: Vec::new(),
+    };
+    let ty = parser.parse_type();
+    let consumed = ty.as_ref().map_or(source.empty_span(start), |ty| ty.span);
+    if ty.is_some() {
+        lexical_diagnostics.retain(|diagnostic| {
+            diagnostic
+                .labels
+                .iter()
+                .any(|label| label.span.start < consumed.end)
+        });
+    }
+    lexical_diagnostics.extend(parser.diagnostics);
+    TypeParseOutput {
+        ty,
+        consumed,
+        diagnostics: lexical_diagnostics,
+    }
+}
+
+fn shift_tokens(tokens: &mut [Token], offset: usize) {
+    for token in tokens {
+        token.span.start = token
+            .span
+            .start
+            .saturating_add(u32::try_from(offset).expect("THP source files are limited to 4 GiB"));
+        token.span.end = token
+            .span
+            .end
+            .saturating_add(u32::try_from(offset).expect("THP source files are limited to 4 GiB"));
+    }
+}
+
+fn shift_diagnostics(diagnostics: &mut [Diagnostic], offset: usize) {
+    for diagnostic in diagnostics {
+        for label in &mut diagnostic.labels {
+            label.span.start = label.span.start.saturating_add(
+                u32::try_from(offset).expect("THP source files are limited to 4 GiB"),
+            );
+            label.span.end = label.span.end.saturating_add(
+                u32::try_from(offset).expect("THP source files are limited to 4 GiB"),
+            );
+        }
+    }
 }
 
 pub fn parse(source: &SourceFile) -> ParseOutput {
@@ -196,6 +276,7 @@ impl Parser<'_, '_> {
             TokenKind::Trait => self.parse_trait(),
             TokenKind::Echo => self.parse_echo(),
             TokenKind::Return => self.parse_return(),
+            TokenKind::Yield => self.parse_yield(),
             TokenKind::Throw => self.parse_throw(),
             TokenKind::Try => self.parse_try(),
             TokenKind::Using => self.parse_using(),
@@ -337,16 +418,18 @@ impl Parser<'_, '_> {
         }
         self.expect(TokenKind::Class, "P0150", "expected `class`")?;
         let name = self.expect(TokenKind::Identifier, "P0151", "expected a class name")?;
+        let type_parameters = self.parse_type_parameters()?;
         let parent = if self.consume(TokenKind::Extends) {
-            Some(self.parse_name_ref("P0152", "expected a parent class name")?)
+            Some(self.parse_nominal_ref("P0152", "expected a parent class type")?)
         } else {
             None
         };
         let mut interfaces = Vec::new();
         if self.consume(TokenKind::Implements) {
             loop {
-                interfaces
-                    .push(self.parse_name_ref("P0153", "expected an implemented interface name")?);
+                interfaces.push(
+                    self.parse_nominal_ref("P0153", "expected an implemented interface type")?,
+                );
                 if !self.consume(TokenKind::Comma) {
                     break;
                 }
@@ -358,6 +441,7 @@ impl Parser<'_, '_> {
             kind: StmtKind::Class(ClassDecl {
                 name: self.text(name.span).to_owned(),
                 name_span: name.span,
+                type_parameters,
                 abstract_class,
                 final_class,
                 parent,
@@ -373,8 +457,9 @@ impl Parser<'_, '_> {
     fn parse_interface(&mut self) -> Option<Stmt> {
         let start = self.advance().span;
         let name = self.expect(TokenKind::Identifier, "P0160", "expected an interface name")?;
+        let type_parameters = self.parse_type_parameters()?;
         let parent = if self.consume(TokenKind::Extends) {
-            let parent = self.parse_name_ref("P0161", "expected a parent interface name")?;
+            let parent = self.parse_nominal_ref("P0161", "expected a parent interface type")?;
             if self.consume(TokenKind::Comma) {
                 self.error_span(
                     "P0162",
@@ -400,10 +485,77 @@ impl Parser<'_, '_> {
             kind: StmtKind::Interface(InterfaceDecl {
                 name: self.text(name.span).to_owned(),
                 name_span: name.span,
+                type_parameters,
                 parent,
                 methods,
             }),
             span: start.join(end),
+        })
+    }
+
+    fn parse_type_parameters(&mut self) -> Option<Vec<TypeParameterDecl>> {
+        if !self.consume(TokenKind::Less) {
+            return Some(Vec::new());
+        }
+        let mut parameters = Vec::new();
+        loop {
+            let name = self.expect(
+                TokenKind::Identifier,
+                "P0190",
+                "expected a type parameter name",
+            )?;
+            let bound = if self.consume(TokenKind::Extends) {
+                Some(self.parse_atomic_type()?)
+            } else {
+                None
+            };
+            parameters.push(TypeParameterDecl {
+                name: self.text(name.span).to_owned(),
+                name_span: name.span,
+                span: bound
+                    .as_ref()
+                    .map_or(name.span, |bound| name.span.join(bound.span)),
+                bound,
+            });
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(
+            TokenKind::Greater,
+            "P0191",
+            "expected `>` after type parameters",
+        )?;
+        Some(parameters)
+    }
+
+    fn parse_nominal_ref(
+        &mut self,
+        code: &'static str,
+        message: &'static str,
+    ) -> Option<NominalRef> {
+        let name = self.parse_qualified_name(true, code, message)?;
+        let mut arguments = Vec::new();
+        let mut end = name.span;
+        if self.consume(TokenKind::Less) {
+            loop {
+                arguments.push(self.parse_type()?);
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+            }
+            end = self
+                .expect(
+                    TokenKind::Greater,
+                    "P0192",
+                    "expected `>` after type arguments",
+                )?
+                .span;
+        }
+        Some(NominalRef {
+            name: name.as_string(),
+            arguments,
+            span: name.span.join(end),
         })
     }
 
@@ -718,6 +870,21 @@ impl Parser<'_, '_> {
         let end = self.expect(TokenKind::Semicolon, "P0401", "expected `;` after return")?;
         Some(Stmt {
             kind: StmtKind::Return(value),
+            span: start.join(end.span),
+        })
+    }
+
+    fn parse_yield(&mut self) -> Option<Stmt> {
+        let start = self.advance().span;
+        let first = self.parse_expression(0)?;
+        let (key, value) = if self.consume(TokenKind::FatArrow) {
+            (Some(first), self.parse_expression(0)?)
+        } else {
+            (None, first)
+        };
+        let end = self.expect(TokenKind::Semicolon, "P0402", "expected `;` after yield")?;
+        Some(Stmt {
+            kind: StmtKind::Yield { key, value },
             span: start.join(end.span),
         })
     }
@@ -1150,6 +1317,16 @@ impl Parser<'_, '_> {
                 kind: TypeSyntaxKind::Nullable(Box::new(inner)),
             });
         }
+        if self.consume(TokenKind::Null) {
+            let span = self.previous().span;
+            return Some(TypeSyntax {
+                kind: TypeSyntaxKind::Named {
+                    name: "null".to_owned(),
+                    arguments: Vec::new(),
+                },
+                span,
+            });
+        }
         let name = self.parse_qualified_name(true, "P0901", "expected a type name")?;
         let mut arguments = Vec::new();
         let mut end = name.span;
@@ -1180,6 +1357,45 @@ impl Parser<'_, '_> {
     fn parse_expression(&mut self, minimum_precedence: u8) -> Option<Expr> {
         let mut left = self.parse_prefix()?;
         loop {
+            if self.at(TokenKind::Less)
+                && matches!(left.kind, ExprKind::Name(_))
+                && let Some((arguments, end)) = self.try_parse_static_type_arguments()
+            {
+                let ExprKind::Name(class_name) = left.kind else {
+                    unreachable!()
+                };
+                let class_span = left.span.join(end);
+                self.expect(
+                    TokenKind::DoubleColon,
+                    "P1003",
+                    "expected `::` after generic class arguments",
+                )?;
+                let name = self.expect(
+                    TokenKind::Identifier,
+                    "P1004",
+                    "expected a member name after `::`",
+                )?;
+                self.expect(
+                    TokenKind::LParen,
+                    "P1005",
+                    "generic static access currently requires a method call",
+                )?;
+                let (call_arguments, call_end) = self.parse_arguments_after_open()?;
+                left = Expr {
+                    kind: ExprKind::StaticCall {
+                        target: ScopeTarget::Named {
+                            name: class_name,
+                            type_arguments: arguments,
+                        },
+                        class_span,
+                        name: self.text(name.span).to_owned(),
+                        name_span: name.span,
+                        arguments: call_arguments,
+                    },
+                    span: left.span.join(call_end),
+                };
+                continue;
+            }
             if self.at(TokenKind::LParen) {
                 if 12 < minimum_precedence {
                     break;
@@ -1209,11 +1425,15 @@ impl Parser<'_, '_> {
                     break;
                 }
                 self.advance();
-                let name = self.expect(
-                    TokenKind::Identifier,
-                    "P1002",
-                    "expected a property or method name after `->`",
-                )?;
+                let name = if self.at(TokenKind::Function) || self.at(TokenKind::Class) {
+                    self.advance()
+                } else {
+                    self.expect(
+                        TokenKind::Identifier,
+                        "P1002",
+                        "expected a property or method name after `->`",
+                    )?
+                };
                 let name_text = self.text(name.span).to_owned();
                 if self.consume(TokenKind::LParen) {
                     let (arguments, end) = self.parse_arguments_after_open()?;
@@ -1253,7 +1473,10 @@ impl Parser<'_, '_> {
                     "self" => ScopeTarget::SelfType,
                     "parent" => ScopeTarget::Parent,
                     "static" => ScopeTarget::Static,
-                    _ => ScopeTarget::Named(class_name.clone()),
+                    _ => ScopeTarget::Named {
+                        name: class_name.clone(),
+                        type_arguments: Vec::new(),
+                    },
                 };
                 self.advance();
                 let name = self.expect(
@@ -1274,7 +1497,11 @@ impl Parser<'_, '_> {
                         span: class_span.join(end),
                     };
                 } else {
-                    let ScopeTarget::Named(class_name) = target else {
+                    let ScopeTarget::Named {
+                        name: class_name,
+                        type_arguments,
+                    } = target
+                    else {
                         self.error_span(
                             "P1005",
                             class_span,
@@ -1282,6 +1509,14 @@ impl Parser<'_, '_> {
                         );
                         return None;
                     };
+                    if !type_arguments.is_empty() {
+                        self.error_span(
+                            "P1005",
+                            class_span,
+                            "generic class constants are not implemented",
+                        );
+                        return None;
+                    }
                     left = Expr {
                         kind: ExprKind::ClassConstant {
                             class_name,
@@ -1305,6 +1540,24 @@ impl Parser<'_, '_> {
                     "P1006",
                     "expected a type name after `instanceof`",
                 )?;
+                if self.consume(TokenKind::Less) {
+                    while !self.at(TokenKind::Greater) && !self.at(TokenKind::Eof) {
+                        let _ = self.parse_type()?;
+                        if !self.consume(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.expect(
+                        TokenKind::Greater,
+                        "P1007",
+                        "expected `>` after instanceof type arguments",
+                    )?;
+                    self.error_span(
+                        "P1007",
+                        class.span.join(end.span),
+                        "`instanceof` is erased; use the bare generic declaration name",
+                    );
+                }
                 let span = left.span.join(class.span);
                 left = Expr {
                     kind: ExprKind::InstanceOf {
@@ -1380,18 +1633,69 @@ impl Parser<'_, '_> {
                 kind: ExprKind::String(self.decode_string(token.span)?),
                 span: token.span,
             },
+            TokenKind::Function | TokenKind::Fn => {
+                self.parse_closure(token.span, token.kind == TokenKind::Fn)?
+            }
             TokenKind::New => {
-                let class =
-                    self.parse_qualified_name(true, "P1104", "expected a class name after `new`")?;
+                let (mut target, target_span) = if self.at(TokenKind::Variable) {
+                    let variable = self.advance();
+                    (
+                        NewTarget::Dynamic(Box::new(Expr {
+                            kind: ExprKind::Variable(self.text(variable.span)[1..].to_owned()),
+                            span: variable.span,
+                        })),
+                        variable.span,
+                    )
+                } else if self.consume(TokenKind::LParen) {
+                    let target = self.parse_expression(0)?;
+                    let end = self.expect(
+                        TokenKind::RParen,
+                        "P1104",
+                        "expected `)` after dynamic class expression",
+                    )?;
+                    let span = target.span.join(end.span);
+                    (NewTarget::Dynamic(Box::new(target)), span)
+                } else {
+                    let class = self.parse_qualified_name(
+                        true,
+                        "P1104",
+                        "expected a class name, variable, or parenthesized expression after `new`",
+                    )?;
+                    let span = class.span;
+                    (
+                        NewTarget::Static {
+                            class_name: class.as_string(),
+                            class_span: span,
+                        },
+                        span,
+                    )
+                };
+                let mut type_arguments = Vec::new();
+                if self.consume(TokenKind::Less) {
+                    loop {
+                        type_arguments.push(self.parse_type()?);
+                        if !self.consume(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.expect(
+                        TokenKind::Greater,
+                        "P1107",
+                        "expected `>` after constructor type arguments",
+                    )?;
+                    if let NewTarget::Static { class_span, .. } = &mut target {
+                        *class_span = class_span.join(end.span);
+                    }
+                }
                 self.expect(TokenKind::LParen, "P1105", "expected constructor arguments")?;
                 let (arguments, end) = self.parse_arguments_after_open()?;
                 Expr {
                     kind: ExprKind::New {
-                        class_name: class.as_string(),
-                        class_span: class.span,
+                        target,
+                        type_arguments,
                         arguments,
                     },
-                    span: token.span.join(end),
+                    span: token.span.join(target_span).join(end),
                 }
             }
             TokenKind::Variable => Expr {
@@ -1451,6 +1755,113 @@ impl Parser<'_, '_> {
             expression = self.finish_call(expression)?;
         }
         Some(expression)
+    }
+
+    fn parse_closure(&mut self, start: Span, arrow: bool) -> Option<Expr> {
+        self.expect(
+            TokenKind::LParen,
+            "P1120",
+            "expected `(` after closure keyword",
+        )?;
+        let mut parameters = Vec::new();
+        while !self.at(TokenKind::RParen) {
+            let ty = self.parse_type()?;
+            let variable =
+                self.expect(TokenKind::Variable, "P1121", "expected a closure parameter")?;
+            parameters.push(Parameter {
+                name: self.text(variable.span)[1..].to_owned(),
+                name_span: variable.span,
+                span: ty.span.join(variable.span),
+                ty,
+                default: None,
+                variadic: false,
+            });
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(
+            TokenKind::RParen,
+            "P1122",
+            "expected `)` after closure parameters",
+        )?;
+        let mut captures = Vec::new();
+        if !arrow && self.consume(TokenKind::Use) {
+            self.expect(TokenKind::LParen, "P1123", "expected `(` after `use`")?;
+            while !self.at(TokenKind::RParen) {
+                let variable =
+                    self.expect(TokenKind::Variable, "P1124", "expected a captured variable")?;
+                captures.push(self.text(variable.span)[1..].to_owned());
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen, "P1125", "expected `)` after captures")?;
+        }
+        self.expect(TokenKind::Colon, "P1126", "expected a closure return type")?;
+        let return_type = self.parse_type()?;
+        let (body, end) = if arrow {
+            self.expect(
+                TokenKind::FatArrow,
+                "P1127",
+                "expected `=>` in arrow function",
+            )?;
+            let value = self.parse_expression(0)?;
+            let end = value.span;
+            (
+                vec![Stmt {
+                    kind: StmtKind::Return(Some(value)),
+                    span: end,
+                }],
+                end,
+            )
+        } else {
+            self.expect(TokenKind::LBrace, "P1128", "expected a closure body")?;
+            self.parse_block_after_open()?
+        };
+        Some(Expr {
+            kind: ExprKind::Closure {
+                parameters,
+                captures,
+                implicit_captures: arrow,
+                return_type,
+                body,
+            },
+            span: start.join(end),
+        })
+    }
+
+    fn try_parse_static_type_arguments(&mut self) -> Option<(Vec<TypeSyntax>, Span)> {
+        let saved = self.current;
+        let diagnostic_count = self.diagnostics.len();
+        self.advance();
+        let mut arguments = Vec::new();
+        loop {
+            let Some(argument) = self.parse_type() else {
+                self.current = saved;
+                self.diagnostics.truncate(diagnostic_count);
+                return None;
+            };
+            arguments.push(argument);
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        let Some(end) = self.expect(
+            TokenKind::Greater,
+            "P1003",
+            "expected `>` after generic class arguments",
+        ) else {
+            self.current = saved;
+            self.diagnostics.truncate(diagnostic_count);
+            return None;
+        };
+        if !self.at(TokenKind::DoubleColon) {
+            self.current = saved;
+            self.diagnostics.truncate(diagnostic_count);
+            return None;
+        }
+        Some((arguments, end.span))
     }
 
     fn parse_vector(&mut self, start: Span) -> Option<Expr> {
@@ -1822,6 +2233,7 @@ fn is_property_initializer(expression: &Expr) -> bool {
         ExprKind::Unary { operand, .. } => is_property_initializer(operand),
         ExprKind::Variable(_)
         | ExprKind::Name(_)
+        | ExprKind::Closure { .. }
         | ExprKind::Binary { .. }
         | ExprKind::Call { .. }
         | ExprKind::Index { .. }
@@ -1876,10 +2288,83 @@ const fn binary_operator(kind: TokenKind) -> Option<(u8, BinaryOp)> {
 
 #[cfg(test)]
 mod tests {
-    use thp_diagnostics::SourceFile;
+    use thp_diagnostics::{SourceFile, Span};
 
     use super::parse;
-    use crate::{BinaryOp, ExprKind, StmtKind};
+    use crate::{BinaryOp, ExprKind, NewTarget, StmtKind};
+
+    #[test]
+    fn parses_dynamic_new_targets_and_generics() {
+        let output = parse(&SourceFile::new(
+            "dynamic-new.thp",
+            "<?thp\n$a = new $class<int>(value: 1);\n$b = new (name())<string>(2);",
+        ));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        for statement in &output.program.statements {
+            let StmtKind::Assign { value, .. } = &statement.kind else {
+                panic!("expected assignment")
+            };
+            let ExprKind::New {
+                target,
+                type_arguments,
+                arguments,
+            } = &value.kind
+            else {
+                panic!("expected dynamic new")
+            };
+            assert!(matches!(target, NewTarget::Dynamic(_)));
+            assert_eq!(type_arguments.len(), 1);
+            assert_eq!(arguments.len(), 1);
+        }
+    }
+
+    #[test]
+    fn parses_generic_nominals_and_explicit_access() {
+        let output = parse(&SourceFile::new(
+            "generic.thp",
+            r"<?thp
+interface Source<T> {}
+class Box<T, U extends Source<T>> implements Source<T> {}
+$box = new Box<int, Source<int>>(1);
+Box<int, Source<int>>::make();
+",
+        ));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let StmtKind::Class(class) = &output.program.statements[1].kind else {
+            panic!("expected class");
+        };
+        assert_eq!(class.type_parameters.len(), 2);
+        assert_eq!(class.interfaces[0].arguments.len(), 1);
+        let StmtKind::Assign { value, .. } = &output.program.statements[2].kind else {
+            panic!("expected construction");
+        };
+        let ExprKind::New { type_arguments, .. } = &value.kind else {
+            panic!("expected new expression");
+        };
+        assert_eq!(type_arguments.len(), 2);
+    }
+
+    #[test]
+    fn diagnoses_malformed_and_runtime_generic_syntax() {
+        let empty = parse(&SourceFile::new("empty.thp", "<?thp\nclass Box<> {}"));
+        assert!(
+            empty
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "P0190")
+        );
+
+        let instanceof = parse(&SourceFile::new(
+            "instanceof.thp",
+            "<?thp\nclass Box<T> {}\n$value = new Box<int>();\n$ok = $value instanceof Box<int>;",
+        ));
+        assert!(
+            instanceof
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "P1007")
+        );
+    }
 
     #[test]
     fn parses_functions_control_flow_and_precedence() {
@@ -1913,6 +2398,20 @@ if ($answer > 40) {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_reflect_as_an_ordinary_function_call() {
+        let output = parse(&SourceFile::new("test.thp", "<?thp\nreflect(int);"));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let StmtKind::Expression(expression) = &output.program.statements[0].kind else {
+            panic!("expected expression statement");
+        };
+        let ExprKind::Call { callee, arguments } = &expression.kind else {
+            panic!("expected ordinary call");
+        };
+        assert!(matches!(&callee.kind, ExprKind::Name(name) if name == "reflect"));
+        assert!(matches!(&arguments[0].value.kind, ExprKind::Name(name) if name == "int"));
     }
 
     #[test]
@@ -2108,5 +2607,32 @@ function build(\Vendor\Contracts\Client $client): Client {
                 output.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn parses_a_nested_type_prefix() {
+        let source = SourceFile::new(
+            "test.thp",
+            "prefix ?map<string, vector<App\\User>> description",
+        );
+        let output = super::parse_type_prefix(&source, Span::new("prefix ".len(), source.len()));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(
+            output.ty.unwrap().to_string(),
+            "?map<string, vector<App\\User>>"
+        );
+        assert_eq!(
+            &source.text()[output.consumed.range()],
+            "?map<string, vector<App\\User>>"
+        );
+    }
+
+    #[test]
+    fn type_prefix_ignores_lex_errors_in_following_text() {
+        let source = SourceFile::new("test.thp", "int described @ runtime");
+        let output = super::parse_type_prefix(&source, Span::new(0, source.len()));
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(output.ty.unwrap().to_string(), "int");
+        assert_eq!(output.consumed, Span::new(0, 3));
     }
 }

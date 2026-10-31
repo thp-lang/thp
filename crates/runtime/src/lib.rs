@@ -4,10 +4,10 @@
 #![allow(clippy::match_same_arms)]
 
 use std::alloc::{Layout, alloc};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::mem;
 use std::rc::Rc;
@@ -15,7 +15,81 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use thp_diagnostics::Span;
-use thp_hir::{ClassId, PropertyId, Type};
+use thp_hir::{ClassId, FunctionId, PropertyId, Type};
+
+mod file_worker;
+pub use file_worker::{
+    DirectoryPending, DirectoryReadError, DirectoryStart, FileInfoPending, FileInfoStart,
+    FileInfoValue, OpenFileFlags, OpenFilePending, OpenFileStart, RecursiveDirectoryPending,
+    RecursiveDirectoryStart, StreamFileOperation, StreamFilePending, StreamFileResult,
+    StreamFileStart, file_info_host, file_info_uses_host, start_directory_read, start_file_info,
+    start_open_file, start_recursive_directory_read,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReflectionCallable {
+    Function(FunctionId),
+    Method {
+        class: ClassId,
+        index: u32,
+        declared: bool,
+        type_arguments: Vec<Type>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReflectionValue {
+    Type(Type),
+    Class {
+        class: ClassId,
+        ty: Option<Type>,
+    },
+    Function(FunctionId),
+    Method {
+        class: ClassId,
+        index: u32,
+        declared: bool,
+        type_arguments: Vec<Type>,
+    },
+    Property {
+        class: ClassId,
+        slot: PropertyId,
+        type_arguments: Vec<Type>,
+    },
+    Parameter {
+        callable: ReflectionCallable,
+        position: u32,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct GeneratorFrame {
+    pub locals: Vec<Option<Value>>,
+    pub registers: Vec<Option<Value>>,
+    pub current: u32,
+    pub previous: Option<u32>,
+    pub called_class: Option<ClassId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratorStatus {
+    Fresh,
+    Suspended,
+    Exhausted,
+    Closed,
+}
+
+#[derive(Debug)]
+pub struct GeneratorState {
+    pub function: FunctionId,
+    pub frame: GeneratorFrame,
+    pub key: Option<Value>,
+    pub value: Option<Value>,
+    pub return_value: Option<Value>,
+    pub next_key: Option<i64>,
+    pub advanced: bool,
+    pub status: GeneratorStatus,
+}
 
 const TAG_NULL: u64 = 0;
 const TAG_INT: u64 = 1;
@@ -72,10 +146,10 @@ impl RequestHeap {
             .try_reserve_exact(root_capacity)
             .map_err(|_| RuntimeErrorKind::AllocationFailure)?;
         let metadata_bytes = roots.capacity() * mem::size_of::<*mut HeapCell>();
-        if let Some(limit) = max_bytes {
-            if metadata_bytes > limit {
-                return Err(RuntimeErrorKind::HeapLimit { limit });
-            }
+        if let Some(limit) = max_bytes
+            && metadata_bytes > limit
+        {
+            return Err(RuntimeErrorKind::HeapLimit { limit });
         }
         Ok(Self {
             state: Rc::new(HeapState {
@@ -510,10 +584,10 @@ impl RequestInput {
         max_bytes: Option<u64>,
         max_time: Option<Duration>,
     ) -> Result<Self, RuntimeErrorKind> {
-        if let (Some(length), Some(limit)) = (declared_length, max_bytes) {
-            if length > limit {
-                return Err(RuntimeErrorKind::InputSizeLimit { limit });
-            }
+        if let (Some(length), Some(limit)) = (declared_length, max_bytes)
+            && length > limit
+        {
+            return Err(RuntimeErrorKind::InputSizeLimit { limit });
         }
         Ok(Self {
             state: Rc::new(RefCell::new(RequestInputState {
@@ -830,6 +904,21 @@ impl Value {
         })
     }
 
+    pub fn try_closure(
+        function: FunctionId,
+        captures: Vec<Self>,
+    ) -> Result<Self, RuntimeErrorKind> {
+        Self::ensure_values_match_active(captures.iter())?;
+        Self::try_allocate(HeapData::Closure { function, captures })
+    }
+
+    pub fn closure_parts(&self) -> Option<(FunctionId, &[Self])> {
+        match self.heap_data()? {
+            HeapData::Closure { function, captures } => Some((*function, captures)),
+            _ => None,
+        }
+    }
+
     pub fn map(key_type: Type, value_type: Type, entries: Vec<(Self, Self)>) -> Self {
         Self::allocate_unmanaged(HeapData::Map {
             key_type,
@@ -839,6 +928,14 @@ impl Value {
     }
 
     pub fn try_object(class: ClassId, property_count: usize) -> Result<Self, RuntimeErrorKind> {
+        Self::try_typed_object(class, Vec::new(), property_count)
+    }
+
+    pub fn try_typed_object(
+        class: ClassId,
+        type_arguments: Vec<Type>,
+        property_count: usize,
+    ) -> Result<Self, RuntimeErrorKind> {
         let mut properties = Vec::new();
         properties
             .try_reserve_exact(property_count)
@@ -846,6 +943,7 @@ impl Value {
         properties.resize_with(property_count, || None);
         Self::try_allocate(HeapData::Object {
             class,
+            type_arguments,
             properties: RefCell::new(properties),
         })
     }
@@ -853,7 +951,67 @@ impl Value {
     pub fn object(class: ClassId, property_count: usize) -> Self {
         Self::allocate_unmanaged(HeapData::Object {
             class,
+            type_arguments: Vec::new(),
             properties: RefCell::new(vec![None; property_count]),
+        })
+    }
+
+    pub fn try_generator(
+        class: ClassId,
+        type_arguments: Vec<Type>,
+        state: GeneratorState,
+    ) -> Result<Self, RuntimeErrorKind> {
+        let frame_bytes = (state.frame.locals.capacity() + state.frame.registers.capacity())
+            * mem::size_of::<Option<Value>>();
+        Self::try_allocate(HeapData::Generator {
+            class,
+            type_arguments,
+            state: RefCell::new(Some(state)),
+            frame_bytes: Cell::new(frame_bytes),
+        })
+    }
+
+    pub fn take_generator_state(&self) -> Option<GeneratorState> {
+        match self.heap_data()? {
+            HeapData::Generator { state, .. } => state.borrow_mut().take(),
+            _ => None,
+        }
+    }
+
+    pub fn put_generator_state(&self, value: GeneratorState) {
+        let Some(HeapData::Generator {
+            state, frame_bytes, ..
+        }) = self.heap_data()
+        else {
+            unreachable!("generator state requires a generator value")
+        };
+        let next = (value.frame.locals.capacity() + value.frame.registers.capacity())
+            * mem::size_of::<Option<Value>>();
+        debug_assert!(
+            next <= frame_bytes.get(),
+            "generator frames do not grow after allocation"
+        );
+        if next < frame_bytes.get() {
+            self.release_growth(frame_bytes.get() - next);
+            frame_bytes.set(next);
+        }
+        *state.borrow_mut() = Some(value);
+    }
+
+    pub fn try_reflection(
+        class: ClassId,
+        value: ReflectionValue,
+    ) -> Result<Self, RuntimeErrorKind> {
+        Self::try_allocate(HeapData::Reflection {
+            class,
+            value: OnceCell::from(value),
+        })
+    }
+
+    pub fn try_uninitialized_reflection(class: ClassId) -> Result<Self, RuntimeErrorKind> {
+        Self::try_allocate(HeapData::Reflection {
+            class,
+            value: OnceCell::new(),
         })
     }
 
@@ -875,6 +1033,8 @@ impl Value {
             target: None,
             system_code: 0,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -888,6 +1048,8 @@ impl Value {
             target: None,
             system_code: 0,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -899,7 +1061,9 @@ impl Value {
                 storage: StreamStorage::Memory(bytes),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: None,
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle,
             }),
         })
@@ -912,7 +1076,9 @@ impl Value {
                 storage: StreamStorage::Memory(bytes),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: None,
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle: None,
             }),
         })
@@ -929,7 +1095,31 @@ impl Value {
                 storage: StreamStorage::Memory(Vec::new()),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: Some(spill_threshold),
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
+                handle,
+            }),
+        })
+    }
+
+    pub fn try_memory_stream_mode(
+        class: ClassId,
+        spill_threshold: Option<usize>,
+        readable: bool,
+        writable: bool,
+        append: bool,
+    ) -> Result<Self, RuntimeErrorKind> {
+        let handle = Self::active_handle_lease()?;
+        Self::try_allocate(HeapData::Stream {
+            class,
+            state: RefCell::new(StreamState {
+                storage: StreamStorage::Memory(Vec::new()),
+                cursor: 0,
+                closed: false,
+                busy: false,
+                spill_threshold,
+                capabilities: stream_flags(readable, writable, append),
                 handle,
             }),
         })
@@ -942,7 +1132,9 @@ impl Value {
                 storage: StreamStorage::Memory(Vec::new()),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: Some(spill_threshold),
+                capabilities: STREAM_READ | STREAM_WRITE | STREAM_SEEK,
                 handle: None,
             }),
         })
@@ -959,7 +1151,33 @@ impl Value {
                 storage: StreamStorage::Input(input),
                 cursor: 0,
                 closed: false,
+                busy: false,
                 spill_threshold: None,
+                capabilities: STREAM_READ,
+                handle,
+            }),
+        })
+    }
+
+    pub fn try_file_stream(
+        class: ClassId,
+        file: std::fs::File,
+        readable: bool,
+        writable: bool,
+        append: bool,
+    ) -> Result<Self, RuntimeErrorKind> {
+        let length = usize::try_from(file.metadata().map_err(stream_io_error)?.len())
+            .map_err(|_| RuntimeErrorKind::Io("file is too large".to_owned()))?;
+        let handle = Self::active_handle_lease()?;
+        Self::try_allocate(HeapData::Stream {
+            class,
+            state: RefCell::new(StreamState {
+                storage: StreamStorage::File { file },
+                cursor: if append { length } else { 0 },
+                closed: false,
+                busy: false,
+                spill_threshold: None,
+                capabilities: stream_flags(readable, writable, append),
                 handle,
             }),
         })
@@ -980,6 +1198,8 @@ impl Value {
             target,
             system_code,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -998,6 +1218,8 @@ impl Value {
             target,
             system_code,
             suppressed: RefCell::new(Vec::new()),
+            origin: Cell::new(None),
+            trace: RefCell::new(Vec::new()),
         })
     }
 
@@ -1098,10 +1320,10 @@ impl Value {
     ) -> Result<(), RuntimeErrorKind> {
         let active = ACTIVE_HEAP.with(|owner| owner.borrow().as_ref().map(|owner| owner.id));
         for value in values {
-            if let Some(owner) = value.owner_id() {
-                if Some(owner) != active {
-                    return Err(RuntimeErrorKind::CrossRequestValue);
-                }
+            if let Some(owner) = value.owner_id()
+                && Some(owner) != active
+            {
+                return Err(RuntimeErrorKind::CrossRequestValue);
             }
         }
         Ok(())
@@ -1140,9 +1362,12 @@ impl Value {
             HeapData::Bytes(bytes) => Some(bytes),
             HeapData::Vector { .. }
             | HeapData::Map { .. }
+            | HeapData::Closure { .. }
+            | HeapData::Generator { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
-            | HeapData::Exception { .. } => None,
+            | HeapData::Exception { .. }
+            | HeapData::Reflection { .. } => None,
         }
     }
 
@@ -1151,9 +1376,12 @@ impl Value {
             HeapData::Vector { values, .. } => Some(values),
             HeapData::Bytes(_)
             | HeapData::Map { .. }
+            | HeapData::Closure { .. }
+            | HeapData::Generator { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
-            | HeapData::Exception { .. } => None,
+            | HeapData::Exception { .. }
+            | HeapData::Reflection { .. } => None,
         }
     }
 
@@ -1162,9 +1390,46 @@ impl Value {
             HeapData::Map { entries, .. } => Some(entries),
             HeapData::Bytes(_)
             | HeapData::Vector { .. }
+            | HeapData::Closure { .. }
+            | HeapData::Generator { .. }
             | HeapData::Object { .. }
             | HeapData::Stream { .. }
-            | HeapData::Exception { .. } => None,
+            | HeapData::Exception { .. }
+            | HeapData::Reflection { .. } => None,
+        }
+    }
+
+    pub fn collection_types(&self) -> Option<(Type, Option<Type>)> {
+        match self.heap_data()? {
+            HeapData::Vector { element_type, .. } => Some((element_type.clone(), None)),
+            HeapData::Map {
+                key_type,
+                value_type,
+                ..
+            } => Some((key_type.clone(), Some(value_type.clone()))),
+            _ => None,
+        }
+    }
+
+    pub fn reflection(&self) -> Option<&ReflectionValue> {
+        match self.heap_data()? {
+            HeapData::Reflection { value, .. } => value.get(),
+            _ => None,
+        }
+    }
+
+    pub fn initialize_reflection(&self, reflection: ReflectionValue) -> bool {
+        match self.heap_data() {
+            Some(HeapData::Reflection { value, .. }) => value.set(reflection).is_ok(),
+            _ => false,
+        }
+    }
+
+    pub fn type_arguments(&self) -> Option<&[Type]> {
+        match self.heap_data()? {
+            HeapData::Object { type_arguments, .. }
+            | HeapData::Generator { type_arguments, .. } => Some(type_arguments),
+            _ => None,
         }
     }
 
@@ -1175,6 +1440,11 @@ impl Value {
     /// Returns a type error when this value is not a vector.
     pub fn vector_push(&mut self, value: Self) -> Result<usize, RuntimeErrorKind> {
         self.ensure_same_owner(&value)?;
+        if !matches!(self.heap_data(), Some(HeapData::Vector { .. })) {
+            return Err(RuntimeErrorKind::TypeError(
+                "array_push requires a vector".to_owned(),
+            ));
+        }
         self.make_heap_unique()?;
         let needs_growth = matches!(
             self.heap_data(),
@@ -1191,9 +1461,7 @@ impl Value {
                 values.push(value);
                 Ok(values.len())
             }
-            _ => Err(RuntimeErrorKind::TypeError(
-                "array_push requires a vector".to_owned(),
-            )),
+            _ => unreachable!("vector kind was validated"),
         }
     }
 
@@ -1207,9 +1475,12 @@ impl Value {
                 HeapData::Bytes(_) => "string",
                 HeapData::Vector { .. } => "vector",
                 HeapData::Map { .. } => "map",
+                HeapData::Closure { .. } => "callable",
+                HeapData::Generator { .. } => "object",
                 HeapData::Object { .. } => "object",
                 HeapData::Stream { .. } => "stream",
                 HeapData::Exception { .. } => "exception",
+                HeapData::Reflection { .. } => "object",
             },
             _ => "invalid",
         }
@@ -1220,9 +1491,12 @@ impl Value {
             HeapData::Bytes(bytes) => Some(bytes.len()),
             HeapData::Vector { values, .. } => Some(values.len()),
             HeapData::Map { entries, .. } => Some(entries.len()),
+            HeapData::Closure { .. } => None,
+            HeapData::Generator { .. } => None,
             HeapData::Object { .. } => None,
             HeapData::Stream { .. } => None,
             HeapData::Exception { .. } => None,
+            HeapData::Reflection { .. } => None,
         }
     }
 
@@ -1303,9 +1577,14 @@ impl Value {
     pub fn class_id(&self) -> Option<ClassId> {
         match self.heap_data()? {
             HeapData::Object { class, .. }
+            | HeapData::Generator { class, .. }
             | HeapData::Stream { class, .. }
-            | HeapData::Exception { class, .. } => Some(*class),
-            HeapData::Bytes(_) | HeapData::Vector { .. } | HeapData::Map { .. } => None,
+            | HeapData::Exception { class, .. }
+            | HeapData::Reflection { class, .. } => Some(*class),
+            HeapData::Bytes(_)
+            | HeapData::Vector { .. }
+            | HeapData::Map { .. }
+            | HeapData::Closure { .. } => None,
         }
     }
 
@@ -1378,6 +1657,11 @@ impl Value {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
         let bytes = match &state.storage {
             StreamStorage::Input(input) => input.read(length)?,
             StreamStorage::Closed => {
@@ -1385,7 +1669,7 @@ impl Value {
             }
             StreamStorage::Memory(_) | StreamStorage::File { .. } => {
                 let start = state.cursor;
-                let end = start.saturating_add(length).min(state.len());
+                let end = start.saturating_add(length).min(state.len()?);
                 state.read_range(start, end)?
             }
         };
@@ -1402,25 +1686,77 @@ impl Value {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
         let bytes = match &state.storage {
             StreamStorage::Input(input) => input.read_all(limit)?,
             StreamStorage::Closed => {
                 return Err(RuntimeErrorKind::Io("stream is closed".to_owned()));
             }
             StreamStorage::Memory(_) | StreamStorage::File { .. } => {
-                let remaining = state.len().saturating_sub(state.cursor);
+                let end = state.len()?;
+                let remaining = end.saturating_sub(state.cursor);
                 if limit.is_some_and(|limit| remaining > limit) {
                     return Err(RuntimeErrorKind::Io(
                         "stream read limit exceeded".to_owned(),
                     ));
                 }
                 let start = state.cursor;
-                let end = state.len();
                 state.read_range(start, end)?
             }
         };
         state.cursor = state.cursor.saturating_add(bytes.len());
         Ok(bytes)
+    }
+
+    pub fn stream_read_line(&self) -> Result<Option<Vec<u8>>, RuntimeErrorKind> {
+        let state = self.stream_state()?;
+        let mut state = state.borrow_mut();
+        ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
+        let cursor = state.cursor;
+        let bytes = match &mut state.storage {
+            StreamStorage::Memory(storage) => {
+                if cursor >= storage.len() {
+                    return Ok(None);
+                }
+                let remaining = &storage[cursor..];
+                let length = remaining
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(remaining.len(), |index| index + 1);
+                remaining[..length].to_vec()
+            }
+            StreamStorage::File { file, .. } => {
+                file.seek(SeekFrom::Start(cursor as u64))
+                    .map_err(stream_io_error)?;
+                let mut bytes = Vec::new();
+                if std::io::BufReader::new(file)
+                    .read_until(b'\n', &mut bytes)
+                    .map_err(stream_io_error)?
+                    == 0
+                {
+                    return Ok(None);
+                }
+                bytes
+            }
+            _ => {
+                return Err(RuntimeErrorKind::Io(
+                    "stream does not support line reading".to_owned(),
+                ));
+            }
+        };
+        state.cursor = cursor
+            .checked_add(bytes.len())
+            .ok_or_else(|| RuntimeErrorKind::Io("stream position overflow".to_owned()))?;
+        Ok(Some(bytes))
     }
 
     /// Reports whether the shared cursor is at the end.
@@ -1432,11 +1768,16 @@ impl Value {
         let state = self.stream_state()?;
         let state = state.borrow();
         ensure_stream_open(&state)?;
+        if !state.has(STREAM_READ) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support reading".to_owned(),
+            ));
+        }
         match &state.storage {
             StreamStorage::Input(input) => input.eof(),
             StreamStorage::Closed => Err(RuntimeErrorKind::Io("stream is closed".to_owned())),
             StreamStorage::Memory(_) | StreamStorage::File { .. } => {
-                Ok(state.cursor >= state.len())
+                Ok(state.cursor >= state.len()?)
             }
         }
     }
@@ -1447,16 +1788,41 @@ impl Value {
     ///
     /// Returns an error for a non-stream or closed stream.
     pub fn stream_seek(&self, position: usize) -> Result<(), RuntimeErrorKind> {
+        self.stream_seek_from(
+            i64::try_from(position)
+                .map_err(|_| RuntimeErrorKind::Io("stream position overflow".to_owned()))?,
+            0,
+        )
+        .map(|_| ())
+    }
+
+    pub fn stream_seek_from(&self, offset: i64, origin: i64) -> Result<usize, RuntimeErrorKind> {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
-        if matches!(state.storage, StreamStorage::Input(_)) {
+        if !state.has(STREAM_SEEK) {
             return Err(RuntimeErrorKind::Io(
                 "stream does not support seeking".to_owned(),
             ));
         }
-        state.cursor = position;
-        Ok(())
+        let base = match origin {
+            0 => 0,
+            1 => state.cursor,
+            2 => state.len()?,
+            _ => return Err(RuntimeErrorKind::Io("invalid seek origin".to_owned())),
+        };
+        let position = (base as i128) + i128::from(offset);
+        if position < 0 {
+            return Err(RuntimeErrorKind::Bounds(
+                "stream position must not be negative".to_owned(),
+            ));
+        }
+        if position > i128::from(i64::MAX) {
+            return Err(RuntimeErrorKind::Io("stream position overflow".to_owned()));
+        }
+        state.cursor = usize::try_from(position)
+            .map_err(|_| RuntimeErrorKind::Io("stream position overflow".to_owned()))?;
+        Ok(state.cursor)
     }
 
     /// Writes all bytes at the cursor, zero-filling any gap.
@@ -1468,10 +1834,13 @@ impl Value {
         let state = self.stream_state()?;
         let mut state = state.borrow_mut();
         ensure_stream_open(&state)?;
-        if matches!(state.storage, StreamStorage::Input(_)) {
+        if !state.has(STREAM_WRITE) {
             return Err(RuntimeErrorKind::Io(
                 "stream does not support writing".to_owned(),
             ));
+        }
+        if state.has(STREAM_APPEND) {
+            state.cursor = state.len()?;
         }
         let end = state
             .cursor
@@ -1500,6 +1869,43 @@ impl Value {
         Ok(())
     }
 
+    pub fn stream_write(&self, bytes: &[u8]) -> Result<usize, RuntimeErrorKind> {
+        self.stream_write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    pub fn stream_flush(&self) -> Result<(), RuntimeErrorKind> {
+        let state = self.stream_state()?;
+        let mut state = state.borrow_mut();
+        ensure_stream_open(&state)?;
+        if !state.has(STREAM_WRITE) {
+            return Err(RuntimeErrorKind::Io(
+                "stream does not support writing".to_owned(),
+            ));
+        }
+        match &mut state.storage {
+            StreamStorage::File { file, .. } => file.flush().map_err(stream_io_error),
+            StreamStorage::Memory(_) => Ok(()),
+            _ => Err(RuntimeErrorKind::Io(
+                "stream does not support writing".to_owned(),
+            )),
+        }
+    }
+
+    pub fn stream_capabilities(&self) -> Result<(bool, bool, bool), RuntimeErrorKind> {
+        let state = self.stream_state()?;
+        let state = state.borrow();
+        Ok(if state.closed {
+            (false, false, false)
+        } else {
+            (
+                state.has(STREAM_READ),
+                state.has(STREAM_WRITE),
+                state.has(STREAM_SEEK),
+            )
+        })
+    }
+
     /// Idempotently closes the shared stream state.
     ///
     /// # Errors
@@ -1510,6 +1916,11 @@ impl Value {
         let mut state = state.borrow_mut();
         if state.closed {
             return Ok(());
+        }
+        if state.busy {
+            return Err(RuntimeErrorKind::Io(
+                "stream has an outstanding file operation".to_owned(),
+            ));
         }
         if let StreamStorage::Input(input) = &state.storage {
             input.close();
@@ -1732,6 +2143,52 @@ impl Value {
         }
     }
 
+    pub fn set_exception_origin(
+        &self,
+        span: Span,
+        frames: Vec<StackFrame>,
+    ) -> Result<(), RuntimeErrorKind> {
+        let Some(HeapData::Exception { origin, trace, .. }) = self.heap_data() else {
+            return Err(RuntimeErrorKind::TypeError(
+                "origin requires a throwable".to_owned(),
+            ));
+        };
+        let size = |frames: &Vec<StackFrame>| {
+            frames.capacity() * mem::size_of::<StackFrame>()
+                + frames
+                    .iter()
+                    .map(|frame| {
+                        frame.function.capacity() + frame.class.as_ref().map_or(0, String::capacity)
+                    })
+                    .sum::<usize>()
+        };
+        let old_size = size(&trace.borrow());
+        let new_size = size(&frames);
+        self.charge_growth(new_size.saturating_sub(old_size))?;
+        *trace.borrow_mut() = frames;
+        origin.set(Some(span));
+        self.release_growth(old_size.saturating_sub(new_size));
+        Ok(())
+    }
+
+    pub fn exception_origin(&self) -> Result<Option<Span>, RuntimeErrorKind> {
+        match self.heap_data() {
+            Some(HeapData::Exception { origin, .. }) => Ok(origin.get()),
+            _ => Err(RuntimeErrorKind::TypeError(
+                "origin requires a throwable".to_owned(),
+            )),
+        }
+    }
+
+    pub fn exception_trace(&self) -> Result<Vec<StackFrame>, RuntimeErrorKind> {
+        match self.heap_data() {
+            Some(HeapData::Exception { trace, .. }) => Ok(trace.borrow().clone()),
+            _ => Err(RuntimeErrorKind::TypeError(
+                "trace requires a throwable".to_owned(),
+            )),
+        }
+    }
+
     /// Attaches a cleanup failure to a primary native exception.
     ///
     /// # Errors
@@ -1803,7 +2260,12 @@ impl Value {
                     })
             }
             Some(
-                HeapData::Object { .. } | HeapData::Stream { .. } | HeapData::Exception { .. },
+                HeapData::Object { .. }
+                | HeapData::Generator { .. }
+                | HeapData::Closure { .. }
+                | HeapData::Stream { .. }
+                | HeapData::Exception { .. }
+                | HeapData::Reflection { .. },
             )
             | None => Err(RuntimeErrorKind::TypeError(format!(
                 "{} cannot be indexed",
@@ -1821,6 +2283,30 @@ impl Value {
     pub fn set_index(&mut self, index: &Self, value: Self) -> Result<(), RuntimeErrorKind> {
         self.ensure_same_owner(index)?;
         self.ensure_same_owner(&value)?;
+        let vector_index = match self.heap_data() {
+            Some(HeapData::Vector { values, .. }) => {
+                let Some(index) = index.as_int() else {
+                    return Err(RuntimeErrorKind::TypeError(
+                        "vector index must be int".to_owned(),
+                    ));
+                };
+                let index = usize::try_from(index)
+                    .map_err(|_| RuntimeErrorKind::Bounds("negative vector index".to_owned()))?;
+                if index >= values.len() {
+                    return Err(RuntimeErrorKind::Bounds(
+                        "vector index out of bounds".to_owned(),
+                    ));
+                }
+                Some(index)
+            }
+            Some(HeapData::Map { .. }) => None,
+            _ => {
+                return Err(RuntimeErrorKind::TypeError(format!(
+                    "{} does not support element assignment",
+                    self.type_name()
+                )));
+            }
+        };
         self.make_heap_unique()?;
         let map_needs_growth = matches!(
             self.heap_data(),
@@ -1832,16 +2318,11 @@ impl Value {
         self.charge_growth(map_growth)?;
         match self.heap_data_mut() {
             Some(HeapData::Vector { values, .. }) => {
-                let Some(index) = index.as_int() else {
-                    return Err(RuntimeErrorKind::TypeError(
-                        "vector index must be int".to_owned(),
+                let Some(slot) = vector_index.and_then(|index| values.get_mut(index)) else {
+                    return Err(RuntimeErrorKind::Bounds(
+                        "vector index out of bounds".to_owned(),
                     ));
                 };
-                let index = usize::try_from(index)
-                    .map_err(|_| RuntimeErrorKind::Bounds("negative vector index".to_owned()))?;
-                let slot = values.get_mut(index).ok_or_else(|| {
-                    RuntimeErrorKind::Bounds("vector index out of bounds".to_owned())
-                })?;
                 *slot = value;
                 Ok(())
             }
@@ -1857,13 +2338,7 @@ impl Value {
                 }
                 Ok(())
             }
-            _ => {
-                self.release_growth(map_growth);
-                Err(RuntimeErrorKind::TypeError(format!(
-                    "{} does not support element assignment",
-                    self.type_name()
-                )))
-            }
+            _ => unreachable!("collection kind was validated"),
         }
     }
 
@@ -1881,9 +2356,12 @@ impl Value {
                 HeapData::Bytes(bytes) => Some(bytes.clone()),
                 HeapData::Vector { .. }
                 | HeapData::Map { .. }
+                | HeapData::Closure { .. }
+                | HeapData::Generator { .. }
                 | HeapData::Object { .. }
                 | HeapData::Stream { .. }
-                | HeapData::Exception { .. } => None,
+                | HeapData::Exception { .. }
+                | HeapData::Reflection { .. } => None,
             },
             _ => None,
         }
@@ -1914,6 +2392,10 @@ impl Value {
                     format!("vector({})\n", values.len()).into_bytes()
                 }
                 HeapData::Map { entries, .. } => format!("map({})\n", entries.len()).into_bytes(),
+                HeapData::Closure { .. } => b"callable(closure)\n".to_vec(),
+                HeapData::Generator { class, .. } => {
+                    format!("object(class#{})\n", class.0).into_bytes()
+                }
                 HeapData::Object { class, .. } => {
                     format!("object(class#{})\n", class.0).into_bytes()
                 }
@@ -1922,6 +2404,9 @@ impl Value {
                 }
                 HeapData::Exception { class, .. } => {
                     format!("exception(class#{})\n", class.0).into_bytes()
+                }
+                HeapData::Reflection { class, .. } => {
+                    format!("object(class#{})\n", class.0).into_bytes()
                 }
             },
             _ => b"<invalid>\n".to_vec(),
@@ -2204,9 +2689,24 @@ enum HeapData {
         value_type: Type,
         entries: Vec<(Value, Value)>,
     },
+    Closure {
+        function: FunctionId,
+        captures: Vec<Value>,
+    },
+    Generator {
+        class: ClassId,
+        type_arguments: Vec<Type>,
+        state: RefCell<Option<GeneratorState>>,
+        frame_bytes: Cell<usize>,
+    },
     Object {
         class: ClassId,
+        type_arguments: Vec<Type>,
         properties: RefCell<Vec<Option<Value>>>,
+    },
+    Reflection {
+        class: ClassId,
+        value: OnceCell<ReflectionValue>,
     },
     Stream {
         class: ClassId,
@@ -2221,6 +2721,8 @@ enum HeapData {
         target: Option<Vec<u8>>,
         system_code: i64,
         suppressed: RefCell<Vec<Value>>,
+        origin: Cell<Option<Span>>,
+        trace: RefCell<Vec<StackFrame>>,
     },
 }
 
@@ -2230,6 +2732,8 @@ impl HeapData {
             Self::Bytes(bytes) => bytes.capacity(),
             Self::Vector { values, .. } => values.capacity() * mem::size_of::<Value>(),
             Self::Map { entries, .. } => entries.capacity() * mem::size_of::<(Value, Value)>(),
+            Self::Closure { captures, .. } => captures.capacity() * mem::size_of::<Value>(),
+            Self::Generator { frame_bytes, .. } => frame_bytes.get(),
             Self::Object { properties, .. } => {
                 properties.borrow().capacity() * mem::size_of::<Option<Value>>()
             }
@@ -2242,20 +2746,36 @@ impl HeapData {
                 message,
                 target,
                 suppressed,
+                trace,
                 ..
             } => {
                 properties.borrow().capacity() * mem::size_of::<Option<Value>>()
                     + message.borrow().capacity()
                     + target.as_ref().map_or(0, Vec::capacity)
                     + suppressed.borrow().capacity() * mem::size_of::<Value>()
+                    + trace.borrow().capacity() * mem::size_of::<StackFrame>()
+                    + trace
+                        .borrow()
+                        .iter()
+                        .map(|frame| {
+                            frame.function.capacity()
+                                + frame.class.as_ref().map_or(0, String::capacity)
+                        })
+                        .sum::<usize>()
             }
+            Self::Reflection { .. } => 0,
         }
     }
 
     fn is_collectable(&self) -> bool {
         matches!(
             self,
-            Self::Vector { .. } | Self::Map { .. } | Self::Object { .. } | Self::Exception { .. }
+            Self::Vector { .. }
+                | Self::Map { .. }
+                | Self::Closure { .. }
+                | Self::Generator { .. }
+                | Self::Object { .. }
+                | Self::Exception { .. }
         )
     }
 
@@ -2275,6 +2795,30 @@ impl HeapData {
                 for (key, value) in entries {
                     visit_value(key);
                     visit_value(value);
+                }
+            }
+            Self::Closure { captures, .. } => {
+                for value in captures {
+                    visit_value(value);
+                }
+            }
+            Self::Generator { state, .. } => {
+                if let Some(state) = state.borrow().as_ref() {
+                    for value in state
+                        .frame
+                        .locals
+                        .iter()
+                        .chain(&state.frame.registers)
+                        .flatten()
+                    {
+                        visit_value(value);
+                    }
+                    for value in [&state.key, &state.value, &state.return_value]
+                        .into_iter()
+                        .flatten()
+                    {
+                        visit_value(value);
+                    }
                 }
             }
             Self::Object { properties, .. } => {
@@ -2298,7 +2842,7 @@ impl HeapData {
                     visit_value(value);
                 }
             }
-            Self::Bytes(_) | Self::Stream { .. } => {}
+            Self::Bytes(_) | Self::Stream { .. } | Self::Reflection { .. } => {}
         }
     }
 
@@ -2306,6 +2850,10 @@ impl HeapData {
         match self {
             Self::Vector { values, .. } => values.clear(),
             Self::Map { entries, .. } => entries.clear(),
+            Self::Closure { captures, .. } => captures.clear(),
+            Self::Generator { state, .. } => {
+                state.get_mut().take();
+            }
             Self::Object { properties, .. } => properties.get_mut().clear(),
             Self::Exception {
                 properties,
@@ -2317,9 +2865,21 @@ impl HeapData {
                 drop(previous.get_mut().take());
                 suppressed.get_mut().clear();
             }
-            Self::Bytes(_) | Self::Stream { .. } => {}
+            Self::Bytes(_) | Self::Stream { .. } | Self::Reflection { .. } => {}
         }
     }
+}
+
+const STREAM_READ: u8 = 1;
+const STREAM_WRITE: u8 = 2;
+const STREAM_SEEK: u8 = 4;
+const STREAM_APPEND: u8 = 8;
+
+fn stream_flags(readable: bool, writable: bool, append: bool) -> u8 {
+    (u8::from(readable) * STREAM_READ)
+        | (u8::from(writable) * STREAM_WRITE)
+        | STREAM_SEEK
+        | (u8::from(append) * STREAM_APPEND)
 }
 
 #[derive(Debug)]
@@ -2327,31 +2887,43 @@ struct StreamState {
     storage: StreamStorage,
     cursor: usize,
     closed: bool,
+    busy: bool,
     spill_threshold: Option<usize>,
+    capabilities: u8,
     handle: Option<HandleLease>,
 }
 
 #[derive(Debug)]
 enum StreamStorage {
     Memory(Vec<u8>),
-    File { file: std::fs::File, length: usize },
+    File { file: std::fs::File },
     Input(RequestInput),
     Closed,
 }
 
 impl StreamState {
-    fn len(&self) -> usize {
+    fn has(&self, capability: u8) -> bool {
+        self.capabilities & capability != 0
+    }
+    fn len(&self) -> Result<usize, RuntimeErrorKind> {
         match &self.storage {
-            StreamStorage::Memory(bytes) => bytes.len(),
-            StreamStorage::File { length, .. } => *length,
-            StreamStorage::Input(_) | StreamStorage::Closed => self.cursor,
+            StreamStorage::Memory(bytes) => Ok(bytes.len()),
+            StreamStorage::File { file } => {
+                usize::try_from(file.metadata().map_err(stream_io_error)?.len())
+                    .map_err(|_| RuntimeErrorKind::Io("file is too large".to_owned()))
+            }
+            StreamStorage::Input(_) | StreamStorage::Closed => Ok(self.cursor),
         }
     }
 
     fn read_range(&mut self, start: usize, end: usize) -> Result<Vec<u8>, RuntimeErrorKind> {
         match &mut self.storage {
-            StreamStorage::Memory(bytes) => Ok(bytes[start..end].to_vec()),
-            StreamStorage::File { file, .. } => {
+            StreamStorage::Memory(bytes) => Ok(if start >= end {
+                Vec::new()
+            } else {
+                bytes[start..end].to_vec()
+            }),
+            StreamStorage::File { file } => {
                 file.seek(SeekFrom::Start(start as u64))
                     .map_err(stream_io_error)?;
                 let mut bytes = vec![0; end.saturating_sub(start)];
@@ -2380,10 +2952,7 @@ impl StreamState {
         };
         let mut file = tempfile::tempfile().map_err(stream_io_error)?;
         file.write_all(&bytes).map_err(stream_io_error)?;
-        self.storage = StreamStorage::File {
-            file,
-            length: bytes.len(),
-        };
+        self.storage = StreamStorage::File { file };
         Ok(())
     }
 
@@ -2404,14 +2973,13 @@ impl StreamState {
                 }
                 storage[self.cursor..end].copy_from_slice(bytes);
             }
-            StreamStorage::File { file, length } => {
-                if self.cursor > *length {
+            StreamStorage::File { file } => {
+                if (self.cursor as u64) > file.metadata().map_err(stream_io_error)?.len() {
                     file.set_len(self.cursor as u64).map_err(stream_io_error)?;
                 }
                 file.seek(SeekFrom::Start(self.cursor as u64))
                     .map_err(stream_io_error)?;
                 file.write_all(bytes).map_err(stream_io_error)?;
-                *length = (*length).max(end);
             }
             StreamStorage::Input(_) => {
                 return Err(RuntimeErrorKind::Io(
@@ -2429,6 +2997,10 @@ impl StreamState {
 fn ensure_stream_open(state: &StreamState) -> Result<(), RuntimeErrorKind> {
     if state.closed {
         Err(RuntimeErrorKind::Io("stream is closed".to_owned()))
+    } else if state.busy {
+        Err(RuntimeErrorKind::Io(
+            "stream has an outstanding file operation".to_owned(),
+        ))
     } else {
         Ok(())
     }
@@ -2526,6 +3098,8 @@ impl fmt::Display for RuntimeErrorKind {
 pub struct StackFrame {
     pub function: String,
     pub span: Span,
+    pub class: Option<String>,
+    pub static_method: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2533,6 +3107,7 @@ pub struct RuntimeError {
     pub kind: RuntimeErrorKind,
     pub span: Span,
     pub trace: Vec<StackFrame>,
+    pub suppressed: Vec<RuntimeErrorKind>,
 }
 
 impl RuntimeError {
@@ -2541,6 +3116,7 @@ impl RuntimeError {
             kind,
             span,
             trace: Vec::new(),
+            suppressed: Vec::new(),
         }
     }
 
@@ -2548,6 +3124,8 @@ impl RuntimeError {
         self.trace.push(StackFrame {
             function: function.into(),
             span,
+            class: None,
+            static_method: false,
         });
     }
 }
@@ -2561,6 +3139,9 @@ impl fmt::Display for RuntimeError {
                 "\n  at {} (source bytes {}..{})",
                 frame.function, frame.span.start, frame.span.end
             )?;
+        }
+        for suppressed in &self.suppressed {
+            write!(formatter, "\n  suppressed: {suppressed}")?;
         }
         Ok(())
     }
@@ -2599,6 +3180,27 @@ mod tests {
         left.vector_push(Value::integer(2)).unwrap();
         assert_eq!(left.count(), Some(2));
         assert_eq!(right.count(), Some(1));
+    }
+
+    #[test]
+    fn failed_collection_assignment_validates_before_detaching() {
+        let heap = RequestHeap::new(Some(1024 * 1024), None).unwrap();
+        let _active = heap.activate();
+        let mut value = Value::try_vector(Type::Int, vec![Value::integer(1)]).unwrap();
+        let _alias = value.clone();
+        let mut map = Value::try_map(Type::Int, Type::Int, Vec::new()).unwrap();
+        let _map_alias = map.clone();
+        heap.fail_allocations_after(0);
+
+        assert!(matches!(
+            value.set_index(&Value::integer(2), Value::integer(3)),
+            Err(RuntimeErrorKind::Bounds(message)) if message == "vector index out of bounds"
+        ));
+
+        assert!(matches!(
+            map.vector_push(Value::integer(1)),
+            Err(RuntimeErrorKind::TypeError(message)) if message == "array_push requires a vector"
+        ));
     }
 
     #[test]

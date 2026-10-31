@@ -34,10 +34,8 @@ errors:
       experimental unless named above.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: Opens a local directory and yields recursive entries through the common iterator protocol.
 version: "0.1"
 owner: std.spl.RecursiveDirectoryIterator
 visibility: public

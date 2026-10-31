@@ -8,18 +8,14 @@ order: 2
 typeParameters: []
 parameters: []
 returns:
-  type: ?Iterator<K, V>
+  type: Iterator<K, V>
   description: Returns the iterator used for the current cycle.
 errors:
-  - description:
-      No additional runtime failure beyond parameter validation and failures
-      propagated by delegated operations is specified.
+  - description: Fails before rewind or after an empty source leaves no current cycle.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.InfiniteIterator
 visibility: public
@@ -30,7 +26,7 @@ modifiers: []
 
 ## Behavior
 
-Returns the iterator used for the current cycle.
+Returns the iterator used for the current cycle. A cycle must be active.
 
 This operation does not change receiver state unless the description explicitly states otherwise.
 

@@ -7,19 +7,31 @@ THP is an experimental, statically typed, PHP-shaped language for greenfield
 programs. It has a standalone compiler, verified bytecode VM, persistent
 OPcache, and baseline Cranelift JIT.
 
-THP v0.1 is for command-line experiments. It is not production-ready, is not a
+THP v0.12.0 is for command-line experiments. It is not production-ready, is not a
 PHP-compatible replacement, does not run through the PHP engine, and is not yet
 a web backend. Familiar syntax never implies compatibility where THP has not
 defined behavior.
 
 ## Quick start
 
-Download the archive for your platform from
-[Releases](https://github.com/thp-lang/thp/releases), extract it, and
-place its `bin` directory on `PATH`. Each archive includes installation notes,
-official-binary terms, the Apache source notice, and third-party notices. The
-release publishes checksums and a Sigstore signature bundle alongside the
-archives.
+On Linux x86-64 (glibc) or macOS, install the latest THP release with:
+
+```sh
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/thp-lang/thp/main/install.sh | bash'
+```
+
+On Windows x86-64, run this in PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/thp-lang/thp/main/install.ps1 -ErrorAction Stop)))
+```
+
+The installers check the archive against the published SHA-256 manifest and
+install into a user-owned directory. On Linux and macOS, add `~/.local/bin` to
+`PATH` if the installer prompts you. On Windows, open a new terminal after
+installation. For a manually verified installation, download an archive from
+[Releases](https://github.com/thp-lang/thp/releases) and follow its
+[`INSTALL.md`](release/INSTALL.md), including the Sigstore signature check.
 
 Create `hello.thp`:
 
@@ -43,9 +55,15 @@ To build from source, install Rust 1.88 or newer and run:
 ```sh
 git clone https://github.com/thp-lang/thp.git
 cd thp
-cargo build --release -p thp-cli
+cargo build --release -p thp-cli -p thp-lsp
 target/release/thp run examples/hello.thp
+target/release/thp-lsp --version
 ```
+
+`thp-lsp` 0.6.0 is versioned independently under `thp-lsp-v*` tags. Its
+release archives contain only the experimental language server; editor plugins
+remain separate projects. See the
+[editor support guide](doc/content/guides/editor-support.md).
 
 The tested [`examples/project`](examples/project) program shows namespaces,
 typed interfaces and classes, collections, project autoloading, and structured
@@ -72,6 +90,7 @@ pages describing proposals are not promises that the feature executes.
 ## Command-line interface
 
 ```text
+thp lock [--project=DIR]
 thp check [--project=DIR] [--metrics=off|human|json] FILE
 thp inspect [--project=DIR] [--emit=tokens|ast|interfaces|module-graph|hir|mir|bytecode] [--metrics=...] FILE
 thp run [--project=DIR] [--engine=auto|vm|jit] [--opcache=off|PATH] [--max-instructions=N] [--metrics=...] FILE
@@ -81,6 +100,8 @@ thp cache-prune --opcache=PATH [--max-bytes=N] [--metrics=...]
 thp --version
 ```
 
+- `lock` snapshots resolved project and installed-package configuration for
+  deployment.
 - `check` compiles and type-checks without executing.
 - `inspect` displays compiler and project intermediate forms.
 - `run` uses the reference VM or supported JIT subset.
@@ -137,8 +158,7 @@ pnpm test:browser
 - [Contributing](CONTRIBUTING.md)
 - [Compiler and runtime architecture](ARCHITECTURE.md)
 
-External code contributions remain paused until lawyer-reviewed contribution
-terms are published. Bug reports, design feedback, and discussions are welcome.
+Bug reports, design feedback, discussions, and code contributions are welcome.
 
 ## Licensing
 

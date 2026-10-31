@@ -23,23 +23,25 @@ parameters:
     default: "false"
   - name: preg_flags
     type: int
-    description: Flags passed to the regular-expression engine.
+    description: Constant match or split flags for the selected mode.
     default: "0"
+  - name: replacement
+    type: string
+    description: Replacement template for REPLACE mode.
+    default: '""'
 returns:
   type: void
   description: This callable does not return a value.
 errors:
   - description:
-      Construction fails when an argument violates the documented contract or an
-      underlying resource cannot be created. Concrete THP error classes remain
-      experimental unless named above.
+      Invalid PCRE2 patterns fail at construction. Nonconstant modes or flags,
+      unsupported flag combinations, and mismatched generic output types are
+      compile errors.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
-version: "0.1"
+availability: implemented
+notice: Fixed mode and flag contracts execute in the reference VM.
+version: "0.11"
 owner: std.spl.RegexIterator
 visibility: public
 modifiers: []

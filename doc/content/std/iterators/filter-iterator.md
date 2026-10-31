@@ -18,11 +18,9 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: This experimental abstract adapter executes in the standalone compiler and reference VM.
+version: "0.6"
 ---
 
 This is an abstract class.
@@ -37,20 +35,30 @@ This is an abstract class.
 
 ## Behavior
 
-For each inner value, `accept($value)` determines whether the adapter yields or
-skips it. Implementations must keep filtering side effects predictable because
-the method runs during advancement.
+For each inner entry, `accept($value, $key)` decides whether it is yielded.
+The adapter preserves the `K` key and `V` value of each accepted entry. It
+rewinds its inner iterator when rewound, then tests entries lazily during
+`valid()`, `key()`, or `value()`. A successful test is cached until `advance()`;
+repeated `valid()` calls do not repeat that test. A rejected entry advances the
+inner iterator. The adapter itself does not allocate a result collection.
+An empty inner iterator calls no `accept()` method; its `K` and `V` types come
+from the typed iterator or explicit constructor arguments. An untyped empty
+literal without an expected iterator type is rejected.
 
 ## Errors
 
-Construction validates the parameters shown above. Cursor operations propagate failures from the wrapped iterator, callback, pattern engine, or filesystem when that dependency is present; each member page identifies the applicable source. Concrete THP error classes remain unsettled.
+Construction and callback creation can fail to allocate. Failures from
+`accept()` or inner cursor operations propagate unchanged. A failure during
+testing leaves the inner cursor at the entry that failed. External cursor
+mutation through `getInnerIterator()` while filtering is active has no
+coordinated cache invalidation.
 
 ## Example
 
 ```thp
-function consume<K, V>(FilterIterator<K, V> $values): void {
-    foreach ($values as $value) {
-        print($value);
+class EvenFilter extends FilterIterator<int, int> {
+    public function accept(int $value, int $key): bool {
+        return $value % 2 == 0;
     }
 }
 ```

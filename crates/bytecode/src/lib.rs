@@ -8,21 +8,30 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    Builtin, CalledClass, Callee, ClassId, FunctionId, LocalId, MethodSlot, NominalKind,
-    PropertyId, Type,
+    Builtin, CalledClass, Callee, ClassId, ConstantValue, DirectoryBuiltin, FileInfoBuiltin,
+    FileObjectBuiltin, FunctionId, LocalId, MAX_CONSTANT_NESTING, MethodSlot, NominalKind,
+    ParameterMetadata, PropertyId, Type, TypeParameter,
 };
 use thp_mir::{BlockId, Constant, Register};
 use thp_syntax::{BinaryOp, UnaryOp};
 
 pub use codec::{DecodeError, decode, encode};
 
-pub const BYTECODE_SCHEMA_VERSION: u16 = 1;
+pub const BYTECODE_SCHEMA_VERSION: u16 = 11;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceInfo {
+    pub path: String,
+    pub line_starts: Vec<u32>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Program {
     pub schema_version: u16,
+    pub sources: Vec<SourceInfo>,
     pub functions: Vec<Function>,
     pub classes: Vec<Class>,
+    pub native_functions: Vec<thp_hir::NativeSignature>,
     pub entry: FunctionId,
 }
 
@@ -33,21 +42,39 @@ pub struct Class {
     pub kind: NominalKind,
     pub abstract_class: bool,
     pub final_class: bool,
+    pub module_name: String,
+    pub native: bool,
+    pub type_parameters: Vec<TypeParameter>,
     pub properties: Vec<Property>,
+    pub declared_properties: Vec<Property>,
     pub methods: Vec<Method>,
+    pub declared_methods: Vec<Method>,
     pub dispatch: Vec<Option<Callee>>,
     pub interfaces: Vec<ClassId>,
+    pub interface_types: Vec<NominalType>,
     pub parent: Option<ClassId>,
+    pub parent_type: Option<NominalType>,
+    pub traits: Vec<ClassId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NominalType {
+    pub class: ClassId,
+    pub arguments: Vec<Type>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Property {
+    pub id: PropertyId,
+    pub name: String,
     pub ty: Type,
     pub visibility: thp_syntax::Visibility,
     pub declaring_class: ClassId,
+    pub default: Option<ConstantValue>,
+    pub origin_trait: Option<ClassId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Method {
     pub name: String,
     pub slot: MethodSlot,
@@ -58,7 +85,10 @@ pub struct Method {
     pub abstract_method: bool,
     pub final_method: bool,
     pub parameter_types: Vec<Type>,
+    pub parameters: Vec<ParameterMetadata>,
     pub return_type: Type,
+    pub origin_trait: Option<ClassId>,
+    pub origin_name: String,
 }
 
 impl Program {
@@ -75,9 +105,12 @@ impl Program {
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub module_name: String,
     pub parameters: Vec<LocalId>,
+    pub parameter_metadata: Vec<ParameterMetadata>,
     pub local_types: Vec<Type>,
     pub return_type: Type,
+    pub generator: bool,
     pub owner: Option<ClassId>,
     pub static_method: bool,
     pub register_types: Vec<Type>,
@@ -157,6 +190,14 @@ pub enum InstructionKind {
         callee: Callee,
         arguments: Vec<Register>,
     },
+    Closure {
+        function: FunctionId,
+        captures: Vec<Register>,
+    },
+    CallValue {
+        callee: Register,
+        arguments: Vec<Register>,
+    },
     DirectMethod {
         callee: Callee,
         arguments: Vec<Register>,
@@ -173,6 +214,15 @@ pub enum InstructionKind {
         arguments: Vec<Register>,
     },
     NewObject(ClassId),
+    NewDynamic {
+        target: Register,
+        type_arguments: Vec<Type>,
+        arguments: Vec<DynamicArgument>,
+    },
+    CheckedNarrow {
+        value: Register,
+        narrowed: Type,
+    },
     GetProperty {
         object: Register,
         property: PropertyId,
@@ -205,6 +255,13 @@ pub enum InstructionKind {
 }
 
 #[derive(Clone, Debug)]
+pub struct DynamicArgument {
+    pub name: Option<String>,
+    pub value: Register,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
 pub enum Terminator {
     Jump(BlockId),
     Branch {
@@ -213,6 +270,11 @@ pub enum Terminator {
         else_block: BlockId,
     },
     Return(Option<Register>),
+    Yield {
+        key: Option<Register>,
+        value: Register,
+        resume: BlockId,
+    },
     Throw(Register),
     Unreachable,
 }
@@ -220,6 +282,7 @@ pub enum Terminator {
 pub fn lower(module: &thp_mir::Module) -> Program {
     Program {
         schema_version: BYTECODE_SCHEMA_VERSION,
+        sources: Vec::new(),
         entry: module.entry,
         classes: module
             .classes
@@ -230,31 +293,17 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                 kind: class.kind,
                 abstract_class: class.abstract_class,
                 final_class: class.final_class,
-                properties: class
-                    .properties
+                module_name: class.module_name.clone(),
+                native: class.native,
+                type_parameters: class.type_parameters.clone(),
+                properties: class.properties.iter().map(lower_property).collect(),
+                declared_properties: class
+                    .declared_properties
                     .iter()
-                    .map(|property| Property {
-                        ty: property.ty.clone(),
-                        visibility: property.visibility,
-                        declaring_class: property.declaring_class,
-                    })
+                    .map(lower_property)
                     .collect(),
-                methods: class
-                    .methods
-                    .iter()
-                    .map(|method| Method {
-                        name: method.name.clone(),
-                        slot: method.slot,
-                        callee: method.callee,
-                        visibility: method.visibility,
-                        declaring_class: method.declaring_class,
-                        static_method: method.static_method,
-                        abstract_method: method.abstract_method,
-                        final_method: method.final_method,
-                        parameter_types: method.parameter_types.clone(),
-                        return_type: method.return_type.clone(),
-                    })
-                    .collect(),
+                methods: class.methods.iter().map(lower_method).collect(),
+                declared_methods: class.declared_methods.iter().map(lower_method).collect(),
                 dispatch: class.dispatch.clone(),
                 interfaces: class
                     .interfaces
@@ -267,6 +316,11 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                             .map(|interface| interface.id)
                     })
                     .collect(),
+                interface_types: class
+                    .interface_types
+                    .iter()
+                    .filter_map(|ty| lower_nominal_type(ty, &module.classes))
+                    .collect(),
                 parent: class.parent.as_ref().and_then(|parent| {
                     module
                         .classes
@@ -274,17 +328,26 @@ pub fn lower(module: &thp_mir::Module) -> Program {
                         .find(|candidate| &candidate.name == parent)
                         .map(|parent| parent.id)
                 }),
+                parent_type: class
+                    .parent_type
+                    .as_ref()
+                    .and_then(|ty| lower_nominal_type(ty, &module.classes)),
+                traits: class.traits.clone(),
             })
             .collect(),
+        native_functions: module.native_functions.clone(),
         functions: module
             .functions
             .iter()
             .map(|function| Function {
                 id: function.id,
                 name: function.name.clone(),
+                module_name: function.module_name.clone(),
                 parameters: function.parameters.clone(),
+                parameter_metadata: function.parameter_metadata.clone(),
                 local_types: function.local_types.clone(),
                 return_type: function.return_type.clone(),
+                generator: function.generator,
                 owner: function.owner,
                 static_method: function.static_method,
                 register_types: function.register_types.clone(),
@@ -327,6 +390,51 @@ pub fn lower(module: &thp_mir::Module) -> Program {
             })
             .collect(),
     }
+}
+
+fn lower_property(property: &thp_hir::Property) -> Property {
+    Property {
+        id: property.id,
+        name: property.name.clone(),
+        ty: property.ty.clone(),
+        visibility: property.visibility,
+        declaring_class: property.declaring_class,
+        default: property.default.clone(),
+        origin_trait: property.origin_trait,
+    }
+}
+
+fn lower_method(method: &thp_hir::Method) -> Method {
+    Method {
+        name: method.name.clone(),
+        slot: method.slot,
+        callee: method.callee,
+        visibility: method.visibility,
+        declaring_class: method.declaring_class,
+        static_method: method.static_method,
+        abstract_method: method.abstract_method,
+        final_method: method.final_method,
+        parameter_types: method.parameter_types.clone(),
+        parameters: method.parameters.clone(),
+        return_type: method.return_type.clone(),
+        origin_trait: method.origin_trait,
+        origin_name: method.origin_name.clone(),
+    }
+}
+
+fn lower_nominal_type(ty: &Type, classes: &[thp_hir::Class]) -> Option<NominalType> {
+    let (name, arguments) = match ty {
+        Type::Object(name) => (name, Vec::new()),
+        Type::Nominal { name, arguments } => (name, arguments.clone()),
+        _ => return None,
+    };
+    classes
+        .iter()
+        .find(|class| &class.name == name)
+        .map(|class| NominalType {
+            class: class.id,
+            arguments,
+        })
 }
 
 fn lower_instruction(instruction: &thp_mir::InstructionKind) -> InstructionKind {
@@ -381,6 +489,14 @@ fn lower_instruction(instruction: &thp_mir::InstructionKind) -> InstructionKind 
             callee: *callee,
             arguments: arguments.clone(),
         },
+        thp_mir::InstructionKind::Closure { function, captures } => InstructionKind::Closure {
+            function: *function,
+            captures: captures.clone(),
+        },
+        thp_mir::InstructionKind::CallValue { callee, arguments } => InstructionKind::CallValue {
+            callee: *callee,
+            arguments: arguments.clone(),
+        },
         thp_mir::InstructionKind::DirectMethod {
             callee,
             arguments,
@@ -409,6 +525,28 @@ fn lower_instruction(instruction: &thp_mir::InstructionKind) -> InstructionKind 
             arguments: arguments.clone(),
         },
         thp_mir::InstructionKind::NewObject(class) => InstructionKind::NewObject(*class),
+        thp_mir::InstructionKind::NewDynamic {
+            target,
+            type_arguments,
+            arguments,
+        } => InstructionKind::NewDynamic {
+            target: *target,
+            type_arguments: type_arguments.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| DynamicArgument {
+                    name: argument.name.clone(),
+                    value: argument.value,
+                    span: argument.span,
+                })
+                .collect(),
+        },
+        thp_mir::InstructionKind::CheckedNarrow { value, narrowed } => {
+            InstructionKind::CheckedNarrow {
+                value: *value,
+                narrowed: narrowed.clone(),
+            }
+        }
         thp_mir::InstructionKind::GetProperty { object, property } => {
             InstructionKind::GetProperty {
                 object: *object,
@@ -472,6 +610,11 @@ fn lower_terminator(terminator: &thp_mir::Terminator) -> Terminator {
             else_block: *else_block,
         },
         thp_mir::Terminator::Return(value) => Terminator::Return(*value),
+        thp_mir::Terminator::Yield { key, value, resume } => Terminator::Yield {
+            key: *key,
+            value: *value,
+            resume: *resume,
+        },
         thp_mir::Terminator::Throw(value) => Terminator::Throw(*value),
         thp_mir::Terminator::Unreachable => Terminator::Unreachable,
     }
@@ -519,6 +662,27 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
     if program.entry.0 as usize >= program.functions.len() {
         return Err(global_error("entry function is out of bounds"));
     }
+    if program.sources.iter().any(|source| {
+        source.line_starts.first() != Some(&0)
+            || source.line_starts.windows(2).any(|pair| pair[0] >= pair[1])
+    }) {
+        return Err(global_error("invalid source line table"));
+    }
+    if program.functions.iter().any(|function| {
+        std::iter::once(function.span)
+            .chain(function.blocks.iter().flat_map(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .map(|instruction| instruction.span)
+            }))
+            .any(|span| {
+                span.source
+                    .is_some_and(|source| source.0 as usize >= program.sources.len())
+            })
+    }) {
+        return Err(global_error("source span references a missing source"));
+    }
     for (index, class) in program.classes.iter().enumerate() {
         if program.classes[..index]
             .iter()
@@ -535,6 +699,12 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
             return Err(global_error(format!(
                 "class id {} does not match index {index}",
                 class.id.0
+            )));
+        }
+        if class.module_name.is_empty() {
+            return Err(global_error(format!(
+                "class {} has no owning module",
+                class.name
             )));
         }
         if class
@@ -587,10 +757,94 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 class.name
             )));
         }
+        for (parameter_index, parameter) in class.type_parameters.iter().enumerate() {
+            if parameter.id.owner != class.id || parameter.id.index as usize != parameter_index {
+                return Err(global_error(format!(
+                    "{} has a malformed type-parameter identity",
+                    class.name
+                )));
+            }
+            if class.type_parameters[..parameter_index]
+                .iter()
+                .any(|previous| previous.name == parameter.name)
+            {
+                return Err(global_error(format!(
+                    "{} has duplicate type-parameter names",
+                    class.name
+                )));
+            }
+            if let Some(bound) = &parameter.bound {
+                verify_encoded_type(program, bound)?;
+                if !matches!(bound, Type::Object(_) | Type::Nominal { .. }) {
+                    return Err(global_error(format!(
+                        "{} has a non-nominal type-parameter bound",
+                        class.name
+                    )));
+                }
+            }
+        }
+        if class.parent != class.parent_type.as_ref().map(|parent| parent.class) {
+            return Err(global_error(format!(
+                "{} has inconsistent instantiated parent metadata",
+                class.name
+            )));
+        }
+        if class.interfaces.len() != class.interface_types.len()
+            || class
+                .interfaces
+                .iter()
+                .zip(&class.interface_types)
+                .any(|(erased, instantiated)| erased != &instantiated.class)
+        {
+            return Err(global_error(format!(
+                "{} has inconsistent instantiated interface metadata",
+                class.name
+            )));
+        }
+        if let Some(parent) = &class.parent_type {
+            verify_nominal_type(program, parent)?;
+        }
+        for interface in &class.interface_types {
+            verify_nominal_type(program, interface)?;
+        }
         for interface in &class.interfaces {
             if program.classes[interface.0 as usize].kind != NominalKind::Interface {
                 return Err(global_error(format!(
                     "{} has a non-interface in its interface closure",
+                    class.name
+                )));
+            }
+        }
+        for trait_id in &class.traits {
+            let Some(trait_class) = program.classes.get(trait_id.0 as usize) else {
+                return Err(global_error(format!(
+                    "{} has an out-of-bounds trait",
+                    class.name
+                )));
+            };
+            if trait_class.kind != NominalKind::Trait {
+                return Err(global_error(format!(
+                    "{} has a non-trait in its trait metadata",
+                    class.name
+                )));
+            }
+        }
+        if class.kind == NominalKind::Class && !class.abstract_class {
+            let has = |name: &str| {
+                class
+                    .interfaces
+                    .iter()
+                    .any(|interface| program.classes[interface.0 as usize].name == name)
+            };
+            if has("Traversable") && !has("Iterator") && !has("IteratorAggregate") {
+                return Err(global_error(format!(
+                    "concrete class {} has no iterator strategy",
+                    class.name
+                )));
+            }
+            if has("Iterator") && has("IteratorAggregate") {
+                return Err(global_error(format!(
+                    "concrete class {} has two iterator strategies",
                     class.name
                 )));
             }
@@ -614,17 +868,80 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                     class.name
                 )));
             }
-        }
-        for property in &class.properties {
-            if property.declaring_class.0 as usize >= program.classes.len() {
+            if !class.type_parameters.is_empty() {
                 return Err(global_error(format!(
-                    "{} has a property with an invalid declaring class",
+                    "{} is an unsupported generic throwable",
                     class.name
                 )));
             }
         }
+        for (property_index, property) in class.properties.iter().enumerate() {
+            verify_encoded_type(program, &property.ty)?;
+            if property.id.0 as usize != property_index
+                || property.name.is_empty()
+                || property.declaring_class.0 as usize >= program.classes.len()
+                || property.origin_trait.is_some_and(|origin| {
+                    program
+                        .classes
+                        .get(origin.0 as usize)
+                        .is_none_or(|origin| origin.kind != NominalKind::Trait)
+                })
+                || property.default.as_ref().is_some_and(|value| {
+                    !constant_value_within_nesting_limit(value, 0)
+                        || !constant_matches_type(program, value, &property.ty)
+                })
+            {
+                return Err(global_error(format!(
+                    "{} has invalid property metadata",
+                    class.name
+                )));
+            }
+        }
+        if class.declared_properties.iter().any(|declared| {
+            declared.declaring_class != class.id
+                || class
+                    .properties
+                    .get(declared.id.0 as usize)
+                    .is_none_or(|property| {
+                        property.name != declared.name
+                            || property.declaring_class != declared.declaring_class
+                    })
+        }) {
+            return Err(global_error(format!(
+                "{} has inconsistent declared property metadata",
+                class.name
+            )));
+        }
         for method in &class.methods {
-            if method.slot.0 as usize >= class.dispatch.len()
+            for ty in &method.parameter_types {
+                verify_encoded_type(program, ty)?;
+            }
+            verify_encoded_type(program, &method.return_type)?;
+            if method.name.is_empty()
+                || method.origin_name.is_empty()
+                || method.parameters.len() != method.parameter_types.len()
+                || method
+                    .parameters
+                    .iter()
+                    .zip(&method.parameter_types)
+                    .any(|(parameter, ty)| {
+                        *ty != if parameter.variadic {
+                            Type::Vector(Box::new(parameter.ty.clone()))
+                        } else {
+                            parameter.ty.clone()
+                        }
+                    })
+                || !parameter_metadata_valid(program, &method.parameters)
+                || method.origin_trait.is_some_and(|origin| {
+                    program.classes.get(origin.0 as usize).is_none_or(|origin| {
+                        origin.kind != NominalKind::Trait
+                            || !origin
+                                .declared_methods
+                                .iter()
+                                .any(|candidate| candidate.name == method.origin_name)
+                    })
+                })
+                || method.slot.0 as usize >= class.dispatch.len()
                 || method.declaring_class.0 as usize >= program.classes.len()
             {
                 return Err(global_error(format!(
@@ -647,6 +964,15 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 )));
             }
         }
+        if class.declared_methods.iter().any(|declared| {
+            declared.declaring_class != class.id
+                || !class.methods.iter().any(|method| method == declared)
+        }) {
+            return Err(global_error(format!(
+                "{} has inconsistent declared method metadata",
+                class.name
+            )));
+        }
         if class.kind == NominalKind::Class
             && !class.abstract_class
             && class
@@ -668,6 +994,9 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 format!("function id {} does not match index {index}", function.id.0),
             ));
         }
+        if function.module_name.is_empty() {
+            return Err(function_error(function.id, "function has no owning module"));
+        }
         if function
             .owner
             .is_some_and(|owner| owner.0 as usize >= program.classes.len())
@@ -677,9 +1006,192 @@ pub fn verify(program: &Program) -> Result<(), VerificationError> {
                 "function owner is out of bounds",
             ));
         }
+        for ty in function
+            .local_types
+            .iter()
+            .chain(&function.register_types)
+            .chain(std::iter::once(&function.return_type))
+        {
+            verify_encoded_type(program, ty)?;
+        }
+        let receiver_count = usize::from(function.owner.is_some() && !function.static_method);
+        if function.parameters.len() != function.parameter_metadata.len() + receiver_count
+            || !parameter_metadata_valid(program, &function.parameter_metadata)
+            || function
+                .parameters
+                .iter()
+                .skip(receiver_count)
+                .zip(&function.parameter_metadata)
+                .any(|(local, parameter)| {
+                    function.local_types.get(local.0 as usize).is_none_or(|ty| {
+                        *ty != if parameter.variadic {
+                            Type::Vector(Box::new(parameter.ty.clone()))
+                        } else {
+                            parameter.ty.clone()
+                        }
+                    })
+                })
+        {
+            return Err(function_error(
+                function.id,
+                "function has invalid parameter metadata",
+            ));
+        }
         verify_function(program, function)?;
     }
     Ok(())
+}
+
+fn parameter_metadata_valid(program: &Program, parameters: &[ParameterMetadata]) -> bool {
+    parameters.iter().enumerate().all(|(index, parameter)| {
+        !parameter.name.is_empty()
+            && !parameters[..index]
+                .iter()
+                .any(|previous| previous.name == parameter.name)
+            && (!parameter.variadic || index + 1 == parameters.len())
+            && (!parameter.variadic || parameter.default.is_none())
+            && verify_encoded_type(program, &parameter.ty).is_ok()
+            && parameter.default.as_ref().is_none_or(|value| {
+                constant_value_within_nesting_limit(value, 0)
+                    && constant_matches_type(program, value, &parameter.ty)
+            })
+    })
+}
+
+fn constant_matches_type(program: &Program, value: &ConstantValue, expected: &Type) -> bool {
+    if expected == &Type::Mixed {
+        return true;
+    }
+    if let Type::Union(members) = expected {
+        return members
+            .iter()
+            .any(|member| constant_matches_type(program, value, member));
+    }
+    match (value, expected) {
+        (ConstantValue::Vector(values), Type::Vector(element)) => values
+            .iter()
+            .all(|value| constant_matches_type(program, value, element)),
+        (ConstantValue::Map(entries), Type::Map(key, value)) => entries.iter().all(|entry| {
+            constant_matches_type(program, &entry.0, key)
+                && constant_matches_type(program, &entry.1, value)
+        }),
+        (ConstantValue::Int(_), _) => type_accepts(program, expected, &Type::Int),
+        (ConstantValue::Float(_), _) => type_accepts(program, expected, &Type::Float),
+        (ConstantValue::Bool(_), _) => type_accepts(program, expected, &Type::Bool),
+        (ConstantValue::Null, _) => type_accepts(program, expected, &Type::Null),
+        (ConstantValue::String(_), _) => type_accepts(program, expected, &Type::String),
+        (ConstantValue::Vector(_) | ConstantValue::Map(_), _) => false,
+    }
+}
+
+fn verify_nominal_type(program: &Program, nominal: &NominalType) -> Result<(), VerificationError> {
+    let Some(class) = program.classes.get(nominal.class.0 as usize) else {
+        return Err(global_error("instantiated nominal class is out of bounds"));
+    };
+    if nominal.arguments.len() != class.type_parameters.len() {
+        return Err(global_error(format!(
+            "instantiated type {} has incorrect argument arity",
+            class.name
+        )));
+    }
+    for argument in &nominal.arguments {
+        verify_encoded_type(program, argument)?;
+        if contains_void(argument)
+            && !(matches!(
+                class.name.as_str(),
+                "Awaitable" | "Completable" | "Coroutine"
+            ) && *argument == Type::Void)
+        {
+            return Err(global_error("generic type argument contains void"));
+        }
+    }
+    let instantiated = NominalType {
+        class: class.id,
+        arguments: nominal.arguments.clone(),
+    };
+    for (parameter, argument) in class.type_parameters.iter().zip(&nominal.arguments) {
+        if let Some(bound) = &parameter.bound {
+            let bound = substitute_descriptor_type(bound, Some(&instantiated), class);
+            if !type_accepts(program, &bound, argument) {
+                return Err(global_error(format!(
+                    "type argument {argument} does not satisfy bound {bound} for {}",
+                    parameter.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_encoded_type(program: &Program, ty: &Type) -> Result<(), VerificationError> {
+    match ty {
+        Type::Vector(element) => verify_encoded_type(program, element),
+        Type::Map(key, value) => {
+            verify_encoded_type(program, key)?;
+            verify_encoded_type(program, value)
+        }
+        Type::Callable(parameters, result) => {
+            for parameter in parameters {
+                verify_encoded_type(program, parameter)?;
+            }
+            verify_encoded_type(program, result)
+        }
+        Type::Union(members) => {
+            for member in members {
+                verify_encoded_type(program, member)?;
+            }
+            Ok(())
+        }
+        Type::Object(name) => {
+            let Some(class) = class_by_name(program, name) else {
+                return Err(global_error(format!("type names unknown nominal {name}")));
+            };
+            if !class.type_parameters.is_empty() {
+                return Err(global_error(format!(
+                    "raw generic type {name} is not permitted"
+                )));
+            }
+            Ok(())
+        }
+        Type::Nominal { name, arguments } => {
+            let Some(class) = class_by_name(program, name) else {
+                return Err(global_error(format!("type names unknown nominal {name}")));
+            };
+            verify_nominal_type(
+                program,
+                &NominalType {
+                    class: class.id,
+                    arguments: arguments.clone(),
+                },
+            )
+        }
+        Type::Parameter { id, name } => {
+            let Some(parameter) = program
+                .classes
+                .get(id.owner.0 as usize)
+                .and_then(|class| class.type_parameters.get(id.index as usize))
+            else {
+                return Err(global_error("type references an unknown type parameter"));
+            };
+            if parameter.id != *id || parameter.name != *name {
+                return Err(global_error("type-parameter metadata is inconsistent"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn contains_void(ty: &Type) -> bool {
+    match ty {
+        Type::Void => true,
+        Type::Vector(element) => contains_void(element),
+        Type::Map(key, value) => contains_void(key) || contains_void(value),
+        Type::Callable(parameters, _) => parameters.iter().any(contains_void),
+        Type::Union(members) => members.iter().any(contains_void),
+        Type::Nominal { arguments, .. } => arguments.iter().any(contains_void),
+        _ => false,
+    }
 }
 
 fn has_parent_cycle(program: &Program, start: ClassId) -> bool {
@@ -747,7 +1259,11 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
             if let Some(parent) = class.parent.filter(|_| class.kind == NominalKind::Class) {
                 let parent = &program.classes[parent.0 as usize];
                 if let Some(inherited) = parent.properties.get(property_index)
-                    && (inherited.ty != property.ty
+                    && (substitute_descriptor_type(
+                        &inherited.ty,
+                        class.parent_type.as_ref(),
+                        parent,
+                    ) != property.ty
                         || inherited.visibility != property.visibility
                         || inherited.declaring_class != property.declaring_class)
                 {
@@ -783,7 +1299,32 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                     class.name
                 )));
             }
+            let parent_instantiation = class
+                .parent_type
+                .as_ref()
+                .expect("erased and instantiated parent metadata agreed");
+            if class.kind == NominalKind::Interface
+                && !class.interface_types.contains(parent_instantiation)
+            {
+                return Err(global_error(format!(
+                    "{} has an incomplete instantiated interface closure",
+                    class.name
+                )));
+            }
+            for inherited in &parent.interface_types {
+                let inherited =
+                    instantiate_nominal_edge(inherited, Some(parent_instantiation), parent);
+                if !class.interface_types.contains(&inherited) {
+                    return Err(global_error(format!(
+                        "{} has an incomplete or conflicting instantiated interface closure",
+                        class.name
+                    )));
+                }
+            }
             for inherited in &parent.methods {
+                if inherited.visibility == thp_syntax::Visibility::Private {
+                    continue;
+                }
                 let Some(method) = class
                     .methods
                     .iter()
@@ -794,17 +1335,24 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                         class.name, inherited.name
                     )));
                 };
+                let inherited =
+                    instantiate_descriptor_method(inherited, class.parent_type.as_ref(), parent);
                 if method.slot != inherited.slot
-                    || !method_signature_equal(method, inherited)
+                    || !(method_signature_equal(method, &inherited)
+                        || matches!(
+                            class.name.as_str(),
+                            "CallbackFilterIterator" | "RecursiveCallbackFilterIterator"
+                        ) && inherited.name == "__construct")
                     || visibility_rank(method.visibility) < visibility_rank(inherited.visibility)
+                    || (method.declaring_class == inherited.declaring_class
+                        && method.callee != inherited.callee)
                 {
                     return Err(global_error(format!(
                         "{} has an incompatible inherited method {}",
                         class.name, inherited.name
                     )));
                 }
-                if (inherited.final_method
-                    || inherited.visibility == thp_syntax::Visibility::Private)
+                if inherited.final_method
                     && (method.callee != inherited.callee
                         || method.declaring_class != inherited.declaring_class)
                 {
@@ -815,9 +1363,27 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                 }
             }
         }
+        for instantiated in &class.interface_types {
+            let interface = &program.classes[instantiated.class.0 as usize];
+            for inherited in &interface.interface_types {
+                let inherited = instantiate_nominal_edge(inherited, Some(instantiated), interface);
+                if !class.interface_types.contains(&inherited) {
+                    return Err(global_error(format!(
+                        "{} has an incomplete or conflicting instantiated interface closure",
+                        class.name
+                    )));
+                }
+            }
+        }
         for interface in &class.interfaces {
             let interface = &program.classes[interface.0 as usize];
+            let instantiated = class
+                .interface_types
+                .iter()
+                .find(|candidate| candidate.class == interface.id);
             for requirement in &interface.methods {
+                let requirement =
+                    instantiate_descriptor_method(requirement, instantiated, interface);
                 let Some(method) = class
                     .methods
                     .iter()
@@ -828,7 +1394,7 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                         class.name, requirement.name
                     )));
                 };
-                if !method_signature_equal(method, requirement)
+                if !method_signature_equal(method, &requirement)
                     || method.visibility != thp_syntax::Visibility::Public
                 {
                     return Err(global_error(format!(
@@ -892,7 +1458,9 @@ fn verify_descriptor_consistency(program: &Program) -> Result<(), VerificationEr
                     class.name
                 )));
             }
-            if let Some(Callee::Function(function)) = method.callee {
+            if method.declaring_class == class.id
+                && let Some(Callee::Function(function)) = method.callee
+            {
                 verify_user_method(program, method, function)?;
             }
         }
@@ -917,6 +1485,263 @@ fn method_signature_equal(left: &Method, right: &Method) -> bool {
     left.static_method == right.static_method
         && left.parameter_types == right.parameter_types
         && left.return_type == right.return_type
+}
+
+fn normalize_union(members: Vec<Type>) -> Type {
+    let mut flat = Vec::new();
+    for member in members {
+        match member {
+            Type::Union(nested) => flat.extend(nested),
+            member => flat.push(member),
+        }
+    }
+    flat.sort_by_key(ToString::to_string);
+    flat.dedup();
+    match flat.as_slice() {
+        [single] => single.clone(),
+        _ => Type::Union(flat),
+    }
+}
+
+fn substitute_descriptor_type(
+    ty: &Type,
+    instantiated: Option<&NominalType>,
+    declaration: &Class,
+) -> Type {
+    fn apply(
+        ty: &Type,
+        substitutions: &std::collections::BTreeMap<thp_hir::TypeParameterId, Type>,
+    ) -> Type {
+        match ty {
+            Type::Parameter { id, .. } => {
+                substitutions.get(id).cloned().unwrap_or_else(|| ty.clone())
+            }
+            Type::Vector(element) => Type::Vector(Box::new(apply(element, substitutions))),
+            Type::Map(key, value) => Type::Map(
+                Box::new(apply(key, substitutions)),
+                Box::new(apply(value, substitutions)),
+            ),
+            Type::Callable(parameters, result) => Type::Callable(
+                parameters
+                    .iter()
+                    .map(|parameter| apply(parameter, substitutions))
+                    .collect(),
+                Box::new(apply(result, substitutions)),
+            ),
+            Type::Union(members) => normalize_union(
+                members
+                    .iter()
+                    .map(|member| apply(member, substitutions))
+                    .collect(),
+            ),
+            Type::Nominal { name, arguments } => Type::Nominal {
+                name: name.clone(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| apply(argument, substitutions))
+                    .collect(),
+            },
+            _ => ty.clone(),
+        }
+    }
+    let substitutions = instantiated
+        .into_iter()
+        .flat_map(|instantiated| {
+            declaration
+                .type_parameters
+                .iter()
+                .zip(&instantiated.arguments)
+                .map(|(parameter, argument)| (parameter.id, argument.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    apply(ty, &substitutions)
+}
+
+fn instantiate_descriptor_method(
+    method: &Method,
+    instantiated: Option<&NominalType>,
+    declaration: &Class,
+) -> Method {
+    let mut method = method.clone();
+    method.parameter_types = method
+        .parameter_types
+        .iter()
+        .map(|ty| substitute_descriptor_type(ty, instantiated, declaration))
+        .collect();
+    method.return_type = substitute_descriptor_type(&method.return_type, instantiated, declaration);
+    method
+}
+
+fn instantiate_nominal_edge(
+    edge: &NominalType,
+    instantiated: Option<&NominalType>,
+    declaration: &Class,
+) -> NominalType {
+    NominalType {
+        class: edge.class,
+        arguments: edge
+            .arguments
+            .iter()
+            .map(|argument| substitute_descriptor_type(argument, instantiated, declaration))
+            .collect(),
+    }
+}
+
+fn declaration_bytecode_type(class: &Class) -> Type {
+    if class.type_parameters.is_empty() {
+        Type::Object(class.name.clone())
+    } else {
+        Type::Nominal {
+            name: class.name.clone(),
+            arguments: class
+                .type_parameters
+                .iter()
+                .map(|parameter| Type::Parameter {
+                    id: parameter.id,
+                    name: parameter.name.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn encoded_nominal_parts(ty: &Type) -> Option<(&str, &[Type])> {
+    match ty {
+        Type::Object(name) => Some((name, &[])),
+        Type::Nominal { name, arguments } => Some((name, arguments)),
+        _ => None,
+    }
+}
+
+fn encoded_nominal_lookup_type(program: &Program, ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Object(_) | Type::Nominal { .. } => Some(ty.clone()),
+        Type::Union(members) => {
+            let mut non_null = members.iter().filter(|member| **member != Type::Null);
+            let only = non_null.next()?;
+            non_null
+                .next()
+                .is_none()
+                .then(|| only.clone())
+                .and_then(|only| encoded_nominal_lookup_type(program, &only))
+        }
+        Type::Parameter { id, .. } => program
+            .classes
+            .get(id.owner.0 as usize)
+            .and_then(|class| class.type_parameters.get(id.index as usize))
+            .and_then(|parameter| parameter.bound.as_ref())
+            .and_then(|bound| encoded_nominal_lookup_type(program, bound)),
+        _ => None,
+    }
+}
+
+fn instantiation_for_class(program: &Program, ty: &Type, target: ClassId) -> Option<NominalType> {
+    if let Type::Parameter { id, .. } = ty {
+        let bound = program
+            .classes
+            .get(id.owner.0 as usize)?
+            .type_parameters
+            .get(id.index as usize)?
+            .bound
+            .as_ref()?;
+        return instantiation_for_class(program, bound, target);
+    }
+    let (name, arguments) = encoded_nominal_parts(ty)?;
+    let class = class_by_name(program, name)?;
+    let current = NominalType {
+        class: class.id,
+        arguments: arguments.to_vec(),
+    };
+    if class.id == target {
+        return Some(current);
+    }
+    class
+        .parent_type
+        .iter()
+        .chain(&class.interface_types)
+        .map(|edge| {
+            let edge_class = &program.classes[edge.class.0 as usize];
+            let arguments = edge
+                .arguments
+                .iter()
+                .map(|argument| substitute_descriptor_type(argument, Some(&current), class))
+                .collect::<Vec<_>>();
+            if arguments.is_empty() {
+                Type::Object(edge_class.name.clone())
+            } else {
+                Type::Nominal {
+                    name: edge_class.name.clone(),
+                    arguments,
+                }
+            }
+        })
+        .find_map(|edge| instantiation_for_class(program, &edge, target))
+}
+
+fn infer_descriptor_instantiation(
+    method: &Method,
+    arguments: &[Register],
+    result: Option<&Type>,
+    caller: &Function,
+    declaration: &Class,
+) -> Option<NominalType> {
+    fn unify(
+        pattern: &Type,
+        actual: &Type,
+        output: &mut std::collections::BTreeMap<thp_hir::TypeParameterId, Type>,
+    ) {
+        match (pattern, actual) {
+            (Type::Parameter { id, .. }, actual) => {
+                output.entry(*id).or_insert_with(|| actual.clone());
+            }
+            (Type::Vector(pattern), Type::Vector(actual)) => unify(pattern, actual, output),
+            (Type::Map(pk, pv), Type::Map(ak, av)) => {
+                unify(pk, ak, output);
+                unify(pv, av, output);
+            }
+            (Type::Callable(pp, pr), Type::Callable(ap, ar)) if pp.len() == ap.len() => {
+                for (pattern, actual) in pp.iter().zip(ap) {
+                    unify(pattern, actual, output);
+                }
+                unify(pr, ar, output);
+            }
+            (
+                Type::Nominal {
+                    name: pn,
+                    arguments: pa,
+                },
+                Type::Nominal {
+                    name: an,
+                    arguments: aa,
+                },
+            ) if pn == an => {
+                for (pattern, actual) in pa.iter().zip(aa) {
+                    unify(pattern, actual, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut inferred = std::collections::BTreeMap::new();
+    if let Some(result) = result {
+        unify(&method.return_type, result, &mut inferred);
+    }
+    for (pattern, argument) in method.parameter_types.iter().zip(arguments) {
+        unify(
+            pattern,
+            &caller.register_types[argument.0 as usize],
+            &mut inferred,
+        );
+    }
+    let arguments = declaration
+        .type_parameters
+        .iter()
+        .map(|parameter| inferred.get(&parameter.id).cloned())
+        .collect::<Option<Vec<_>>>()?;
+    Some(NominalType {
+        class: declaration.id,
+        arguments,
+    })
 }
 
 const fn visibility_rank(visibility: thp_syntax::Visibility) -> u8 {
@@ -963,7 +1788,7 @@ fn verify_user_method(
     if !method.static_method {
         let receiver = parameters.next().expect("receiver count was checked");
         let declaring = &program.classes[method.declaring_class.0 as usize];
-        if function.local_types[receiver.0 as usize] != Type::Object(declaring.name.clone()) {
+        if function.local_types[receiver.0 as usize] != declaration_bytecode_type(declaring) {
             return Err(global_error(format!(
                 "method {} has an incompatible receiver",
                 method.name
@@ -988,6 +1813,29 @@ fn verify_function(program: &Program, function: &Function) -> Result<(), Verific
     }
     if function.entry.0 as usize >= function.blocks.len() {
         return Err(function_error(function.id, "entry block is out of bounds"));
+    }
+    if function.generator {
+        if class_by_name(program, "Generator").is_none() {
+            return Err(function_error(function.id, "Generator metadata is missing"));
+        }
+        if !matches!(&function.return_type, Type::Nominal { name, .. } if name == "Iterator" || name == "Generator")
+        {
+            return Err(function_error(
+                function.id,
+                "generator return type must be Iterator<K, V> or Generator<K, V>",
+            ));
+        }
+        let Some(iterator) = class_by_name(program, "Iterator") else {
+            return Err(function_error(function.id, "Iterator metadata is missing"));
+        };
+        if instantiation_for_class(program, &function.return_type, iterator.id)
+            .is_none_or(|ty| ty.arguments.len() != 2)
+        {
+            return Err(function_error(
+                function.id,
+                "generator return type is not Iterator<K, V>",
+            ));
+        }
     }
     for parameter in &function.parameters {
         if parameter.0 as usize >= function.local_types.len() {
@@ -1043,6 +1891,12 @@ fn verify_function(program: &Program, function: &Function) -> Result<(), Verific
                     return Err(function_error(
                         function.id,
                         "catch class is not a Throwable subtype",
+                    ));
+                }
+                if !class.type_parameters.is_empty() {
+                    return Err(function_error(
+                        function.id,
+                        "generic catch classes are not supported",
                     ));
                 }
                 if function.local_types[clause.local.0 as usize] != Type::Object(class.name.clone())
@@ -1338,6 +2192,62 @@ fn verify_instruction(
             )
             .map_err(|message| error(&message))?;
         }
+        InstructionKind::Closure {
+            function: target,
+            captures,
+        } => {
+            let Some(target) = program.functions.get(target.0 as usize) else {
+                return Err(error("closure target is out of bounds"));
+            };
+            if target.owner.is_some() || target.parameters.len() < captures.len() {
+                return Err(error("invalid closure target"));
+            }
+            for (capture_index, capture) in captures.iter().enumerate() {
+                check_register(function, *capture, block, Some(index))?;
+                let parameter = target.parameters[capture_index];
+                if !type_accepts(
+                    program,
+                    &target.local_types[parameter.0 as usize],
+                    &function.register_types[capture.0 as usize],
+                ) {
+                    return Err(error("closure capture has the wrong type"));
+                }
+            }
+            let parameters = target.parameters[captures.len()..]
+                .iter()
+                .map(|local| target.local_types[local.0 as usize].clone())
+                .collect::<Vec<_>>();
+            if instruction.ty.as_ref()
+                != Some(&Type::Callable(
+                    parameters,
+                    Box::new(target.return_type.clone()),
+                ))
+            {
+                return Err(error("closure result type does not match target"));
+            }
+        }
+        InstructionKind::CallValue { callee, arguments } => {
+            check_register(function, *callee, block, Some(index))?;
+            let Type::Callable(parameters, result) = &function.register_types[callee.0 as usize]
+            else {
+                return Err(error("dynamic call target is not callable"));
+            };
+            if parameters.len() != arguments.len()
+                || instruction.ty.as_ref() != Some(result.as_ref())
+            {
+                return Err(error("dynamic call signature is incorrect"));
+            }
+            for (argument, expected) in arguments.iter().zip(parameters) {
+                check_register(function, *argument, block, Some(index))?;
+                if !type_accepts(
+                    program,
+                    expected,
+                    &function.register_types[argument.0 as usize],
+                ) {
+                    return Err(error("dynamic call argument type is incorrect"));
+                }
+            }
+        }
         InstructionKind::DirectMethod {
             callee,
             arguments,
@@ -1359,10 +2269,12 @@ fn verify_instruction(
                     let Some(receiver) = arguments.first() else {
                         return Err(error("receiver-derived direct method call has no receiver"));
                     };
-                    if !matches!(
-                        function.register_types[receiver.0 as usize],
-                        Type::Object(_)
-                    ) {
+                    if encoded_nominal_lookup_type(
+                        program,
+                        &function.register_types[receiver.0 as usize],
+                    )
+                    .is_none()
+                    {
                         return Err(error(
                             "receiver-derived called class requires an object receiver",
                         ));
@@ -1374,6 +2286,26 @@ fn verify_instruction(
             else {
                 return Err(error("direct method call violates member visibility"));
             };
+            let mut method = method.clone();
+            let declaration = &program.classes[method.declaring_class.0 as usize];
+            let instantiated = if method.static_method {
+                infer_descriptor_instantiation(
+                    &method,
+                    arguments,
+                    instruction.ty.as_ref(),
+                    function,
+                    declaration,
+                )
+            } else {
+                arguments.first().and_then(|receiver| {
+                    instantiation_for_class(
+                        program,
+                        &function.register_types[receiver.0 as usize],
+                        method.declaring_class,
+                    )
+                })
+            };
+            method = instantiate_descriptor_method(&method, instantiated.as_ref(), declaration);
             let signature_arguments = if method.static_method {
                 arguments.as_slice()
             } else {
@@ -1383,7 +2315,7 @@ fn verify_instruction(
             };
             verify_method_signature(
                 program,
-                method,
+                &method,
                 signature_arguments,
                 instruction.ty.as_ref(),
                 function,
@@ -1407,7 +2339,11 @@ fn verify_instruction(
             for argument in arguments {
                 check_register(function, *argument, block, Some(index))?;
             }
-            let Type::Object(class_name) = &function.register_types[receiver.0 as usize] else {
+            let receiver_type = &function.register_types[receiver.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("virtual method receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("virtual method receiver is not an object"));
             };
             let class = class_by_name(program, class_name)
@@ -1420,15 +2356,20 @@ fn verify_instruction(
             if method.static_method {
                 return Err(error("virtual instance call targets a static method"));
             }
+            let instantiated = NominalType {
+                class: class.id,
+                arguments: receiver_arguments.to_vec(),
+            };
+            let method = instantiate_descriptor_method(method, Some(&instantiated), class);
             verify_method_signature(
                 program,
-                method,
+                &method,
                 arguments,
                 instruction.ty.as_ref(),
                 function,
             )
             .map_err(|message| error(&message))?;
-            if !member_accessible(program, function.owner, method) {
+            if !member_accessible(program, function.owner, &method) {
                 return Err(error("virtual method call violates member visibility"));
             }
         }
@@ -1473,22 +2414,111 @@ fn verify_instruction(
             let Some(class) = program.classes.get(class.0 as usize) else {
                 return Err(error("allocated class is out of bounds"));
             };
-            if class.kind != NominalKind::Class || class.abstract_class {
+            if class.kind != NominalKind::Class
+                || class.abstract_class
+                || (class.native
+                    && !is_instance_of_name(program, &class.name, "Throwable")
+                    && !matches!(
+                        class.name.as_str(),
+                        "ReflectionClass"
+                            | "ReflectionFunction"
+                            | "ReflectionMethod"
+                            | "ReflectionProperty"
+                            | "ReflectionParameter"
+                            | "VectorIterator"
+                            | "MapIterator"
+                            | "EmptyIterator"
+                            | "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "AppendIterator"
+                            | "CachingIterator"
+                            | "RecursiveCachingIterator"
+                            | "FixedSequence"
+                            | "LinkedList"
+                            | "Queue"
+                            | "Stack"
+                            | "MaxHeap"
+                            | "MinHeap"
+                            | "PriorityQueue"
+                            | "TypedMap"
+                            | "ObjectStorage"
+                            | "ParentIterator"
+                            | "RecursiveCallbackFilterIterator"
+                            | "RecursiveEntry"
+                            | "RecursiveIteratorIterator"
+                            | "CallbackFilterIterator"
+                            | "RegexIterator"
+                            | "RecursiveRegexIterator"
+                            | "TraceLine"
+                            | "SplFileInfo"
+                            | "SplFileObject"
+                            | "DirectoryIterator"
+                            | "FilesystemIterator"
+                            | "RecursiveDirectoryIterator"
+                            | "GlobIterator"
+                    ))
+            {
                 return Err(error("only a concrete class can be allocated"));
             }
-            if instruction.ty.as_ref() != Some(&Type::Object(class.name.clone())) {
+            if instruction
+                .ty
+                .as_ref()
+                .and_then(encoded_nominal_parts)
+                .map(|(name, _)| name)
+                != Some(class.name.as_str())
+            {
                 return Err(error("allocated object type does not match its class"));
+            }
+        }
+        InstructionKind::NewDynamic {
+            target,
+            type_arguments,
+            arguments,
+        } => {
+            check_register(function, *target, block, Some(index))?;
+            if function.register_types[target.0 as usize] != Type::String {
+                return Err(error("dynamic class target is not string"));
+            }
+            for ty in type_arguments {
+                verify_encoded_type(program, ty)?;
+                if contains_void(ty) {
+                    return Err(error("dynamic generic argument contains void"));
+                }
+            }
+            for argument in arguments {
+                check_register(function, argument.value, block, Some(index))?;
+                if argument.name.as_ref().is_some_and(String::is_empty) {
+                    return Err(error("dynamic argument name is empty"));
+                }
+            }
+            if instruction.ty.as_ref() != Some(&Type::Mixed) {
+                return Err(error("dynamic construction result is not mixed"));
+            }
+        }
+        InstructionKind::CheckedNarrow { value, narrowed } => {
+            check_register(function, *value, block, Some(index))?;
+            verify_encoded_type(program, narrowed)?;
+            let source = &function.register_types[value.0 as usize];
+            if !valid_checked_narrow(program, source, narrowed)
+                || instruction.ty.as_ref() != Some(narrowed)
+            {
+                return Err(error("invalid checked narrowing target"));
             }
         }
         InstructionKind::GetProperty { object, property } => {
             check_register(function, *object, block, Some(index))?;
-            let Type::Object(class_name) = &function.register_types[object.0 as usize] else {
+            let receiver_type = &function.register_types[object.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("property receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("property receiver is not an object"));
             };
             let Some(class) = program
                 .classes
                 .iter()
-                .find(|class| &class.name == class_name)
+                .find(|class| class.name == class_name)
             else {
                 return Err(error("property receiver class is unavailable"));
             };
@@ -1498,7 +2528,15 @@ fn verify_instruction(
             if !property_accessible(program, function.owner, property) {
                 return Err(error("property load violates member visibility"));
             }
-            if instruction.ty.as_ref() != Some(&property.ty) {
+            let property_type = substitute_descriptor_type(
+                &property.ty,
+                Some(&NominalType {
+                    class: class.id,
+                    arguments: receiver_arguments.to_vec(),
+                }),
+                class,
+            );
+            if instruction.ty.as_ref() != Some(&property_type) {
                 return Err(error("loaded property type does not match result type"));
             }
         }
@@ -1509,13 +2547,17 @@ fn verify_instruction(
         } => {
             check_register(function, *object, block, Some(index))?;
             check_register(function, *value, block, Some(index))?;
-            let Type::Object(class_name) = &function.register_types[object.0 as usize] else {
+            let receiver_type = &function.register_types[object.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("property receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("property receiver is not an object"));
             };
             let Some(class) = program
                 .classes
                 .iter()
-                .find(|class| &class.name == class_name)
+                .find(|class| class.name == class_name)
             else {
                 return Err(error("property receiver class is unavailable"));
             };
@@ -1527,7 +2569,14 @@ fn verify_instruction(
             }
             if !type_accepts(
                 program,
-                &property.ty,
+                &substitute_descriptor_type(
+                    &property.ty,
+                    Some(&NominalType {
+                        class: class.id,
+                        arguments: receiver_arguments.to_vec(),
+                    }),
+                    class,
+                ),
                 &function.register_types[value.0 as usize],
             ) {
                 return Err(error("stored property type does not match property type"));
@@ -1543,7 +2592,11 @@ fn verify_instruction(
         } => {
             check_register(function, *object, block, Some(index))?;
             check_register(function, *value, block, Some(index))?;
-            let Type::Object(class_name) = &function.register_types[object.0 as usize] else {
+            let receiver_type = &function.register_types[object.0 as usize];
+            let Some(lookup_type) = encoded_nominal_lookup_type(program, receiver_type) else {
+                return Err(error("property initializer receiver is not an object"));
+            };
+            let Some((class_name, receiver_arguments)) = encoded_nominal_parts(&lookup_type) else {
                 return Err(error("property initializer receiver is not an object"));
             };
             let class = class_by_name(program, class_name)
@@ -1568,7 +2621,14 @@ fn verify_instruction(
                 .ok_or_else(|| error("initialized property is out of bounds"))?;
             if !type_accepts(
                 program,
-                &property.ty,
+                &substitute_descriptor_type(
+                    &property.ty,
+                    Some(&NominalType {
+                        class: class.id,
+                        arguments: receiver_arguments.to_vec(),
+                    }),
+                    class,
+                ),
                 &function.register_types[value.0 as usize],
             ) {
                 return Err(error("initialized value type does not match property type"));
@@ -1681,6 +2741,13 @@ fn verify_callee_call(
             if arguments.len() != target.parameters.len() {
                 return Err("call argument count does not match function signature".to_owned());
             }
+            let generic_owner = target
+                .owner
+                .and_then(|owner| program.classes.get(owner.0 as usize))
+                .is_some_and(|owner| !owner.type_parameters.is_empty());
+            if generic_owner {
+                return Ok(());
+            }
             for (argument, parameter) in arguments.iter().zip(&target.parameters) {
                 if !type_accepts(
                     program,
@@ -1709,7 +2776,12 @@ fn verify_method_signature(
     caller: &Function,
 ) -> Result<(), String> {
     if arguments.len() != method.parameter_types.len() {
-        return Err("method argument count does not match signature".to_owned());
+        return Err(format!(
+            "method {} argument count {} does not match signature {}",
+            method.name,
+            arguments.len(),
+            method.parameter_types.len()
+        ));
     }
     for (argument, parameter) in arguments.iter().zip(&method.parameter_types) {
         if !type_accepts(
@@ -1782,8 +2854,13 @@ fn direct_method<'program>(
                     .owner
                     .is_some_and(|owner| is_instance_of_id(program, owner, method.declaring_class)),
                 CalledClass::Receiver => arguments.first().is_some_and(|receiver| {
-                    let Type::Object(name) = &calling_function.register_types[receiver.0 as usize]
-                    else {
+                    let Some(lookup_type) = encoded_nominal_lookup_type(
+                        program,
+                        &calling_function.register_types[receiver.0 as usize],
+                    ) else {
+                        return false;
+                    };
+                    let Some((name, _)) = encoded_nominal_parts(&lookup_type) else {
                         return false;
                     };
                     class_by_name(program, name).is_some_and(|class| {
@@ -1798,8 +2875,13 @@ fn direct_method<'program>(
                 return called_class != CalledClass::Receiver;
             }
             arguments.first().is_some_and(|receiver| {
-                let Type::Object(name) = &calling_function.register_types[receiver.0 as usize]
-                else {
+                let Some(lookup_type) = encoded_nominal_lookup_type(
+                    program,
+                    &calling_function.register_types[receiver.0 as usize],
+                ) else {
+                    return false;
+                };
+                let Some((name, _)) = encoded_nominal_parts(&lookup_type) else {
                     return false;
                 };
                 class_by_name(program, name).is_some_and(|class| {
@@ -1849,6 +2931,1171 @@ fn verify_builtin_call(
             .ok_or_else(|| format!("builtin requires a {expected} receiver"))
     };
     match builtin {
+        Builtin::SchedulerRegisterDefault | Builtin::SchedulerIsRegistered | Builtin::Suspend => {
+            check(
+                &[],
+                &if builtin == Builtin::SchedulerIsRegistered {
+                    Type::Bool
+                } else {
+                    Type::Void
+                },
+            )
+        }
+        Builtin::SchedulerRegister => {
+            if arguments.len() != 1
+                || !type_accepts(
+                    program,
+                    &Type::Object("SchedulerInterface".to_owned()),
+                    argument_type(0),
+                )
+                || result != Some(&Type::Void)
+            {
+                return Err("invalid scheduler registration signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Delay | Builtin::Timeout => check(
+            &[Type::Int],
+            &if builtin == Builtin::Delay {
+                Type::Void
+            } else {
+                Type::Object("Timeout".to_owned())
+            },
+        ),
+        Builtin::Async => {
+            if arguments.is_empty() {
+                return Err("async requires a callable".to_owned());
+            }
+            let Type::Callable(parameters, output) = argument_type(0) else {
+                return Err("async requires a typed callable".to_owned());
+            };
+            if arguments.len() != parameters.len() + 1
+                || parameters.iter().enumerate().any(|(index, parameter)| {
+                    !type_accepts(program, parameter, argument_type(index + 1))
+                })
+                || result
+                    != Some(&Type::Nominal {
+                        name: "Coroutine".to_owned(),
+                        arguments: vec![output.as_ref().clone()],
+                    })
+            {
+                return Err("async callable arguments or result do not match".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Await => {
+            if arguments.len() != 2 {
+                return Err("await requires a target and cancellation source".to_owned());
+            }
+            let target =
+                encoded_nominal_ancestor_arguments(program, argument_type(0), "Completable")
+                    .and_then(|mut arguments| (arguments.len() == 1).then(|| arguments.remove(0)))
+                    .ok_or_else(|| "await target is not Completable<T>".to_owned())?;
+            if argument_type(1) != &Type::Null
+                && encoded_nominal_ancestor_arguments(program, argument_type(1), "Completable")
+                    .is_none()
+            {
+                return Err("await cancellation source is not Completable<T>".to_owned());
+            }
+            if result != Some(&target) {
+                return Err("await result type does not match target".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::CoroutineCancel
+        | Builtin::CoroutineGetId
+        | Builtin::CoroutineIsStarted
+        | Builtin::CoroutineIsQueued
+        | Builtin::CoroutineIsRunning
+        | Builtin::CoroutineIsSuspended
+        | Builtin::CoroutineIsCompleted
+        | Builtin::CoroutineIsCancelled
+        | Builtin::CoroutineSubscribe
+        | Builtin::CoroutineResult => {
+            if arguments.is_empty() {
+                return Err("Coroutine method requires a receiver".to_owned());
+            }
+            let value = encoded_nominal_ancestor_arguments(program, argument_type(0), "Coroutine")
+                .and_then(|mut arguments| (arguments.len() == 1).then(|| arguments.remove(0)))
+                .ok_or_else(|| "Coroutine builtin has the wrong receiver".to_owned())?;
+            let callback = Type::Callable(vec![], Box::new(Type::Void));
+            let expected = match builtin {
+                Builtin::CoroutineCancel => Type::Void,
+                Builtin::CoroutineGetId => Type::Int,
+                Builtin::CoroutineIsStarted
+                | Builtin::CoroutineIsQueued
+                | Builtin::CoroutineIsRunning
+                | Builtin::CoroutineIsSuspended
+                | Builtin::CoroutineIsCompleted
+                | Builtin::CoroutineIsCancelled => Type::Bool,
+                Builtin::CoroutineSubscribe => callback.clone(),
+                Builtin::CoroutineResult => value,
+                _ => unreachable!(),
+            };
+            if result != Some(&expected)
+                || (builtin == Builtin::CoroutineSubscribe
+                    && (arguments.len() != 2 || argument_type(1) != &callback))
+                || (builtin != Builtin::CoroutineSubscribe && arguments.len() != 1)
+            {
+                return Err("invalid Coroutine builtin signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::TimeoutCancel
+        | Builtin::TimeoutIsCompleted
+        | Builtin::TimeoutIsCancelled
+        | Builtin::TimeoutSubscribe
+        | Builtin::TimeoutResult => {
+            object_receiver("Timeout")?;
+            let callback = Type::Callable(vec![], Box::new(Type::Void));
+            let expected = match builtin {
+                Builtin::TimeoutCancel => Type::Void,
+                Builtin::TimeoutIsCompleted | Builtin::TimeoutIsCancelled => Type::Bool,
+                Builtin::TimeoutSubscribe => callback.clone(),
+                Builtin::TimeoutResult => Type::Mixed,
+                _ => unreachable!(),
+            };
+            if result != Some(&expected)
+                || (builtin == Builtin::TimeoutSubscribe
+                    && (arguments.len() != 2 || argument_type(1) != &callback))
+                || (builtin != Builtin::TimeoutSubscribe && arguments.len() != 1)
+            {
+                return Err("invalid Timeout builtin signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::PregMatch | Builtin::PregSplit => {
+            let count = if builtin == Builtin::PregMatch { 3 } else { 4 };
+            if arguments.len() != count
+                || argument_type(0) != &Type::String
+                || argument_type(1) != &Type::String
+                || (count == 4 && argument_type(2) != &Type::Int)
+                || argument_type(count - 1) != &Type::Int
+            {
+                return Err("regex arguments do not match the signature".to_owned());
+            }
+            let flag_register = arguments[count - 1];
+            let flags = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .find(|instruction| instruction.destination == Some(flag_register))
+                .and_then(|instruction| match &instruction.kind {
+                    InstructionKind::Constant(thp_mir::Constant::Integer(value)) => Some(*value),
+                    _ => None,
+                })
+                .ok_or_else(|| "regex flags must be constant".to_owned())?;
+            let allowed = if builtin == Builtin::PregMatch {
+                256 | 512
+            } else {
+                1 | 2 | 4
+            };
+            if flags < 0 || flags & !allowed != 0 {
+                return Err("unsupported regex flags".to_owned());
+            }
+            let capture = if flags
+                & (if builtin == Builtin::PregMatch {
+                    256
+                } else {
+                    4
+                })
+                != 0
+            {
+                Type::Object("RegexCapture".to_owned())
+            } else if flags & 512 != 0 {
+                Type::Union(vec![Type::Null, Type::String])
+            } else {
+                Type::String
+            };
+            let expected = if builtin == Builtin::PregMatch {
+                Type::Union(vec![
+                    Type::Map(Box::new(Type::String), Box::new(capture)),
+                    Type::Null,
+                ])
+            } else {
+                Type::Vector(Box::new(capture))
+            };
+            if result != Some(&expected) {
+                return Err("regex result type does not match constant flags".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::PregReplace => check(
+            &[Type::String, Type::String, Type::String, Type::Int],
+            &Type::String,
+        ),
+        Builtin::RegexCaptureText | Builtin::RegexCaptureOffset => {
+            if arguments.len() != 1 {
+                return Err("RegexCapture method signature mismatch".to_owned());
+            }
+            object_receiver("RegexCapture")?;
+            if result
+                != Some(&if builtin == Builtin::RegexCaptureText {
+                    Type::Union(vec![Type::Null, Type::String])
+                } else {
+                    Type::Int
+                })
+            {
+                return Err("RegexCapture method signature mismatch".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Native(index) => {
+            let native = program
+                .native_functions
+                .get(index as usize)
+                .ok_or_else(|| "native function index is out of bounds".to_owned())?;
+            if arguments.len() != native.parameters.len() {
+                return Err("native function argument count does not match signature".to_owned());
+            }
+            for (argument, parameter) in arguments.iter().zip(&native.parameters) {
+                if !type_accepts(
+                    program,
+                    parameter,
+                    &function.register_types[argument.0 as usize],
+                ) {
+                    return Err("native function argument type does not match signature".to_owned());
+                }
+            }
+            if result != Some(&native.return_type) {
+                return Err("native function result type does not match signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::VectorMap | Builtin::VectorFilter => {
+            if arguments.len() != 2 {
+                return Err("vector callback operation requires two arguments".to_owned());
+            }
+            let Type::Vector(element) = argument_type(0) else {
+                return Err("vector callback operation requires a vector".to_owned());
+            };
+            let Type::Callable(parameters, callback_result) = argument_type(1) else {
+                return Err("vector callback operation requires a callable".to_owned());
+            };
+            if parameters.as_slice() != [element.as_ref().clone()] {
+                return Err("vector callback parameter type is wrong".to_owned());
+            }
+            let expected = if builtin == Builtin::VectorMap {
+                Type::Vector(callback_result.clone())
+            } else {
+                if callback_result.as_ref() != &Type::Bool {
+                    return Err("vector filter callback must return bool".to_owned());
+                }
+                argument_type(0).clone()
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "vector callback result type is wrong".to_owned())
+        }
+        Builtin::VectorSlice => {
+            if arguments.len() != 3
+                || !matches!(argument_type(0), Type::Vector(_))
+                || argument_type(1) != &Type::Int
+                || !type_accepts(
+                    program,
+                    &Type::Union(vec![Type::Int, Type::Null]),
+                    argument_type(2),
+                )
+                || result != Some(argument_type(0))
+            {
+                return Err("invalid vector_slice signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::VectorConcat => {
+            if arguments.len() != 2
+                || !matches!(argument_type(0), Type::Vector(_))
+                || !type_accepts(program, argument_type(0), argument_type(1))
+                || result != Some(argument_type(0))
+            {
+                return Err("invalid vector_concat signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::MapTransform | Builtin::MapFilter => {
+            if arguments.len() != 2 {
+                return Err("map callback operation requires two arguments".to_owned());
+            }
+            let Type::Map(key, value) = argument_type(0) else {
+                return Err("map callback operation requires a map".to_owned());
+            };
+            let Type::Callable(parameters, callback_result) = argument_type(1) else {
+                return Err("map callback operation requires a callable".to_owned());
+            };
+            if parameters.as_slice() != [value.as_ref().clone(), key.as_ref().clone()] {
+                return Err("map callback parameter types are wrong".to_owned());
+            }
+            let expected = if builtin == Builtin::MapTransform {
+                Type::Map(key.clone(), callback_result.clone())
+            } else {
+                if callback_result.as_ref() != &Type::Bool {
+                    return Err("map filter callback must return bool".to_owned());
+                }
+                argument_type(0).clone()
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "map callback result type is wrong".to_owned())
+        }
+        Builtin::MapMerge => {
+            if arguments.len() != 2
+                || !matches!(argument_type(0), Type::Map(_, _))
+                || !type_accepts(program, argument_type(0), argument_type(1))
+                || result != Some(argument_type(0))
+            {
+                return Err("invalid map_merge signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::IteratorApply => {
+            if arguments.len() != 2 || result != Some(&Type::Int) {
+                return Err("invalid iterator_apply signature".to_owned());
+            }
+            let Some(iterator_class) = class_by_name(program, "Iterator") else {
+                return Err("Iterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) =
+                instantiation_for_class(program, argument_type(0), iterator_class.id)
+            else {
+                return Err("iterator_apply requires an iterator".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("iterator_apply iterator type is wrong".to_owned());
+            };
+            if argument_type(1)
+                != &Type::Callable(vec![value.clone(), key.clone()], Box::new(Type::Bool))
+            {
+                return Err("iterator_apply callback type is wrong".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::IteratorFromCollection => {
+            if arguments.len() != 1 {
+                return Err("invalid collection iterator conversion".to_owned());
+            }
+            let expected = match argument_type(0) {
+                Type::Vector(value) => Type::Nominal {
+                    name: "VectorIterator".to_owned(),
+                    arguments: vec![value.as_ref().clone()],
+                },
+                Type::Map(key, value) => Type::Nominal {
+                    name: "MapIterator".to_owned(),
+                    arguments: vec![key.as_ref().clone(), value.as_ref().clone()],
+                },
+                _ => return Err("collection iterator requires a vector or map".to_owned()),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "collection iterator result type is wrong".to_owned())
+        }
+        Builtin::RegexIteratorConstruct => {
+            if arguments.len() != 7 || result != Some(&Type::Void) {
+                return Err("invalid regex iterator constructor".to_owned());
+            }
+            let Some((name, [key, input, output])) = encoded_nominal_parts(argument_type(0)) else {
+                return Err("invalid regex iterator receiver".to_owned());
+            };
+            if !matches!(name, "RegexIterator" | "RecursiveRegexIterator") {
+                return Err("invalid regex iterator receiver".to_owned());
+            }
+            let inner = Type::Nominal {
+                name: if name == "RecursiveRegexIterator" {
+                    "RecursiveIterator"
+                } else {
+                    "Iterator"
+                }
+                .to_owned(),
+                arguments: vec![key.clone(), input.clone()],
+            };
+            if !type_accepts(program, &inner, argument_type(1))
+                || argument_type(2) != &Type::String
+                || argument_type(3) != &Type::Int
+                || argument_type(4) != &Type::Bool
+                || argument_type(5) != &Type::Int
+                || argument_type(6) != &Type::String
+            {
+                return Err("invalid regex iterator constructor arguments".to_owned());
+            }
+            let constant = |register| {
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instructions)
+                    .find(|instruction| instruction.destination == Some(register))
+                    .and_then(|instruction| match &instruction.kind {
+                        InstructionKind::Constant(thp_mir::Constant::Integer(value)) => {
+                            Some(*value)
+                        }
+                        _ => None,
+                    })
+            };
+            let mode = constant(arguments[3]).ok_or("regex iterator mode must be constant")?;
+            let flags = constant(arguments[5]).ok_or("regex iterator flags must be constant")?;
+            let allowed = match mode {
+                0 | 4 | 5 => 0,
+                1 | 2 => 256 | 512,
+                3 => 1 | 2 | 4,
+                _ => return Err("invalid regex iterator mode".to_owned()),
+            };
+            let valid = flags >= 0
+                && flags & !allowed == 0
+                && (mode == 5 || input == &Type::String)
+                && (mode != 5 || key == &Type::String);
+            if !valid {
+                return Err("invalid regex iterator mode or flags".to_owned());
+            }
+            let capture = Type::Map(
+                Box::new(Type::String),
+                Box::new(if flags & 256 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else if flags & 512 != 0 {
+                    Type::Union(vec![Type::Null, Type::String])
+                } else {
+                    Type::String
+                }),
+            );
+            let expected = match mode {
+                0 | 5 => input.clone(),
+                1 => capture.clone(),
+                2 => Type::Vector(Box::new(capture)),
+                3 => Type::Vector(Box::new(if flags & 4 != 0 {
+                    Type::Object("RegexCapture".to_owned())
+                } else {
+                    Type::String
+                })),
+                4 => Type::String,
+                _ => return Err("invalid regex iterator mode".to_owned()),
+            };
+            if output != &expected {
+                return Err("regex iterator output type does not match mode".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::RegexIteratorGetInner
+        | Builtin::RegexIteratorGetRegex
+        | Builtin::RegexIteratorGetMode
+        | Builtin::RegexIteratorGetPregFlags => {
+            if arguments.len() != 1 {
+                return Err("invalid regex iterator getter".to_owned());
+            }
+            let Some((name, [key, input, _])) = encoded_nominal_parts(argument_type(0)) else {
+                return Err("invalid regex iterator receiver".to_owned());
+            };
+            if !matches!(name, "RegexIterator" | "RecursiveRegexIterator") {
+                return Err("invalid regex iterator receiver".to_owned());
+            }
+            let expected = match builtin {
+                Builtin::RegexIteratorGetInner => Type::Nominal {
+                    name: if name == "RecursiveRegexIterator" {
+                        "RecursiveIterator"
+                    } else {
+                        "Iterator"
+                    }
+                    .to_owned(),
+                    arguments: vec![key.clone(), input.clone()],
+                },
+                Builtin::RegexIteratorGetRegex => Type::String,
+                _ => Type::Int,
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid regex iterator getter type".to_owned())
+        }
+        Builtin::IteratorConstruct | Builtin::CallbackFilterConstruct => {
+            let Some((name, type_arguments)) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid iterator constructor receiver".to_owned());
+            };
+            let caching =
+                encoded_nominal_ancestor_arguments(program, argument_type(0), "CachingIterator");
+            let expected_argument = match (name, type_arguments) {
+                ("VectorIterator", [value]) => Some(Type::Vector(Box::new(value.clone()))),
+                ("MapIterator", [key, value]) => {
+                    Some(Type::Map(Box::new(key.clone()), Box::new(value.clone())))
+                }
+                (
+                    "IteratorIterator"
+                    | "LimitIterator"
+                    | "CachingIterator"
+                    | "FilterIterator"
+                    | "CallbackFilterIterator",
+                    [key, value],
+                ) => Some(Type::Nominal {
+                    name: "Iterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                }),
+                ("InfiniteIterator", [key, value]) => Some(Type::Nominal {
+                    name: "IteratorAggregate".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                }),
+                ("RecursiveCachingIterator", [key, value]) => Some(Type::Nominal {
+                    name: "RecursiveIterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                }),
+                ("EmptyIterator" | "AppendIterator", [_, _]) => None,
+                _ => {
+                    if let Some([key, value]) = caching.as_deref() {
+                        Some(Type::Nominal {
+                            name: "Iterator".to_owned(),
+                            arguments: vec![key.clone(), value.clone()],
+                        })
+                    } else {
+                        let Some(filter) = class_by_name(program, "FilterIterator") else {
+                            return Err("FilterIterator metadata is missing".to_owned());
+                        };
+                        let Some(instantiation) =
+                            instantiation_for_class(program, argument_type(0), filter.id)
+                        else {
+                            return Err("invalid iterator constructor receiver".to_owned());
+                        };
+                        let [key, value] = instantiation.arguments.as_slice() else {
+                            return Err("invalid filter iterator type".to_owned());
+                        };
+                        Some(Type::Nominal {
+                            name: "Iterator".to_owned(),
+                            arguments: vec![key.clone(), value.clone()],
+                        })
+                    }
+                }
+            };
+            if (builtin == Builtin::CallbackFilterConstruct) != (name == "CallbackFilterIterator")
+                || arguments.len()
+                    != 1 + usize::from(expected_argument.is_some())
+                        + usize::from(name == "CallbackFilterIterator")
+                        + usize::from(name == "LimitIterator") * 2
+                        + usize::from(caching.is_some())
+                || result != Some(&Type::Void)
+                || expected_argument
+                    .as_ref()
+                    .is_some_and(|expected| !type_accepts(program, expected, argument_type(1)))
+                || (name == "LimitIterator"
+                    && (argument_type(2) != &Type::Int || argument_type(3) != &Type::Int))
+                || (caching.is_some() && argument_type(2) != &Type::Int)
+                || (name == "CallbackFilterIterator"
+                    && argument_type(2)
+                        != &Type::Callable(
+                            vec![type_arguments[1].clone(), type_arguments[0].clone()],
+                            Box::new(Type::Bool),
+                        ))
+            {
+                return Err("invalid iterator constructor".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::IteratorRewind
+        | Builtin::IteratorAdvance
+        | Builtin::IteratorValid
+        | Builtin::IteratorKey
+        | Builtin::IteratorValue
+        | Builtin::IteratorGetInner => {
+            let Some((name, _type_arguments)) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid iterator cursor receiver".to_owned());
+            };
+            let filter = class_by_name(program, name)
+                .and_then(|class| {
+                    class_by_name(program, "FilterIterator")
+                        .map(|base| is_instance_of_id(program, class.id, base.id))
+                })
+                .unwrap_or(false);
+            let caching =
+                encoded_nominal_ancestor_arguments(program, argument_type(0), "CachingIterator")
+                    .is_some();
+            if arguments.len() != 1
+                || (!filter
+                    && !caching
+                    && !matches!(
+                        name,
+                        "VectorIterator"
+                            | "MapIterator"
+                            | "EmptyIterator"
+                            | "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "AppendIterator"
+                            | "CachingIterator"
+                            | "RecursiveCachingIterator"
+                            | "RecursiveIteratorIterator"
+                            | "Generator"
+                            | "RegexIterator"
+                            | "RecursiveRegexIterator"
+                    ))
+            {
+                return Err("invalid iterator cursor call".to_owned());
+            }
+            let Some(iterator_class) = class_by_name(program, "Iterator") else {
+                return Err("Iterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) =
+                instantiation_for_class(program, argument_type(0), iterator_class.id)
+            else {
+                return Err("invalid iterator cursor receiver".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("invalid iterator type arguments".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::IteratorRewind | Builtin::IteratorAdvance => Type::Void,
+                Builtin::IteratorValid => Type::Bool,
+                Builtin::IteratorKey => key.clone(),
+                Builtin::IteratorValue => value.clone(),
+                Builtin::IteratorGetInner
+                    if matches!(
+                        name,
+                        "IteratorIterator"
+                            | "LimitIterator"
+                            | "InfiniteIterator"
+                            | "CachingIterator"
+                            | "RecursiveCachingIterator"
+                    ) || filter
+                        || caching =>
+                {
+                    Type::Nominal {
+                        name: "Iterator".to_owned(),
+                        arguments: vec![key.clone(), value.clone()],
+                    }
+                }
+                _ => return Err("invalid iterator cursor call".to_owned()),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid iterator cursor result".to_owned())
+        }
+        Builtin::LimitSeek
+        | Builtin::LimitGetPosition
+        | Builtin::AppendAdd
+        | Builtin::AppendGetIndex
+        | Builtin::AppendGetIterator => {
+            let Some((name, type_arguments)) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid adapter receiver".to_owned());
+            };
+            let expected = match (builtin, name, type_arguments) {
+                (Builtin::LimitSeek, "LimitIterator", [_, _])
+                    if arguments.len() == 2 && argument_type(1) == &Type::Int =>
+                {
+                    Type::Void
+                }
+                (Builtin::LimitGetPosition, "LimitIterator", [_, _]) if arguments.len() == 1 => {
+                    Type::Int
+                }
+                (Builtin::AppendAdd, "AppendIterator", [key, value])
+                    if arguments.len() == 2
+                        && type_accepts(
+                            program,
+                            &Type::Nominal {
+                                name: "Iterator".to_owned(),
+                                arguments: vec![key.clone(), value.clone()],
+                            },
+                            argument_type(1),
+                        ) =>
+                {
+                    Type::Void
+                }
+                (Builtin::AppendGetIndex, "AppendIterator", [_, _]) if arguments.len() == 1 => {
+                    Type::Union(vec![Type::Int, Type::Null])
+                }
+                (Builtin::AppendGetIterator, "AppendIterator", [key, value])
+                    if arguments.len() == 1 =>
+                {
+                    Type::Nominal {
+                        name: "VectorIterator".to_owned(),
+                        arguments: vec![Type::Nominal {
+                            name: "Iterator".to_owned(),
+                            arguments: vec![key.clone(), value.clone()],
+                        }],
+                    }
+                }
+                _ => return Err("invalid adapter method".to_owned()),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid adapter result".to_owned())
+        }
+        Builtin::CachingHasNext
+        | Builtin::CachingCount
+        | Builtin::CachingGetCache
+        | Builtin::CachingGetFlags
+        | Builtin::CachingSetFlags
+        | Builtin::CachingOffsetExists
+        | Builtin::CachingOffsetGet
+        | Builtin::CachingOffsetSet
+        | Builtin::CachingOffsetUnset
+        | Builtin::CachingToString => {
+            let Some([key, value]) = arguments
+                .first()
+                .and_then(|_| {
+                    encoded_nominal_ancestor_arguments(program, argument_type(0), "CachingIterator")
+                })
+                .and_then(|args| <[Type; 2]>::try_from(args).ok())
+            else {
+                return Err("invalid caching iterator receiver".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::CachingHasNext | Builtin::CachingOffsetExists => Type::Bool,
+                Builtin::CachingCount | Builtin::CachingGetFlags => Type::Int,
+                Builtin::CachingGetCache => {
+                    Type::Map(Box::new(key.clone()), Box::new(value.clone()))
+                }
+                Builtin::CachingToString => Type::String,
+                Builtin::CachingOffsetGet => value.clone(),
+                Builtin::CachingSetFlags
+                | Builtin::CachingOffsetSet
+                | Builtin::CachingOffsetUnset => Type::Void,
+                _ => unreachable!(),
+            };
+            let valid_arguments = match builtin {
+                Builtin::CachingSetFlags => arguments.len() == 2 && argument_type(1) == &Type::Int,
+                Builtin::CachingOffsetExists
+                | Builtin::CachingOffsetGet
+                | Builtin::CachingOffsetUnset => arguments.len() == 2 && argument_type(1) == &key,
+                Builtin::CachingOffsetSet => {
+                    arguments.len() == 3
+                        && type_accepts(
+                            program,
+                            &Type::Union(vec![key.clone(), Type::Null]),
+                            argument_type(1),
+                        )
+                        && argument_type(2) == &value
+                }
+                _ => arguments.len() == 1,
+            };
+            (valid_arguments && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid caching iterator method".to_owned())
+        }
+        Builtin::RecursiveWalkConstruct
+        | Builtin::RecursiveWalkSetMaxDepth
+        | Builtin::RecursiveWalkGetMaxDepth
+        | Builtin::RecursiveWalkGetDepth
+        | Builtin::RecursiveWalkGetSubIterator
+        | Builtin::RecursiveWalkGetRecursiveIterator
+        | Builtin::RecursiveWalkHook => {
+            let receiver = arguments.first().map(|_| argument_type(0));
+            let Some([key, value]) = receiver
+                .and_then(|ty| {
+                    encoded_nominal_ancestor_arguments(program, ty, "RecursiveIteratorIterator")
+                })
+                .and_then(|args| <[Type; 2]>::try_from(args).ok())
+            else {
+                return Err("invalid recursive walk receiver".to_owned());
+            };
+            let source = Type::Nominal {
+                name: "RecursiveIterator".to_owned(),
+                arguments: vec![key.clone(), value.clone()],
+            };
+            let valid = match builtin {
+                Builtin::RecursiveWalkConstruct => {
+                    arguments.len() == 3
+                        && type_accepts(program, &source, argument_type(1))
+                        && argument_type(2) == &Type::Int
+                        && result == Some(&Type::Void)
+                }
+                Builtin::RecursiveWalkSetMaxDepth => {
+                    arguments.len() == 2
+                        && argument_type(1) == &Type::Int
+                        && result == Some(&Type::Void)
+                }
+                Builtin::RecursiveWalkGetMaxDepth => {
+                    arguments.len() == 1
+                        && result == Some(&Type::Union(vec![Type::Bool, Type::Int]))
+                }
+                Builtin::RecursiveWalkGetDepth => {
+                    arguments.len() == 1 && result == Some(&Type::Int)
+                }
+                Builtin::RecursiveWalkGetSubIterator => {
+                    arguments.len() == 2
+                        && type_accepts(
+                            program,
+                            &Type::Union(vec![Type::Int, Type::Null]),
+                            argument_type(1),
+                        )
+                        && result == Some(&Type::Union(vec![source.clone(), Type::Null]))
+                }
+                Builtin::RecursiveWalkGetRecursiveIterator => {
+                    arguments.len() == 1 && result == Some(&source)
+                }
+                Builtin::RecursiveWalkHook => arguments.len() == 1 && result == Some(&Type::Void),
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid recursive walk method".to_owned())
+        }
+        Builtin::FixedConstruct
+        | Builtin::FixedSetSize
+        | Builtin::FixedGetSize
+        | Builtin::FixedOffsetExists
+        | Builtin::FixedOffsetGet
+        | Builtin::FixedOffsetSet
+        | Builtin::FixedOffsetUnset
+        | Builtin::FixedGetIterator => {
+            let Some(("FixedSequence", [element])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid fixed sequence receiver".to_owned());
+            };
+            let slot = normalize_union(vec![element.clone(), Type::Null]);
+            let valid = match builtin {
+                Builtin::FixedConstruct | Builtin::FixedSetSize => {
+                    arguments.len() == 2
+                        && argument_type(1) == &Type::Int
+                        && result == Some(&Type::Void)
+                }
+                Builtin::FixedGetSize => arguments.len() == 1 && result == Some(&Type::Int),
+                Builtin::FixedOffsetExists
+                | Builtin::FixedOffsetGet
+                | Builtin::FixedOffsetUnset => {
+                    arguments.len() == 2
+                        && argument_type(1) == &Type::Int
+                        && result
+                            == Some(&match builtin {
+                                Builtin::FixedOffsetExists => Type::Bool,
+                                Builtin::FixedOffsetGet => slot.clone(),
+                                _ => Type::Void,
+                            })
+                }
+                Builtin::FixedOffsetSet => {
+                    arguments.len() == 3
+                        && type_accepts(
+                            program,
+                            &Type::Union(vec![Type::Int, Type::Null]),
+                            argument_type(1),
+                        )
+                        && type_accepts(program, &slot, argument_type(2))
+                        && result == Some(&Type::Void)
+                }
+                Builtin::FixedGetIterator => {
+                    arguments.len() == 1
+                        && result
+                            == Some(&Type::Nominal {
+                                name: "Traversable".to_owned(),
+                                arguments: vec![Type::Int, slot],
+                            })
+                }
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid fixed sequence method".to_owned())
+        }
+        Builtin::ListConstruct
+        | Builtin::ListPush
+        | Builtin::ListPop
+        | Builtin::ListUnshift
+        | Builtin::ListShift
+        | Builtin::ListTop
+        | Builtin::ListBottom
+        | Builtin::ListCount
+        | Builtin::ListIsEmpty
+        | Builtin::ListGetIterator
+        | Builtin::ListToVector => {
+            let Some([element]) = arguments
+                .first()
+                .and_then(|_| {
+                    encoded_nominal_ancestor_arguments(program, argument_type(0), "LinkedList")
+                })
+                .and_then(|args| <[Type; 1]>::try_from(args).ok())
+            else {
+                return Err("invalid linked sequence receiver".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::ListConstruct | Builtin::ListPush | Builtin::ListUnshift => Type::Void,
+                Builtin::ListPop | Builtin::ListShift | Builtin::ListTop | Builtin::ListBottom => {
+                    element.clone()
+                }
+                Builtin::ListCount => Type::Int,
+                Builtin::ListIsEmpty => Type::Bool,
+                Builtin::ListGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, element.clone()],
+                },
+                Builtin::ListToVector => Type::Vector(Box::new(element.clone())),
+                _ => unreachable!(),
+            };
+            let valid_args = if matches!(builtin, Builtin::ListPush | Builtin::ListUnshift) {
+                arguments.len() == 2 && type_accepts(program, &element, argument_type(1))
+            } else {
+                arguments.len() == 1
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid linked sequence method".to_owned())
+        }
+        Builtin::HeapConstruct
+        | Builtin::HeapInsert
+        | Builtin::HeapTop
+        | Builtin::HeapExtract
+        | Builtin::HeapCount
+        | Builtin::HeapIsEmpty
+        | Builtin::HeapGetIterator => {
+            let Some((name @ ("MaxHeap" | "MinHeap" | "PriorityQueue"), [element])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid heap receiver".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::HeapConstruct | Builtin::HeapInsert => Type::Void,
+                Builtin::HeapTop | Builtin::HeapExtract => element.clone(),
+                Builtin::HeapCount => Type::Int,
+                Builtin::HeapIsEmpty => Type::Bool,
+                Builtin::HeapGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, element.clone()],
+                },
+                _ => unreachable!(),
+            };
+            let valid_args = if builtin == Builtin::HeapInsert {
+                arguments.len() == if name == "PriorityQueue" { 3 } else { 2 }
+                    && type_accepts(program, element, argument_type(1))
+                    && (name != "PriorityQueue" || argument_type(2) == &Type::Int)
+            } else {
+                arguments.len() == 1
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid heap method".to_owned())
+        }
+        Builtin::TypedMapConstruct
+        | Builtin::TypedMapSet
+        | Builtin::TypedMapGet
+        | Builtin::TypedMapContains
+        | Builtin::TypedMapRemove
+        | Builtin::TypedMapCount
+        | Builtin::TypedMapToMap
+        | Builtin::TypedMapGetIterator => {
+            let Some(("TypedMap", [key, value])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid typed map receiver".to_owned());
+            };
+            let optional = normalize_union(vec![value.clone(), Type::Null]);
+            let expected = match builtin {
+                Builtin::TypedMapConstruct | Builtin::TypedMapSet => Type::Void,
+                Builtin::TypedMapGet => optional,
+                Builtin::TypedMapContains | Builtin::TypedMapRemove => Type::Bool,
+                Builtin::TypedMapCount => Type::Int,
+                Builtin::TypedMapToMap => Type::Map(Box::new(key.clone()), Box::new(value.clone())),
+                Builtin::TypedMapGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                },
+                _ => unreachable!(),
+            };
+            let valid_args = match builtin {
+                Builtin::TypedMapSet => {
+                    arguments.len() == 3
+                        && type_accepts(program, key, argument_type(1))
+                        && type_accepts(program, value, argument_type(2))
+                }
+                Builtin::TypedMapGet | Builtin::TypedMapContains | Builtin::TypedMapRemove => {
+                    arguments.len() == 2 && type_accepts(program, key, argument_type(1))
+                }
+                _ => arguments.len() == 1,
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid typed map method".to_owned())
+        }
+        Builtin::ObjectStorageConstruct
+        | Builtin::ObjectStorageAttach
+        | Builtin::ObjectStorageGet
+        | Builtin::ObjectStorageContains
+        | Builtin::ObjectStorageDetach
+        | Builtin::ObjectStorageCount
+        | Builtin::ObjectStorageGetIterator => {
+            let Some(("ObjectStorage", [value])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid object storage receiver".to_owned());
+            };
+            let optional = normalize_union(vec![value.clone(), Type::Null]);
+            let expected = match builtin {
+                Builtin::ObjectStorageConstruct | Builtin::ObjectStorageAttach => Type::Void,
+                Builtin::ObjectStorageGet => optional,
+                Builtin::ObjectStorageContains | Builtin::ObjectStorageDetach => Type::Bool,
+                Builtin::ObjectStorageCount => Type::Int,
+                Builtin::ObjectStorageGetIterator => Type::Nominal {
+                    name: "Traversable".to_owned(),
+                    arguments: vec![Type::Int, Type::Mixed],
+                },
+                _ => unreachable!(),
+            };
+            let valid_args = match builtin {
+                Builtin::ObjectStorageAttach => {
+                    arguments.len() == 3 && type_accepts(program, value, argument_type(2))
+                }
+                Builtin::ObjectStorageGet
+                | Builtin::ObjectStorageContains
+                | Builtin::ObjectStorageDetach => arguments.len() == 2,
+                _ => arguments.len() == 1,
+            };
+            (valid_args && result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid object storage method".to_owned())
+        }
+        Builtin::ParentAccept
+        | Builtin::RecursiveCallbackAccept
+        | Builtin::RecursiveCallbackConstruct => {
+            let receiver = arguments.first().map(|_| argument_type(0));
+            let Some([key, value]) = receiver
+                .and_then(|ty| {
+                    encoded_nominal_ancestor_arguments(program, ty, "RecursiveFilterIterator")
+                })
+                .and_then(|args| <[Type; 2]>::try_from(args).ok())
+            else {
+                return Err("invalid recursive filter receiver".to_owned());
+            };
+            let entry = Type::Nominal {
+                name: "RecursiveEntry".to_owned(),
+                arguments: vec![key.clone(), value.clone()],
+            };
+            let valid = match builtin {
+                Builtin::ParentAccept | Builtin::RecursiveCallbackAccept => {
+                    arguments.len() == 3
+                        && type_accepts(program, &entry, argument_type(1))
+                        && type_accepts(program, &key, argument_type(2))
+                        && result == Some(&Type::Bool)
+                }
+                Builtin::RecursiveCallbackConstruct => {
+                    arguments.len() == 3
+                        && type_accepts(
+                            program,
+                            &Type::Nominal {
+                                name: "RecursiveIterator".to_owned(),
+                                arguments: vec![key.clone(), value],
+                            },
+                            argument_type(1),
+                        )
+                        && argument_type(2)
+                            == &Type::Callable(vec![entry, key], Box::new(Type::Bool))
+                        && result == Some(&Type::Void)
+                }
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid recursive filter method".to_owned())
+        }
+        Builtin::RecursiveEntryConstruct
+        | Builtin::RecursiveEntryValue
+        | Builtin::RecursiveEntryChildren => {
+            let Some(("RecursiveEntry", [key, value])) = arguments
+                .first()
+                .and_then(|_| encoded_nominal_parts(argument_type(0)))
+            else {
+                return Err("invalid recursive entry receiver".to_owned());
+            };
+            let children = Type::Union(vec![
+                Type::Nominal {
+                    name: "RecursiveIterator".to_owned(),
+                    arguments: vec![key.clone(), value.clone()],
+                },
+                Type::Null,
+            ]);
+            let valid = match builtin {
+                Builtin::RecursiveEntryConstruct => {
+                    arguments.len() == 3
+                        && argument_type(1) == value
+                        && type_accepts(program, &children, argument_type(2))
+                        && result == Some(&Type::Void)
+                }
+                Builtin::RecursiveEntryValue => arguments.len() == 1 && result == Some(value),
+                Builtin::RecursiveEntryChildren => {
+                    arguments.len() == 1 && result == Some(&children)
+                }
+                _ => unreachable!(),
+            };
+            valid
+                .then_some(())
+                .ok_or_else(|| "invalid recursive entry method".to_owned())
+        }
+        Builtin::GeneratorGetReturn | Builtin::GeneratorClose => {
+            if arguments.len() != 1
+                || encoded_nominal_parts(argument_type(0)).map(|(name, _)| name)
+                    != Some("Generator")
+            {
+                return Err("generator method requires a Generator receiver".to_owned());
+            }
+            let expected = if builtin == Builtin::GeneratorClose {
+                Type::Void
+            } else {
+                Type::Mixed
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid generator method result".to_owned())
+        }
+        Builtin::IteratorCount | Builtin::IteratorToVector | Builtin::IteratorToMap => {
+            if arguments.len() != 1 {
+                return Err("iterator function requires one argument".to_owned());
+            }
+            let Some(iterator_class) = class_by_name(program, "Iterator") else {
+                return Err("Iterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) = arguments.first().and_then(|_| {
+                instantiation_for_class(program, argument_type(0), iterator_class.id)
+            }) else {
+                return Err("iterator function requires an iterator".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("invalid iterator type arguments".to_owned());
+            };
+            let expected = match builtin {
+                Builtin::IteratorCount => Type::Int,
+                Builtin::IteratorToVector => Type::Vector(Box::new(value.clone())),
+                _ => Type::Map(Box::new(key.clone()), Box::new(value.clone())),
+            };
+            (result == Some(&expected))
+                .then_some(())
+                .ok_or_else(|| "invalid iterator function result".to_owned())
+        }
+        Builtin::CallbackFilterAccept => {
+            if arguments.len() != 3 || result != Some(&Type::Bool) {
+                return Err("invalid callback filter acceptance call".to_owned());
+            }
+            let Some(class) = class_by_name(program, "CallbackFilterIterator") else {
+                return Err("CallbackFilterIterator metadata is missing".to_owned());
+            };
+            let Some(instantiation) = instantiation_for_class(program, argument_type(0), class.id)
+            else {
+                return Err("callback filter requires a callback filter receiver".to_owned());
+            };
+            let [key, value] = instantiation.arguments.as_slice() else {
+                return Err("invalid filter arguments".to_owned());
+            };
+            if !type_accepts(program, value, argument_type(1))
+                || !type_accepts(program, key, argument_type(2))
+            {
+                return Err("callback filter argument types are wrong".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::IsString
+        | Builtin::IsInt
+        | Builtin::IsFloat
+        | Builtin::IsNull
+        | Builtin::IsNumeric
+        | Builtin::IsVector
+        | Builtin::IsMap => {
+            if arguments.len() != 1
+                || argument_type(0) == &Type::Void
+                || result != Some(&Type::Bool)
+            {
+                return Err("invalid type-guard signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::Count => {
             if arguments.len() != 1 {
                 return Err("`count` requires one argument".to_owned());
@@ -1877,7 +4124,7 @@ fn verify_builtin_call(
                     Some(Type::Object(name))
                         if matches!(
                             name.as_str(),
-                            "MemoryStream" | "TempStream" | "ReadableStream"
+                            "MemoryStream" | "TempStream" | "ReadableStream" | "Stream" | "ReadableFileStream" | "WritableFileStream" | "ReadWriteFileStream"
                         )
                 )
             {
@@ -1889,8 +4136,16 @@ fn verify_builtin_call(
             &[Type::String],
             &Type::Object("ReadableFileStream".to_owned()),
         ),
+        Builtin::FilesOpenWrite => check(
+            &[Type::String, Type::Int],
+            &Type::Object("WritableFileStream".to_owned()),
+        ),
+        Builtin::FilesOpenReadWrite => check(
+            &[Type::String, Type::Int],
+            &Type::Object("ReadWriteFileStream".to_owned()),
+        ),
         Builtin::StreamTell => {
-            object_receiver("ReadableStream")?;
+            object_receiver("SeekableStream")?;
             if arguments.len() != 1 || result != Some(&Type::Int) {
                 return Err("invalid stream `tell` signature".to_owned());
             }
@@ -1916,11 +4171,17 @@ fn verify_builtin_call(
             }
             Ok(())
         }
-        Builtin::StreamEof | Builtin::StreamIsClosed => {
+        Builtin::StreamEof
+        | Builtin::StreamIsClosed
+        | Builtin::StreamIsReadable
+        | Builtin::StreamIsWritable
+        | Builtin::StreamIsSeekable => {
             object_receiver(if builtin == Builtin::StreamEof {
                 "ReadableStream"
-            } else {
+            } else if builtin == Builtin::StreamIsClosed {
                 "Closeable"
+            } else {
+                "Stream"
             })?;
             if arguments.len() != 1 || result != Some(&Type::Bool) {
                 return Err("invalid boolean stream method signature".to_owned());
@@ -1929,7 +4190,10 @@ fn verify_builtin_call(
         }
         Builtin::StreamSeek => {
             object_receiver("SeekableStream")?;
-            if arguments.len() != 2 || argument_type(1) != &Type::Int || result != Some(&Type::Void)
+            if arguments.len() != 3
+                || argument_type(1) != &Type::Int
+                || argument_type(2) != &Type::Int
+                || result != Some(&Type::Int)
             {
                 return Err("invalid stream `seek` signature".to_owned());
             }
@@ -1945,10 +4209,177 @@ fn verify_builtin_call(
             }
             Ok(())
         }
+        Builtin::StreamWrite => {
+            object_receiver("WritableStream")?;
+            if arguments.len() != 2
+                || argument_type(1) != &Type::String
+                || result != Some(&Type::Int)
+            {
+                return Err("invalid stream `write` signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::StreamFlush => {
+            object_receiver("WritableStream")?;
+            if arguments.len() != 1 || result != Some(&Type::Void) {
+                return Err("invalid stream `flush` signature".to_owned());
+            }
+            Ok(())
+        }
         Builtin::StreamClose => {
             object_receiver("Closeable")?;
             if arguments.len() != 1 || result != Some(&Type::Void) {
                 return Err("invalid stream `close` signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::FileInfo(operation) => {
+            object_receiver("SplFileInfo")?;
+            let expected = match operation {
+                FileInfoBuiltin::Construct => {
+                    if arguments.len() != 2 || argument_type(1) != &Type::String {
+                        return Err("invalid file-info constructor".to_owned());
+                    }
+                    Type::Void
+                }
+                FileInfoBuiltin::Basename => {
+                    if arguments.len() != 2 || argument_type(1) != &Type::String {
+                        return Err("invalid file-info basename".to_owned());
+                    }
+                    Type::String
+                }
+                FileInfoBuiltin::Path
+                | FileInfoBuiltin::Pathname
+                | FileInfoBuiltin::Filename
+                | FileInfoBuiltin::Extension
+                | FileInfoBuiltin::ToString => Type::String,
+                FileInfoBuiltin::RealPath | FileInfoBuiltin::LinkTarget | FileInfoBuiltin::Type => {
+                    Type::Union(vec![Type::Bool, Type::String])
+                }
+                FileInfoBuiltin::IsFile
+                | FileInfoBuiltin::IsDir
+                | FileInfoBuiltin::IsLink
+                | FileInfoBuiltin::IsReadable
+                | FileInfoBuiltin::IsWritable
+                | FileInfoBuiltin::IsExecutable => Type::Bool,
+                _ => Type::Union(vec![Type::Bool, Type::Int]),
+            };
+            if arguments.len()
+                != if matches!(
+                    operation,
+                    FileInfoBuiltin::Construct | FileInfoBuiltin::Basename
+                ) {
+                    2
+                } else {
+                    1
+                }
+                || result != Some(&expected)
+            {
+                return Err("invalid file-info builtin signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::FileObject(operation) => {
+            object_receiver("SplFileObject")?;
+            let (count, expected) = match operation {
+                FileObjectBuiltin::Construct => {
+                    if arguments.len() != 2 || argument_type(1) != &Type::String {
+                        return Err("invalid file-object constructor".to_owned());
+                    }
+                    (2, Type::Void)
+                }
+                FileObjectBuiltin::Seek => (2, Type::Void),
+                FileObjectBuiltin::Fread => (2, Type::Union(vec![Type::Bool, Type::String])),
+                FileObjectBuiltin::Rewind | FileObjectBuiltin::Advance => (1, Type::Void),
+                FileObjectBuiltin::Valid | FileObjectBuiltin::Eof => (1, Type::Bool),
+                FileObjectBuiltin::Key | FileObjectBuiltin::Ftell => (1, Type::Int),
+                FileObjectBuiltin::Value | FileObjectBuiltin::Fgets => (1, Type::String),
+            };
+            if arguments.len() != count
+                || (count == 2
+                    && operation != FileObjectBuiltin::Construct
+                    && argument_type(1) != &Type::Int)
+                || result != Some(&expected)
+            {
+                return Err("invalid file-object builtin signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Directory(operation) => {
+            match operation {
+                DirectoryBuiltin::ConstructDirectory
+                | DirectoryBuiltin::KeyInt
+                | DirectoryBuiltin::Seek
+                | DirectoryBuiltin::IsDot
+                | DirectoryBuiltin::ToString => object_receiver("DirectoryIterator")?,
+                DirectoryBuiltin::ConstructFilesystem
+                | DirectoryBuiltin::SkipsDots
+                | DirectoryBuiltin::FollowsSymlinks => object_receiver("FilesystemIterator")?,
+                DirectoryBuiltin::ConstructRecursive
+                | DirectoryBuiltin::RecursiveValue
+                | DirectoryBuiltin::GetSubPath
+                | DirectoryBuiltin::GetSubPathname => {
+                    object_receiver("RecursiveDirectoryIterator")?;
+                }
+                DirectoryBuiltin::ConstructGlob | DirectoryBuiltin::Count => {
+                    object_receiver("GlobIterator")?;
+                }
+                DirectoryBuiltin::KeyPath => object_receiver("FilesystemIterator")
+                    .or_else(|_| object_receiver("RecursiveDirectoryIterator"))
+                    .or_else(|_| object_receiver("GlobIterator"))?,
+                _ => object_receiver("DirectoryIterator")
+                    .or_else(|_| object_receiver("FilesystemIterator"))
+                    .or_else(|_| object_receiver("RecursiveDirectoryIterator"))
+                    .or_else(|_| object_receiver("GlobIterator"))?,
+            }
+            let (count, expected) = match operation {
+                DirectoryBuiltin::ConstructDirectory => (2, Type::Void),
+                DirectoryBuiltin::ConstructFilesystem | DirectoryBuiltin::ConstructRecursive => {
+                    (5, Type::Void)
+                }
+                DirectoryBuiltin::ConstructGlob => (4, Type::Void),
+                DirectoryBuiltin::Rewind | DirectoryBuiltin::Advance | DirectoryBuiltin::Seek => (
+                    if operation == DirectoryBuiltin::Seek {
+                        2
+                    } else {
+                        1
+                    },
+                    Type::Void,
+                ),
+                DirectoryBuiltin::Valid
+                | DirectoryBuiltin::IsDot
+                | DirectoryBuiltin::SkipsDots
+                | DirectoryBuiltin::FollowsSymlinks => (1, Type::Bool),
+                DirectoryBuiltin::KeyInt | DirectoryBuiltin::Count => (1, Type::Int),
+                DirectoryBuiltin::KeyPath | DirectoryBuiltin::ToString => (1, Type::String),
+                DirectoryBuiltin::Value => (1, Type::Object("SplFileInfo".to_owned())),
+                DirectoryBuiltin::RecursiveValue => (
+                    1,
+                    Type::Nominal {
+                        name: "RecursiveEntry".to_owned(),
+                        arguments: vec![Type::String, Type::Object("SplFileInfo".to_owned())],
+                    },
+                ),
+                DirectoryBuiltin::GetSubPath | DirectoryBuiltin::GetSubPathname => {
+                    (1, Type::String)
+                }
+            };
+            if arguments.len() != count
+                || (count >= 2
+                    && argument_type(1) != &Type::String
+                    && operation != DirectoryBuiltin::Seek)
+                || (operation == DirectoryBuiltin::Seek && argument_type(1) != &Type::Int)
+                || (matches!(
+                    operation,
+                    DirectoryBuiltin::ConstructFilesystem | DirectoryBuiltin::ConstructRecursive
+                ) && (argument_type(2) != &Type::Bool
+                    || argument_type(3) != &Type::Bool
+                    || argument_type(4) != &Type::Bool))
+                || (operation == DirectoryBuiltin::ConstructGlob
+                    && (argument_type(2) != &Type::Bool || argument_type(3) != &Type::Bool))
+                || result != Some(&expected)
+            {
+                return Err("invalid directory builtin signature".to_owned());
             }
             Ok(())
         }
@@ -2024,6 +4455,128 @@ fn verify_builtin_call(
             }
             Ok(())
         }
+        Builtin::OptionSome | Builtin::OptionNone => {
+            let Some(Type::Nominal {
+                name,
+                arguments: type_arguments,
+            }) = result
+            else {
+                return Err("option factory must return Option<T>".to_owned());
+            };
+            if name != "Option"
+                || type_arguments.len() != 1
+                || arguments.len() != usize::from(builtin == Builtin::OptionSome)
+                || (builtin == Builtin::OptionSome
+                    && !type_accepts(program, &type_arguments[0], argument_type(0)))
+            {
+                return Err("invalid option factory signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::OptionIsSome | Builtin::OptionIsNone | Builtin::OptionGet => {
+            object_receiver("Option")?;
+            if arguments.len() != 1 {
+                return Err("option method requires one receiver".to_owned());
+            }
+            let Type::Nominal {
+                name,
+                arguments: type_arguments,
+            } = argument_type(0)
+            else {
+                return Err("option receiver must retain its type argument".to_owned());
+            };
+            if name != "Option"
+                || type_arguments.len() != 1
+                || result
+                    != Some(if builtin == Builtin::OptionGet {
+                        &type_arguments[0]
+                    } else {
+                        &Type::Bool
+                    })
+            {
+                return Err("invalid option method signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Serialize => {
+            if arguments.len() != 1 || result != Some(&Type::String) {
+                return Err("invalid serialize signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Unserialize => check(&[Type::String], &Type::Mixed),
+        Builtin::TraceLineConstruct => {
+            object_receiver("TraceLine")?;
+            if arguments.len() != 8
+                || result != Some(&Type::Void)
+                || argument_type(1) != &Type::String
+                || argument_type(2) != &Type::Int
+                || argument_type(3) != &Type::String
+                || argument_type(4) != &Type::String
+                || argument_type(6) != &Type::String
+            {
+                return Err("invalid TraceLine constructor signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::ExceptionGetFile
+        | Builtin::ExceptionGetTraceAsString
+        | Builtin::ExceptionToString => {
+            object_receiver("Throwable")?;
+            if arguments.len() != 1 || result != Some(&Type::String) {
+                return Err("invalid throwable string method signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::ExceptionGetLine => {
+            object_receiver("Throwable")?;
+            if arguments.len() != 1 || result != Some(&Type::Int) {
+                return Err("invalid throwable line method signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::ExceptionGetTrace => {
+            object_receiver("Throwable")?;
+            if arguments.len() != 1
+                || result
+                    != Some(&Type::Vector(Box::new(Type::Object(
+                        "TraceLine".to_owned(),
+                    ))))
+            {
+                return Err("invalid throwable trace method signature".to_owned());
+            }
+            Ok(())
+        }
+        Builtin::Reflection(operation) => {
+            let Some((class, method)) = program.classes.iter().find_map(|class| {
+                class
+                    .declared_methods
+                    .iter()
+                    .find(|method| {
+                        method.callee == Some(Callee::Builtin(Builtin::Reflection(operation)))
+                    })
+                    .map(|method| (class, method))
+            }) else {
+                return Err("reflection builtin has no native descriptor method".to_owned());
+            };
+            let receiver_count = usize::from(!method.static_method);
+            if arguments.len() != method.parameter_types.len() + receiver_count
+                || result != Some(&method.return_type)
+            {
+                return Err("invalid reflection builtin signature".to_owned());
+            }
+            if receiver_count == 1
+                && !type_accepts(program, &Type::Object(class.name.clone()), argument_type(0))
+            {
+                return Err("reflection builtin has the wrong receiver".to_owned());
+            }
+            for (index, expected) in method.parameter_types.iter().enumerate() {
+                if !type_accepts(program, expected, argument_type(index + receiver_count)) {
+                    return Err("reflection builtin argument has the wrong type".to_owned());
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2053,11 +4606,13 @@ fn verify_terminator(
         Terminator::Return(value) => match value {
             Some(value) => {
                 check_register(function, value, block.id, None)?;
-                if !type_accepts(
-                    program,
-                    &function.return_type,
-                    &function.register_types[value.0 as usize],
-                ) {
+                if !function.generator
+                    && !type_accepts(
+                        program,
+                        &function.return_type,
+                        &function.register_types[value.0 as usize],
+                    )
+                {
                     return Err(block_error(
                         function.id,
                         block.id,
@@ -2066,7 +4621,7 @@ fn verify_terminator(
                 }
                 Ok(())
             }
-            None if function.return_type == Type::Void => Ok(()),
+            None if function.return_type == Type::Void || function.generator => Ok(()),
             None => Err(block_error(
                 function.id,
                 block.id,
@@ -2089,6 +4644,55 @@ fn verify_terminator(
             Ok(())
         }
         Terminator::Unreachable => Ok(()),
+        Terminator::Yield { key, value, resume } => {
+            if !function.generator {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "yield in a non-generator function",
+                ));
+            }
+            let iterator = class_by_name(program, "Iterator").ok_or_else(|| {
+                block_error(function.id, block.id, "Iterator metadata is missing")
+            })?;
+            let instantiation =
+                instantiation_for_class(program, &function.return_type, iterator.id).ok_or_else(
+                    || block_error(function.id, block.id, "invalid generator result"),
+                )?;
+            let [key_type, value_type] = instantiation.arguments.as_slice() else {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "invalid generator type arguments",
+                ));
+            };
+            let actual_key = if let Some(key) = key {
+                check_register(function, key, block.id, None)?;
+                &function.register_types[key.0 as usize]
+            } else {
+                &Type::Int
+            };
+            if !type_accepts(program, key_type, actual_key) {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "yielded key type is invalid",
+                ));
+            }
+            check_register(function, value, block.id, None)?;
+            if !type_accepts(
+                program,
+                value_type,
+                &function.register_types[value.0 as usize],
+            ) {
+                return Err(block_error(
+                    function.id,
+                    block.id,
+                    "yielded value type is invalid",
+                ));
+            }
+            check_block(function, resume, block.id, None)
+        }
     }
 }
 
@@ -2146,10 +4750,20 @@ fn check_block(
     }
 }
 
-fn type_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
+pub fn type_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
     expected == &Type::Mixed
         || actual == &Type::Never
         || expected == actual
+        || matches!((expected, actual), (Type::Vector(element), Type::Vector(_)) if element.as_ref() == &Type::Mixed)
+        || matches!((expected, actual), (Type::Map(expected_key, expected_value), Type::Map(actual_key, _))
+            if expected_value.as_ref() == &Type::Mixed
+                && type_accepts(program, expected_key, actual_key))
+        || matches!(actual, Type::Parameter { id, .. } if program
+            .classes
+            .get(id.owner.0 as usize)
+            .and_then(|class| class.type_parameters.get(id.index as usize))
+            .and_then(|parameter| parameter.bound.as_ref())
+            .is_some_and(|bound| type_accepts(program, expected, bound)))
         || matches!(
             actual,
             Type::Union(members)
@@ -2164,11 +4778,85 @@ fn type_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
                     .iter()
                     .any(|member| type_accepts(program, member, actual))
         )
-        || matches!(
-            (expected, actual),
-            (Type::Object(expected), Type::Object(actual))
-                if is_instance_of_name(program, actual, expected)
-        )
+        || encoded_nominal_accepts(program, expected, actual)
+}
+
+fn encoded_nominal_accepts(program: &Program, expected: &Type, actual: &Type) -> bool {
+    let Some((expected_name, expected_arguments)) = encoded_nominal_parts(expected) else {
+        return false;
+    };
+    let Some((actual_name, actual_arguments)) = encoded_nominal_parts(actual) else {
+        return false;
+    };
+    if expected_name == actual_name {
+        return expected_arguments == actual_arguments;
+    }
+    let Some(actual_class) = class_by_name(program, actual_name) else {
+        return false;
+    };
+    let instantiated = NominalType {
+        class: actual_class.id,
+        arguments: actual_arguments.to_vec(),
+    };
+    actual_class
+        .parent_type
+        .iter()
+        .chain(&actual_class.interface_types)
+        .map(|edge| NominalType {
+            class: edge.class,
+            arguments: edge
+                .arguments
+                .iter()
+                .map(|argument| {
+                    substitute_descriptor_type(argument, Some(&instantiated), actual_class)
+                })
+                .collect(),
+        })
+        .any(|edge| {
+            let edge_class = &program.classes[edge.class.0 as usize];
+            let edge_type = if edge.arguments.is_empty() {
+                Type::Object(edge_class.name.clone())
+            } else {
+                Type::Nominal {
+                    name: edge_class.name.clone(),
+                    arguments: edge.arguments,
+                }
+            };
+            encoded_nominal_accepts(program, expected, &edge_type)
+        })
+}
+
+fn encoded_nominal_ancestor_arguments(
+    program: &Program,
+    actual: &Type,
+    target: &str,
+) -> Option<Vec<Type>> {
+    let (name, arguments) = encoded_nominal_parts(actual)?;
+    if name == target {
+        return Some(arguments.to_vec());
+    }
+    let class = class_by_name(program, name)?;
+    let instantiated = NominalType {
+        class: class.id,
+        arguments: arguments.to_vec(),
+    };
+    class
+        .parent_type
+        .iter()
+        .chain(&class.interface_types)
+        .find_map(|edge| {
+            let edge_class = &program.classes[edge.class.0 as usize];
+            let edge_arguments = edge
+                .arguments
+                .iter()
+                .map(|argument| substitute_descriptor_type(argument, Some(&instantiated), class))
+                .collect::<Vec<_>>();
+            let edge_type = Type::Nominal {
+                name: edge_class.name.clone(),
+                arguments: edge_arguments,
+            };
+            encoded_nominal_ancestor_arguments(program, &edge_type, target)
+        })
 }
 
 fn is_instance_of_name(program: &Program, actual: &str, expected: &str) -> bool {
@@ -2205,6 +4893,68 @@ fn constant_type(constant: &Constant) -> Type {
         Constant::Null => Type::Null,
         Constant::String(_) => Type::String,
     }
+}
+
+fn constant_value_within_nesting_limit(value: &ConstantValue, depth: usize) -> bool {
+    match value {
+        ConstantValue::Vector(values) => {
+            depth < MAX_CONSTANT_NESTING
+                && values
+                    .iter()
+                    .all(|value| constant_value_within_nesting_limit(value, depth + 1))
+        }
+        ConstantValue::Map(entries) => {
+            depth < MAX_CONSTANT_NESTING
+                && entries.iter().all(|(key, value)| {
+                    constant_value_within_nesting_limit(key, depth + 1)
+                        && constant_value_within_nesting_limit(value, depth + 1)
+                })
+        }
+        _ => true,
+    }
+}
+
+fn valid_checked_narrow(program: &Program, source: &Type, narrowed: &Type) -> bool {
+    let canonical = matches!(
+        narrowed,
+        Type::String | Type::Int | Type::Float | Type::Null
+    ) || matches!(
+        narrowed,
+        Type::Vector(element) if element.as_ref() == &Type::Mixed
+    ) || matches!(
+        narrowed,
+        Type::Map(key, value)
+            if key.as_ref() == &Type::Mixed && value.as_ref() == &Type::Mixed
+    ) || matches!(
+        narrowed,
+        Type::Union(members) if members.as_slice() == [Type::Int, Type::Float, Type::String]
+    ) || matches!(
+        narrowed,
+        Type::Object(name)
+            if class_by_name(program, name).is_some_and(|class| {
+                class.type_parameters.is_empty()
+                    && matches!(class.kind, NominalKind::Class | NominalKind::Interface)
+            })
+    );
+    (source == &Type::Mixed || type_accepts(program, source, narrowed))
+        && (canonical
+            || (source != &Type::Mixed
+                && match narrowed {
+                    Type::String
+                    | Type::Int
+                    | Type::Float
+                    | Type::Null
+                    | Type::Vector(_)
+                    | Type::Map(_, _)
+                    | Type::Callable(_, _)
+                    | Type::Object(_)
+                    | Type::Nominal { .. }
+                    | Type::Parameter { .. } => true,
+                    Type::Union(members) => members
+                        .iter()
+                        .all(|member| valid_checked_narrow(program, source, member)),
+                    Type::Mixed | Type::Bool | Type::Void | Type::Never => false,
+                }))
 }
 
 fn global_error(message: impl Into<String>) -> VerificationError {
@@ -2311,6 +5061,95 @@ mod tests {
     }
 
     #[test]
+    fn generator_yields_round_trip_and_reject_forged_types() {
+        let mut program = compile("<?thp\nfunction values(): Generator<int, int> { yield 1; }");
+        verify(&program).unwrap();
+        verify(&decode(&encode(&program)).unwrap()).unwrap();
+        let function = program
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "values")
+            .unwrap();
+        function.return_type = thp_hir::Type::Nominal {
+            name: "Generator".to_owned(),
+            arguments: vec![thp_hir::Type::Int, thp_hir::Type::String],
+        };
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .message
+                .contains("yielded value type is invalid")
+        );
+    }
+
+    #[test]
+    fn iterator_builtins_round_trip_and_reject_forged_result_types() {
+        let source = "<?thp\n$iterator: Iterator<int, int> = [1, 2];\n$values = iterator_to_vector($iterator);";
+        let mut program = compile(source);
+        verify(&program).unwrap();
+        verify(&decode(&encode(&program)).unwrap()).unwrap();
+        let function = &mut program.functions[program.entry.0 as usize];
+        let instruction = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction.kind,
+                    super::InstructionKind::Call {
+                        callee: thp_hir::Callee::Builtin(thp_hir::Builtin::IteratorToVector),
+                        ..
+                    }
+                )
+            })
+            .expect("iterator conversion call");
+        let destination = instruction.destination.expect("conversion has result");
+        let forged = thp_hir::Type::Vector(Box::new(thp_hir::Type::String));
+        instruction.ty = Some(forged.clone());
+        function.register_types[destination.0 as usize] = forged;
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid iterator function result")
+        );
+    }
+
+    #[test]
+    fn version_nine_native_builtins_round_trip() {
+        let source = "<?thp\nclass Box {}\n$fixed = new FixedSequence<int>(2);\n$fixed->offsetSet(0, 1);\n$list = new LinkedList<int>();\n$list->push(3);\n$heap = new MaxHeap<int>();\n$heap->insert(4);\n$map = new TypedMap<string, int>();\n$map->set(\"x\", 5);\n$storage = new ObjectStorage<int>();\n$storage->attach(new Box(), 6);";
+        let program = compile(source);
+        verify(&program).unwrap();
+        verify(&decode(&encode(&program)).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rejects_extra_iterator_conversion_argument() {
+        let mut program = compile(
+            "<?thp\n$iterator: Iterator<int, int> = [1, 2];\n$values = iterator_to_vector($iterator);",
+        );
+        let instruction = program.functions[program.entry.0 as usize]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction.kind,
+                    super::InstructionKind::Call {
+                        callee: thp_hir::Callee::Builtin(thp_hir::Builtin::IteratorToVector),
+                        ..
+                    }
+                )
+            })
+            .expect("iterator conversion call");
+        let super::InstructionKind::Call { arguments, .. } = &mut instruction.kind else {
+            unreachable!()
+        };
+        arguments.push(arguments[0]);
+        assert!(verify(&program).is_err());
+    }
+
+    #[test]
     fn rejects_bad_branch_target() {
         let mut program = compile("<?thp\nif (true) { echo \"yes\"; }");
         program.functions[0].blocks[0].terminator = super::Terminator::Jump(thp_mir::BlockId(999));
@@ -2364,6 +5203,60 @@ mod tests {
     }
 
     #[test]
+    fn source_locations_round_trip_and_reject_missing_sources() {
+        let mut program = compile("<?thp\necho 1;");
+        program.sources.push(super::SourceInfo {
+            path: "example.thp".to_owned(),
+            line_starts: vec![0, 6],
+        });
+        let instruction =
+            &mut program.functions[program.entry.0 as usize].blocks[0].instructions[0];
+        instruction.span.source = Some(thp_diagnostics::SourceId(0));
+        let decoded = decode(&encode(&program)).unwrap();
+        assert_eq!(decoded.sources[0].path, "example.thp");
+        assert_eq!(
+            decoded.functions[decoded.entry.0 as usize].blocks[0].instructions[0]
+                .span
+                .source,
+            Some(thp_diagnostics::SourceId(0))
+        );
+        program.sources.clear();
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .message
+                .contains("missing source")
+        );
+    }
+
+    #[test]
+    fn captured_callable_and_collection_call_round_trip_and_reject_bad_target() {
+        let source = "<?thp\n$base: int = 3;\n$callback = fn(int $value): int => $value + $base;\n$values = vector_map([1, 2], $callback);\necho $callback($values[0]);";
+        let mut program = compile(source);
+        verify(&program).unwrap();
+        let decoded = decode(&encode(&program)).unwrap();
+        verify(&decoded).unwrap();
+        assert_eq!(decoded.to_string(), program.to_string());
+
+        let instruction = program.functions[program.entry.0 as usize]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| matches!(instruction.kind, super::InstructionKind::Closure { .. }))
+            .expect("captured closure");
+        let super::InstructionKind::Closure { function, .. } = &mut instruction.kind else {
+            unreachable!()
+        };
+        *function = thp_hir::FunctionId(u32::MAX);
+        assert!(
+            verify(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("closure target is out of bounds")
+        );
+    }
+
+    #[test]
     fn object_metadata_and_binary_strings_round_trip() {
         let program = compile(
             r#"<?thp
@@ -2372,11 +5265,301 @@ class Box {
     public function __construct(string $value) { $this->value = $value; }
 }
 $box = new Box("\x00\xff");
+$descriptor = new ReflectionClass($box);
 "#,
         );
         let decoded = decode(&encode(&program)).unwrap();
         verify(&decoded).unwrap();
         assert!(decoded.classes.iter().any(|class| class.name == "Box"));
+    }
+
+    #[test]
+    fn dynamic_construction_metadata_and_instructions_round_trip() {
+        let program = compile(
+            r#"<?thp
+class Box {
+    public vector<int> $values = [1, 2];
+    public function __construct(string $name = "box", int ...$items) {}
+}
+$class: mixed = "Box";
+if (is_string($class)) { $box = new $class(name: "dynamic"); }
+"#,
+        );
+        let decoded = decode(&encode(&program)).unwrap();
+        verify(&decoded).unwrap();
+        let class = decoded
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        assert!(class.properties[0].default.is_some());
+        let constructor = class
+            .methods
+            .iter()
+            .find(|method| method.name == "__construct")
+            .unwrap();
+        assert_eq!(constructor.parameters[0].name, "name");
+        assert!(constructor.parameters[0].default.is_some());
+        assert!(constructor.parameters[1].variadic);
+        assert!(
+            decoded.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction.kind,
+                    super::InstructionKind::NewDynamic { .. }
+                ))
+        );
+
+        let mut forged = decoded.clone();
+        let destination = {
+            let instruction = forged.functions[0]
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.instructions)
+                .find(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        super::InstructionKind::CheckedNarrow { .. }
+                    )
+                })
+                .unwrap();
+            instruction.kind = super::InstructionKind::CheckedNarrow {
+                value: match &instruction.kind {
+                    super::InstructionKind::CheckedNarrow { value, .. } => *value,
+                    _ => unreachable!(),
+                },
+                narrowed: thp_hir::Type::Bool,
+            };
+            instruction.ty = Some(thp_hir::Type::Bool);
+            instruction.destination.unwrap()
+        };
+        forged.functions[0].register_types[destination.0 as usize] = thp_hir::Type::Bool;
+        assert!(verify(&forged).is_err());
+        assert!(
+            decoded.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(
+                    instruction.kind,
+                    super::InstructionKind::CheckedNarrow { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn typed_constant_defaults_enforce_the_collection_nesting_limit() {
+        fn nested(levels: usize) -> thp_hir::ConstantValue {
+            let mut value = thp_hir::ConstantValue::Null;
+            for level in 0..levels {
+                value = if level % 2 == 0 {
+                    thp_hir::ConstantValue::Vector(vec![value])
+                } else {
+                    thp_hir::ConstantValue::Map(vec![(thp_hir::ConstantValue::Int(0), value)])
+                };
+            }
+            value
+        }
+
+        let mut program = compile(
+            "<?thp\nclass Box { public mixed $value = null; public function __construct(mixed $value = null) {} }",
+        );
+        let class = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        class.properties[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        for method in class
+            .methods
+            .iter_mut()
+            .chain(&mut class.declared_methods)
+            .filter(|method| method.name == "__construct")
+        {
+            method.parameters[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        }
+        verify(&program).unwrap();
+
+        let decoded = decode(&encode(&program)).expect("verified bytecode must round-trip");
+        verify(&decoded).unwrap();
+
+        program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap()
+            .properties[0]
+            .default = Some(nested(thp_hir::MAX_CONSTANT_NESTING + 1));
+        let error = verify(&program).unwrap_err();
+        assert!(error.message.contains("invalid property metadata"));
+
+        let class = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        class.properties[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING));
+        for method in class
+            .methods
+            .iter_mut()
+            .chain(&mut class.declared_methods)
+            .filter(|method| method.name == "__construct")
+        {
+            method.parameters[0].default = Some(nested(thp_hir::MAX_CONSTANT_NESTING + 1));
+        }
+        let error = verify(&program).unwrap_err();
+        assert!(error.message.contains("invalid method metadata"));
+    }
+
+    #[test]
+    fn rejects_forged_reflection_metadata() {
+        let mut property = compile(
+            r"<?thp
+class Box { public int $value = 1; }
+",
+        );
+        property
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap()
+            .properties[0]
+            .id = thp_hir::PropertyId(99);
+        assert!(
+            verify(&property)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid property metadata")
+        );
+
+        let mut parameter = compile("<?thp\nfunction take(int $value = 1): void {}");
+        parameter
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "take")
+            .unwrap()
+            .parameter_metadata[0]
+            .default = Some(thp_hir::ConstantValue::String(b"wrong".to_vec()));
+        assert!(
+            verify(&parameter)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid parameter metadata")
+        );
+    }
+
+    #[test]
+    fn verifies_variadic_method_reflection_metadata() {
+        let program = compile(
+            r"<?thp
+class Values {
+    public function first(int ...$values): int { return $values[0]; }
+}
+",
+        );
+
+        verify(&program).unwrap();
+    }
+
+    #[test]
+    fn rejects_forged_declared_method_signature() {
+        let mut program = compile("<?thp\n$stream = MemoryStream::open();");
+        let method = program
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "MemoryStream")
+            .unwrap()
+            .declared_methods
+            .iter_mut()
+            .find(|method| method.name == "read")
+            .unwrap();
+        method.parameter_types[0] = thp_hir::Type::String;
+        method.parameters[0].ty = thp_hir::Type::String;
+
+        assert!(verify(&program).is_err());
+    }
+
+    #[test]
+    fn generic_descriptors_round_trip_and_reject_forged_metadata() {
+        let program = compile(
+            r#"<?thp
+interface Value<T> { public function value(): T; }
+interface Root<T> {}
+interface Child<T> extends Root<T> {}
+class Box<T> implements Value<T> {
+    public T $item;
+    public function __construct(T $item) { $this->item = $item; }
+    public function value(): T { return $this->item; }
+}
+class Marker<T> implements Child<T> {}
+$value: Value<int> = new Box(42);
+echo $value->value() . "";
+"#,
+        );
+        let decoded = decode(&encode(&program)).unwrap();
+        verify(&decoded).unwrap();
+        let box_class = decoded
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        assert_eq!(box_class.type_parameters.len(), 1);
+        assert_eq!(box_class.interface_types[0].arguments.len(), 1);
+
+        let mut invalid_parameter = decoded.clone();
+        let box_class = invalid_parameter
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        box_class.type_parameters[0].id.index = 99;
+        assert!(
+            verify(&invalid_parameter)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed type-parameter identity")
+        );
+
+        let mut invalid_closure = decoded.clone();
+        let root = invalid_closure
+            .classes
+            .iter()
+            .find(|class| class.name == "Root")
+            .unwrap()
+            .id;
+        let marker = invalid_closure
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Marker")
+            .unwrap();
+        marker
+            .interface_types
+            .iter_mut()
+            .find(|interface| interface.class == root)
+            .unwrap()
+            .arguments[0] = thp_hir::Type::String;
+        assert!(
+            verify(&invalid_closure)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete or conflicting instantiated interface closure")
+        );
+
+        let mut invalid_arity = decoded;
+        let box_class = invalid_arity
+            .classes
+            .iter_mut()
+            .find(|class| class.name == "Box")
+            .unwrap();
+        box_class.interface_types[0].arguments.clear();
+        assert!(
+            verify(&invalid_arity)
+                .unwrap_err()
+                .to_string()
+                .contains("incorrect argument arity")
+        );
     }
 
     #[test]
@@ -2519,12 +5702,8 @@ try {
         );
         assert_eq!(regions.functions[0].exception_handlers.len(), 2);
         regions.functions[0].exception_handlers.swap(0, 1);
-        assert!(
-            verify(&regions)
-                .unwrap_err()
-                .to_string()
-                .contains("innermost first")
-        );
+        let error = verify(&regions).unwrap_err();
+        assert!(error.to_string().contains("innermost first"), "{error}");
 
         let mut catches = compile(
             r"<?thp
@@ -2537,11 +5716,7 @@ try {
         catches.functions[0].exception_handlers[0]
             .catches
             .swap(0, 1);
-        assert!(
-            verify(&catches)
-                .unwrap_err()
-                .to_string()
-                .contains("subsumed")
-        );
+        let error = verify(&catches).unwrap_err();
+        assert!(error.to_string().contains("subsumed"), "{error}");
     }
 }

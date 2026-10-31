@@ -33,6 +33,11 @@ cells and payload capacity, buffers possible cycle roots, and uses trial
 deletion to reclaim unreachable vector, map, object, and exception cycles.
 Stream cells own logical handle leases and release native storage on explicit
 close, last-reference cleanup, or request teardown.
+Coroutine queues, timers, and VM frames belong to one request. File jobs use
+four process-wide workers and a 64-job queue; only owned path bytes, file
+handles, byte buffers, and operation data cross threads. Completed jobs return
+to the request VM thread, which applies stream cursor changes and preserves
+operation order for aliases.
 
 VM requests carry instruction, execution-time, managed-heap, request-input,
 logical-stack, and open-handle limits plus a request-local filesystem base.
@@ -47,6 +52,9 @@ exposes version-one opaque engine/prepared-project handles, size-versioned
 runtime limits, synchronous input/output and module-provider callbacks, owned
 byte buffers, and extension/host function tables through
 `crates/abi/include/thp.h`. Legacy captured run functions remain available.
+`thp-native` loads project libraries before type checking, retains them with
+prepared programs, and exposes call-scoped opaque values to C callbacks. Its
+fixed signatures and library digests are verified against linked bytecode.
 Rust layouts are never part of that ABI, panics are caught before returning to
 C, and every allocation has an explicit matching release function.
 

@@ -18,7 +18,7 @@ export const guideSections: Record<GuideSection, GuideSectionDetails> = {
   },
   language: {
     breadcrumb: "Language",
-    navigation: "Implemented Language",
+    navigation: "Language",
     notice: "Experimental language",
     root: "/language/overview/",
     sidebar: "Language reference",
