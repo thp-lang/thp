@@ -18,11 +18,9 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: This experimental contract is implemented in the standalone compiler and VM.
+version: "0.5"
 ---
 
 `EmptyIterator` represents an iterator that never yields a value.
@@ -40,7 +38,7 @@ version: "0.1"
 
 ## Errors
 
-Construction validates the parameters shown above. Cursor operations propagate failures from the wrapped iterator, callback, pattern engine, or filesystem when that dependency is present; each member page identifies the applicable source. Concrete THP error classes remain unsettled.
+`key()` and `value()` fail when the cursor is exhausted.
 
 ## Example
 

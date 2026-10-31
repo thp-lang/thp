@@ -14,8 +14,10 @@ path = "src/main.rs"
 [dependencies]
 thp-bytecode = { path = "../bytecode" }
 thp-compiler = { path = "../compiler" }
+thp-config = { path = "../config" }
 thp-jit = { path = "../jit" }
 thp-metrics = { path = "../metrics" }
+thp-native = { path = "../native" }
 thp-opcache = { path = "../opcache" }
 thp-vm = { path = "../vm" }
 

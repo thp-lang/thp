@@ -15,14 +15,12 @@ returns:
   description: This method does not return a value.
 errors:
   - description:
-      The operation fails when the requested position is invalid or the
-      underlying source cannot seek.
+      Throws OutOfBoundsException when the requested position is negative or
+      unavailable. Failures from the underlying iterator propagate.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: LimitIterator implements this cursor method.
 version: "0.1"
 owner: std.spl.SeekableIterator
 visibility: public

@@ -22,19 +22,17 @@ properties:
     type: string
     description: "Declaring class for a method frame. Access: public read-only."
   - name: object
-    type: ?object
-    description: "Receiver recorded for an instance-method frame. Access: public read-only."
+    type: mixed
+    description: "Optional receiver. Construction accepts only an object or null. Access: public read-only."
   - name: type
     type: string
     description: 'Call operator: "->", "::", or "". Access: public read-only.'
   - name: args
-    type: ?vector<mixed>
-    description: "Ordered arguments when argument capture is enabled. Access: public read-only."
+    type: mixed
+    description: "A vector or null. Captured traces currently store null. Access: public read-only."
 status: experimental
-availability: proposed
-notice:
-  This typed stack-frame contract is proposed for THP and is not yet implemented
-  in this repository.
+availability: implemented
+notice: The compiler and reference VM implement this experimental contract.
 version: "0.1"
 ---
 
@@ -54,6 +52,11 @@ frame in a stack trace.
 The class is final and immutable. A stack trace is represented as
 `vector<TraceLine>`, ordered from the most recent captured frame toward its
 callers.
+The VM currently records `null` for receiver objects and arguments in captured
+frames. `TraceLine` constructors accept a non-negative line, a `type` of `""`,
+`"->"`, or `"::"`, an object or `null` receiver, and a vector or `null` for
+arguments. Invalid fields throw `InvalidArgumentException`. Property writes
+after construction throw `TypeError`.
 
 ## Example
 

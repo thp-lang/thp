@@ -30,7 +30,7 @@ echo greet("Ada");
 Current `thp inspect --emit=bytecode greet.thp` output includes:
 
 ```text
-THP bytecode v1 entry=#0
+THP bytecode v2 entry=#0
 function #0 <main> locals=0 registers=2 -> void
   block 0:
     r0 = Constant(String([65, 100, 97]))
@@ -62,6 +62,12 @@ renamed copies of one artifact.
 The binary codec records an explicit bytecode schema version. Decoding performs
 bounds checks, but successful decoding is still followed by semantic bytecode
 verification.
+
+Class descriptors carry generic parameters, bounds, nominal arguments, and
+the fully instantiated interface closure. These signatures are compile-time
+metadata: allocation and dispatch still use one erased class ID for each
+declaration. Changing this descriptor shape increments the bytecode schema;
+older linked programs are rejected cleanly and become OPcache misses.
 
 ## Design choices compared with PHP
 

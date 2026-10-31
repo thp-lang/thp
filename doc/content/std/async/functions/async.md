@@ -22,18 +22,11 @@ returns:
     The newly created Coroutine, where T is the callable's return type. Pass
     this handle to await() to retrieve the result.
 errors:
-  - description:
-      The call fails if no scheduler has been registered or the scheduler cannot
-      create or enqueue the coroutine. The concrete error types are not yet finalized.
-  - description:
-      Type or argument-count failures produced when invoking $function become the
-      coroutine's failed result and are observed through await().
+  - description: An unregistered scheduler throws Error at this call site.
+  - description: Incompatible callable arguments are compile errors.
 related: []
 status: experimental
-availability: proposed
-notice:
-  async() is proposed and is not implemented in this repository. Callable typing,
-  cancellation, and concrete error types are not finalized.
+availability: implemented
 version: "0.1"
 module: async
 ---
@@ -44,11 +37,11 @@ Async.
 
 ## Behavior
 
-`async()` asks the registered [`SchedulerInterface`](thp:std.async.SchedulerInterface) to
-create a coroutine, enqueues it for execution, and returns without waiting for
-the callable to finish.
+`async()` requires a statically typed callable. The compiler checks each
+argument against its parameter and infers `T` from the callable's return type.
+THP enqueues its body and returns `Coroutine<T>` before that body runs.
 
-The callable is not guaranteed to start before `async()` returns. Its result or
+The callable does not start before `async()` returns. Its result or
 failure is stored by the coroutine runtime:
 
 - returning from `$function` completes the coroutine successfully;
@@ -58,12 +51,17 @@ failure is stored by the coroutine runtime:
 Starting several coroutines before awaiting them allows their work to overlap at
 cooperative suspension points.
 
-Inside the coroutine, supported I/O operations suspend transparently. The same
-operation called outside a coroutine keeps its normal blocking behavior.
+Direct file-backed opens, reads, writes, seeks, EOF checks, flushes,
+`SplFileObject` line methods, `SplFileInfo` metadata queries, directory
+iteration, and temporary-file spill suspend while a worker performs host I/O.
+Memory-stream operations complete immediately. `thp:/input`, host output, and
+ABI-v1 native callbacks may block the request thread.
 
 ## Example
 
 ```thp
+<?thp
+
 scheduler_register_default();
 
 $first: Coroutine<string> = async(fetchText(...), "/first");
@@ -72,6 +70,9 @@ $second: Coroutine<string> = async(fetchText(...), "/second");
 echo await($first);
 echo await($second);
 ```
+
+The compiler rejects an argument whose type does not match the callable's
+parameter. It does not defer that error until the body runs.
 
 The two operations are scheduled before either result is requested. This mirrors
 True Async's model of launching a callable and returning a handle for its

@@ -155,11 +155,68 @@ typedef void (*ThpLogFn)(
     void *user_data
 );
 
+/* Opaque values belong to one synchronous native call. All returned handles,
+ * including clones and constructed values, expire when the callback returns.
+ * A callback returns one live handle through result. It must never free one.
+ * Borrowed byte buffers remain readable only until the callback returns. */
+typedef struct ThpCall ThpCall;
+typedef struct ThpValue ThpValue;
+
+typedef int32_t (*ThpNativeCallFn)(
+    void *user_data,
+    ThpCall *call,
+    const ThpValue *const *arguments,
+    size_t count,
+    const ThpValue **result
+);
+
+typedef struct {
+    size_t struct_size;
+    ThpBorrowedBuffer name;
+    const ThpBorrowedBuffer *parameters;
+    size_t parameter_count;
+    ThpBorrowedBuffer result;
+    ThpNativeCallFn callback;
+    void *user_data;
+} ThpNativeFunction;
+
+typedef int32_t (*ThpRegisterFunctionFn)(void *user_data, const ThpNativeFunction *function);
+
 typedef struct {
     uint32_t abi_version;
     size_t struct_size;
     ThpLogFn log;
     void *user_data;
+    ThpRegisterFunctionFn register_function;
+    /* Kinds: null=0, int=1, float=2, bool=3, string=4, vector=5,
+     * map=6, object=7, callable=8, stream=9, exception=10; -1 invalid. */
+    int32_t (*value_kind)(ThpCall *, const ThpValue *);
+    int32_t (*value_get_int)(ThpCall *, const ThpValue *, int64_t *);
+    int32_t (*value_get_float)(ThpCall *, const ThpValue *, double *);
+    int32_t (*value_get_bool)(ThpCall *, const ThpValue *, uint8_t *);
+    int32_t (*value_get_bytes)(ThpCall *, const ThpValue *, ThpBorrowedBuffer *);
+    int32_t (*value_count)(ThpCall *, const ThpValue *, size_t *);
+    const ThpValue *(*value_item)(ThpCall *, const ThpValue *, size_t);
+    const ThpValue *(*value_map_key)(ThpCall *, const ThpValue *, size_t);
+    const ThpValue *(*value_map_value)(ThpCall *, const ThpValue *, size_t);
+    const ThpValue *(*value_property)(ThpCall *, const ThpValue *, size_t);
+    const ThpValue *(*value_new_null)(ThpCall *);
+    const ThpValue *(*value_new_int)(ThpCall *, int64_t);
+    const ThpValue *(*value_new_float)(ThpCall *, double);
+    const ThpValue *(*value_new_bool)(ThpCall *, uint8_t);
+    const ThpValue *(*value_new_bytes)(ThpCall *, ThpBorrowedBuffer);
+    const ThpValue *(*value_clone)(ThpCall *, const ThpValue *);
+    const ThpValue *(*value_new_vector)(
+        ThpCall *, ThpBorrowedBuffer element_type,
+        const ThpValue *const *values, size_t count
+    );
+    const ThpValue *(*value_new_map)(
+        ThpCall *, ThpBorrowedBuffer key_type, ThpBorrowedBuffer value_type,
+        const ThpValue *const *keys, const ThpValue *const *values, size_t count
+    );
+    int32_t (*fail)(ThpCall *, ThpBorrowedBuffer message);
+    /* Canonical extension-owned TOML, borrowed only during initialize(). */
+    ThpBorrowedBuffer extension_config;
 } ThpHost;
 
 typedef int32_t (*ThpExtensionInitFn)(const ThpHost *host);

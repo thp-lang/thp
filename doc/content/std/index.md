@@ -7,10 +7,9 @@ module: standard-library
 order: 0
 status: experimental
 availability: proposed
-notice:
-  This section defines THP's intended library contracts. Async, autoloading, Base,
-  SPL, and typed collections are not presented as available runtime APIs in this
-  documentation checkout.
+notice: This section defines THP's intended library contracts. Native collection
+  operations and selected iterator APIs execute; the broader Async, Base, and
+  SPL surface remains proposed.
 ---
 
 ## Async
@@ -31,28 +30,14 @@ custom scheduler implementations. [`delay()`](thp:std.async.delay) and
 [`suspend()`](thp:std.async.suspend) yield cooperatively; [`timeout()`](thp:std.async.timeout)
 limits an outstanding wait.
 
-## Autoloading
-
-[Autoloading](thp:std.dataStructures) defines a PHP-inspired, process-wide queue of
-callbacks that load type declarations on demand. Use
-[`spl_autoload_register()`](thp:std.spl.spl_autoload_register) and
-[`spl_autoload_unregister()`](thp:std.spl.spl_autoload_unregister) to
-manage loaders,
-[`spl_autoload_functions()`](thp:std.spl.spl_autoload_functions) to inspect
-them, and [`spl_autoload_call()`](thp:std.spl.spl_autoload_call) to start a
-lookup explicitly.
-
-The section also documents the configurable
-[`spl_autoload()`](thp:std.spl.spl_autoload) default loader.
-
 ## PHP-inspired library categories
 
-[`Exceptions`](thp:std.exceptions) documents the proposed exception
+[`Exceptions`](thp:std.exceptions) documents the executable exception
 hierarchy. [`Iterators`](thp:std.iterators) covers adapters and recursive
 traversal. [`Filesystem`](thp:std.filesystem) documents filesystem metadata,
 files, temporary files, and locking results.
 [`Data structures`](thp:std.dataStructures) contains generic containers,
-observer contracts, autoloading, and object utilities.
+observer contracts, and object utilities.
 
 ## Streams
 
@@ -60,12 +45,15 @@ observer contracts, autoloading, and object utilities.
 cleanup, capability interfaces, file and memory factories, and a dynamic URI
 compatibility bridge.
 
+## Reflection
+
+[`Reflection`](thp:std.reflection) exposes immutable, VM-owned descriptors for
+types and declarations retained in the verified linked program.
+
 ## Bundled extensions
 
-[Bundled extensions](thp:std.extensions) reserves reference routes for the
-optional extensions shipped in PHP's source distribution. Every entry is
-currently a design placeholder rather than an implemented compatibility
-promise.
+[Bundled extensions](thp:std.extensions) includes the implemented PCRE2 regex
+functions and reserves routes for other proposed optional extensions.
 
 ## Base
 
@@ -86,15 +74,22 @@ generic element and key constraints. `[]` creates a vector,
 `{key => value}` creates a map, and both support bracket access.
 
 Collection operations use global functions prefixed by their native input
-shape rather than methods or PHP's `array_*` names. The proposed vector family
-includes `vector_map()`, `vector_filter()`, `vector_slice()`, and
-`vector_concat()`. The proposed map family includes `map_transform()`,
-`map_filter()`, and `map_merge()`. These helpers are not implemented yet;
-`count()` is the only executable general collection function in this checkout.
-The executable `foreach` implementation currently works with native vectors
-and maps, preserves single evaluation and keys, and supports `break` and
-`continue`. The proposed object protocol uses `Iterator<K, V>` for both vector
-and map iterators; iterator-object traversal remains unimplemented.
+shape rather than methods or PHP's `array_*` names. The vector family
+[`vector_map()`](thp:std.baseTypes.vector_map),
+[`vector_filter()`](thp:std.baseTypes.vector_filter),
+[`vector_slice()`](thp:std.baseTypes.vector_slice), and
+[`vector_concat()`](thp:std.baseTypes.vector_concat) and the map family
+[`map_transform()`](thp:std.baseTypes.map_transform),
+[`map_filter()`](thp:std.baseTypes.map_filter), and
+[`map_merge()`](thp:std.baseTypes.map_merge) execute in the reference VM.
+`count(string|vector<T>|map<K, V>|Countable): int` reads length without traversal state.
+It is distinct from implemented
+[`iterator_count()`](thp:std.spl.iterator_count), which consumes an explicit
+iterator from its current cursor without rewinding.
+The executable `foreach` implementation works with native vectors and maps and
+with `Traversable<K, V>` objects. It preserves single evaluation and keys and
+supports `break` and `continue`; object traversal dispatches through
+`Iterator<K, V>` or delegated `IteratorAggregate<K, V>` layers.
 
 Native collection storage is intended to let the compiler and VM lower
 construction, indexing, mutation, and iteration directly instead of wrapping

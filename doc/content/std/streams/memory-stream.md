@@ -13,11 +13,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: Opening, reading, writing, flushing, seeking, and closing execute.
 version: "0.1"
 ---
 

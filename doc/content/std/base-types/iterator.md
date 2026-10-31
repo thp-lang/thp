@@ -12,15 +12,19 @@ typeParameters:
     description: The type of each current value.
 interfaces:
   - id: std.baseTypes.Traversable
+    arguments:
+      - K
+      - V
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice: This THP-native contract is proposed and is not yet implemented in this repository.
+availability: implemented
+notice: The interface, method-dispatch contract, and object-based foreach execute.
 version: "0.1"
 ---
 
-`Iterator<K, V>` exposes a cursor over typed keys and values. It
+`Iterator<K, V>` invariantly extends `Traversable<K, V>` and exposes a cursor
+over typed keys and values. `K` has no additional constraint. The interface
 uses the familiar PHP iterator state model with explicit method names and does
 not allocate an entry or option object for each element.
 
@@ -53,16 +57,36 @@ fail when `rewind()` is called after it has advanced; consequently a second
 `foreach` over the same consumed one-shot iterator may fail. An aggregate
 avoids that reuse by returning a fresh iterator for each traversal.
 
+[`Generator<K, V>`](thp:std.spl.Generator) is a one-shot implementation. Its
+first `rewind()` starts the function body; `advance()` resumes it. It adds
+`getReturn()` and `close()` on its concrete type.
+
+For direct iterator traversal, `foreach` calls `rewind()` and then repeats
+`valid() → value() → optional key() → body → advance()`. It calls `key()` only
+for a keyed loop. `continue` still reaches `advance()`; `break`, `return`, and a
+throw do not. Any throwable from the iterator propagates unchanged, after
+required `using` and `finally` cleanup.
+
+Mutation of an iterator object remains visible exactly as its methods expose
+it. This differs from native vectors and maps, whose direct traversal observes
+the COW snapshot captured when the source is evaluated.
+
 ## Collection keys
 
 A vector iterator implements `Iterator<int, T>` and uses zero-based offsets as
 keys. A map iterator implements `Iterator<K, V>` and preserves the map's keys
 and insertion order. There is no separate keyed-iterator interface.
 
+Native [`VectorIterator<T>`](thp:std.spl.VectorIterator) and
+[`MapIterator<K, V>`](thp:std.spl.MapIterator) capture copy-on-write snapshots.
+Typed iterator boundaries create fresh collection cursors; passing an iterator
+object keeps its identity and current position.
+
 ## Example
 
 ```thp
-function printEntries<K, V>(Iterator<K, V> $iterator): void {
+function printEntries(Iterator<int, string> $iterator): void
+{
     $iterator->rewind();
 
     while ($iterator->valid()) {
@@ -71,6 +95,9 @@ function printEntries<K, V>(Iterator<K, V> $iterator): void {
     }
 }
 ```
+
+The example invokes the protocol directly; passing the iterator to `foreach`
+uses the same method order through virtual dispatch.
 
 ## See also
 

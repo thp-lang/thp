@@ -1,0 +1,21 @@
+[package]
+name = "thp-native"
+version.workspace = true
+publish = false
+edition.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+description = "Native extension loading and checked C value handles"
+
+[dependencies]
+blake3.workspace = true
+libloading.workspace = true
+thp-bytecode = { path = "../bytecode" }
+thp-config = { path = "../config" }
+thp-diagnostics = { path = "../diagnostics" }
+thp-hir = { path = "../hir" }
+thp-runtime = { path = "../runtime" }
+thp-syntax = { path = "../syntax" }
+
+[lints]
+workspace = true

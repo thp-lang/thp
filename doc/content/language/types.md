@@ -10,8 +10,9 @@ status: experimental
 availability: partial
 notice: >-
   Scalars, nullable and union types, user classes, native vectors and maps, and
-  arbitrary-byte strings execute. Generic user types and the broader proposed
-  type system remain unimplemented.
+  arbitrary-byte strings execute. Invariant erased generic classes and
+  interfaces execute; generic functions, methods, traits, defaults, variance,
+  and intersection bounds remain proposed.
 ---
 
 THP checks declared types before and during execution. THP replaces PHP's
@@ -21,20 +22,20 @@ using distinct literal syntax.
 
 ## Core types
 
-| Type        | Meaning                                                   |
-| ----------- | --------------------------------------------------------- |
-| `int`       | Signed 64-bit integer.                                    |
-| `float`     | Double-precision floating-point number.                   |
-| `bool`      | `true` or `false`.                                        |
-| `string`    | Arbitrary byte string.                                    |
-| `null`      | The null value.                                           |
-| `object`    | An object value.                                          |
-| `callable`  | A callable value.                                         |
-| `mixed`     | A value whose more precise type is unknown.               |
-| `void`      | A callable that returns no useful value.                  |
-| `never`     | A callable that does not return normally.                 |
-| `vector<T>` | Ordered native collection containing values of type `T`.  |
-| `map<K, V>` | Native collection mapping keys `K` to values of type `V`. |
+| Type                | Meaning                                                          |
+| ------------------- | ---------------------------------------------------------------- |
+| `int`               | Signed 64-bit integer.                                           |
+| `float`             | Double-precision floating-point number.                          |
+| `bool`              | `true` or `false`.                                               |
+| `string`            | Arbitrary byte string.                                           |
+| `null`              | The null value.                                                  |
+| `object`            | An object value.                                                 |
+| `callable<P..., R>` | A callable with fixed parameter types followed by a return type. |
+| `mixed`             | A value whose more precise type is unknown.                      |
+| `void`              | A callable that returns no useful value.                         |
+| `never`             | A callable that does not return normally.                        |
+| `vector<T>`         | Ordered native collection containing values of type `T`.         |
+| `map<K, V>`         | Native collection mapping keys `K` to values of type `V`.        |
 
 ## Collections
 
@@ -67,6 +68,12 @@ A non-empty literal infers its generic types from its entries. An empty literal
 uses its declared or otherwise expected type when its generic arguments cannot
 be inferred.
 
+Collection callbacks supply expected element types for empty literals:
+`vector_map([], fn(int $value): string => "x")` yields `vector<string>`.
+`vector_slice([], 0)` needs an expected `vector<T>` result type, while
+`vector_concat([], $known)` can infer from `$known`. The map family follows the
+same rule using its callback's value and key parameter types or its other map.
+
 Keyed entries are not valid inside `[]`, and unkeyed entries are not valid
 inside `{}`. Both collection types use bracket access, variable-rooted element
 assignment, and direct `foreach` traversal. A vector index must be an integer;
@@ -74,11 +81,17 @@ a map key must be compatible with `K`. Their generic arguments let THP reject
 incorrect indices, keys, and values.
 
 Map traversal follows insertion order. Keyed `foreach` binds the map's `K` and
-`V` directly; vector traversal binds an `int` offset and `T` value. Iterator
-objects are not yet accepted by the executable `foreach` implementation.
-The proposed object protocol represents both shapes as `Iterator<K, V>`;
-vector iterators use `int` for `K`, while map iterators preserve their declared
-key type.
+`V` directly; vector traversal binds an `int` offset and `T` value. Executable
+object traversal accepts `Traversable<K, V>` and binds its invariant `K` and
+`V`. Iterator implementations use `int` keys for vector shapes and preserve
+the declared key type for map shapes.
+
+At a typed assignment, property, argument, or return boundary requiring a
+compatible `Iterator<K, V>` or `Traversable<K, V>`, a vector or map creates a
+fresh rewindable iterator over its copy-on-write snapshot. Nullable targets
+and unions with one compatible iterator branch work the same way. An existing
+iterator keeps its identity and position. Raw collections have no cursor
+methods, and direct collection `foreach` keeps its native traversal.
 
 Vectors and maps are native values rather than ordinary class instances. This
 allows the compiler and VM to lower common collection operations directly
@@ -97,8 +110,11 @@ function findName(map<int, string> $names, int $id): ?string {
 }
 ```
 
-Classes, interfaces, and enumerations define user types. Their advanced generic
-and runtime behavior is still evolving.
+Classes and interfaces may declare invariant type parameters with optional
+nominal `extends` bounds. A reference to a generic declaration supplies its
+exact arity, while `new` may infer class arguments from supplied constructor
+arguments. Generic arguments are retained for static checking and module and
+bytecode validation, but are erased from runtime objects.
 
 ## Type conversion
 
@@ -123,6 +139,38 @@ APIs that interpret a string as UTF-8 validate it explicitly. Invalid UTF-8
 raises `ValueError` unless the API documents a replacement policy. This keeps
 binary data lossless while making text assumptions visible at the operation
 that needs them.
+
+## Runtime type guards
+
+These reserved functions accept `mixed`, return `bool`, and narrow a local used
+directly in a positive `if` or `elseif` condition:
+
+| Guard                                                | Accepted runtime values             | Positive-branch type         |
+| ---------------------------------------------------- | ----------------------------------- | ---------------------------- |
+| [`is_string($value)`](thp:std.baseTypes.is_string)   | Any byte string                     | `string`                     |
+| [`is_int($value)`](thp:std.baseTypes.is_int)         | Integer                             | `int`                        |
+| [`is_float($value)`](thp:std.baseTypes.is_float)     | Floating-point number               | `float`                      |
+| [`is_null($value)`](thp:std.baseTypes.is_null)       | Null                                | `null`                       |
+| [`is_numeric($value)`](thp:std.baseTypes.is_numeric) | Integer, float, or numeric string   | `int` \| `float` \| `string` |
+| [`is_vector($value)`](thp:std.baseTypes.is_vector)   | Any vector                          | `vector<mixed>`              |
+| [`is_map($value)`](thp:std.baseTypes.is_map)         | Any map                             | `map<mixed, mixed>`          |
+| `$value instanceof Foo`                              | A `Foo` instance or nominal subtype | `Foo`                        |
+
+Narrowing intersects the guard type with the local's current type and ends with
+the guarded branch. Assigning the local invalidates that refinement for later
+statements, including after a nested conditional that may perform the
+assignment. Narrowing does not apply through negation, boolean composition,
+loops, early exits, or branch joins. `instanceof` narrows only to non-generic
+classes and interfaces because runtime objects erase generic arguments.
+
+A numeric string follows the documented
+[PHP numeric-string grammar](https://www.php.net/manual/en/language.types.numeric-strings.php):
+optional ASCII whitespace, an optional sign, decimal digits with an optional
+decimal point, and an optional decimal exponent with at least one exponent
+digit. At least one decimal digit is required overall.
+Hexadecimal and binary prefixes, underscores, `INF`, `NAN`, non-ASCII bytes,
+and trailing non-whitespace text are rejected. `is_numeric` never converts the
+string; after narrowing it remains a `string` member of the union.
 
 ## See also
 

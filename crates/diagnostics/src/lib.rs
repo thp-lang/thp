@@ -27,7 +27,7 @@ impl SourceMap {
             u32::try_from(self.sources.len())
                 .expect("a compilation is limited to u32::MAX sources"),
         );
-        self.sources.push(source);
+        self.sources.push(source.with_source_id(id));
         id
     }
 
@@ -48,6 +48,7 @@ impl SourceMap {
 pub struct Span {
     pub start: u32,
     pub end: u32,
+    pub source: Option<SourceId>,
 }
 
 impl Span {
@@ -61,11 +62,23 @@ impl Span {
         Self {
             start: u32::try_from(start).expect("THP source files are limited to 4 GiB"),
             end: u32::try_from(end).expect("THP source files are limited to 4 GiB"),
+            source: None,
+        }
+    }
+
+    pub fn in_source(source: SourceId, start: usize, end: usize) -> Self {
+        Self {
+            source: Some(source),
+            ..Self::new(start, end)
         }
     }
 
     pub fn empty(offset: usize) -> Self {
         Self::new(offset, offset)
+    }
+
+    pub fn empty_in(source: SourceId, offset: usize) -> Self {
+        Self::in_source(source, offset, offset)
     }
 
     pub fn range(self) -> Range<usize> {
@@ -74,9 +87,14 @@ impl Span {
 
     #[must_use]
     pub fn join(self, other: Self) -> Self {
+        debug_assert!(
+            self.source.is_none() || other.source.is_none() || self.source == other.source,
+            "cannot join spans from different sources"
+        );
         Self {
             start: self.start.min(other.start),
             end: self.end.max(other.end),
+            source: self.source.or(other.source),
         }
     }
 }
@@ -87,6 +105,7 @@ pub struct SourceFile {
     path: Arc<PathBuf>,
     text: Arc<str>,
     line_starts: Arc<[u32]>,
+    source_id: Option<SourceId>,
 }
 
 impl SourceFile {
@@ -109,7 +128,28 @@ impl SourceFile {
             path: Arc::new(path.into()),
             text,
             line_starts: line_starts.into(),
+            source_id: None,
         }
+    }
+
+    fn with_source_id(mut self, source_id: SourceId) -> Self {
+        self.source_id = Some(source_id);
+        self
+    }
+
+    pub fn source_id(&self) -> Option<SourceId> {
+        self.source_id
+    }
+
+    pub fn span(&self, start: usize, end: usize) -> Span {
+        self.source_id.map_or_else(
+            || Span::new(start, end),
+            |source| Span::in_source(source, start, end),
+        )
+    }
+
+    pub fn empty_span(&self, offset: usize) -> Span {
+        self.span(offset, offset)
     }
 
     pub fn path(&self) -> &Path {
@@ -130,7 +170,10 @@ impl SourceFile {
 
     /// Returns a one-based line and Unicode-scalar column.
     pub fn line_column(&self, offset: usize) -> (usize, usize) {
-        let offset = offset.min(self.text.len());
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
         let line_index = self
             .line_starts
             .partition_point(|start| *start as usize <= offset)
@@ -197,7 +240,7 @@ impl Diagnostic {
             severity: Severity::Error,
             message: message.into(),
             labels: vec![Label {
-                source: None,
+                source: span.source,
                 span,
                 message: None,
             }],
@@ -208,7 +251,7 @@ impl Diagnostic {
     #[must_use]
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.labels.push(Label {
-            source: None,
+            source: span.source,
             span,
             message: Some(message.into()),
         });
@@ -272,9 +315,7 @@ impl Diagnostic {
         );
         if let Some(text) = source.line_text(line) {
             let _ = writeln!(rendered, " {line:>4} | {text}");
-            let width = primary.map_or(1, |span| {
-                usize::max(1, (span.end.saturating_sub(span.start)) as usize)
-            });
+            let width = primary.map_or(1, |span| underline_width(source, span, line, column, text));
             let message = self
                 .labels
                 .first()
@@ -284,7 +325,7 @@ impl Diagnostic {
                 rendered,
                 "      | {}{}{}",
                 " ".repeat(column.saturating_sub(1)),
-                "^".repeat(width.min(text.len().saturating_sub(column - 1).max(1))),
+                "^".repeat(width.min(text.chars().count().saturating_sub(column - 1).max(1)),),
                 message,
             );
         }
@@ -299,7 +340,8 @@ impl Diagnostic {
                 label_column
             );
             if let Some(text) = label_source.line_text(label_line) {
-                let width = usize::max(1, label.span.end.saturating_sub(label.span.start) as usize);
+                let width =
+                    underline_width(label_source, label.span, label_line, label_column, text);
                 let message = label
                     .message
                     .as_deref()
@@ -309,7 +351,9 @@ impl Diagnostic {
                     rendered,
                     "      | {}{}{}",
                     " ".repeat(label_column.saturating_sub(1)),
-                    "^".repeat(width.min(text.len().saturating_sub(label_column - 1).max(1))),
+                    "^".repeat(
+                        width.min(text.chars().count().saturating_sub(label_column - 1).max(1),),
+                    ),
                     message,
                 );
             }
@@ -318,6 +362,21 @@ impl Diagnostic {
             let _ = writeln!(rendered, " note: {note}");
         }
         rendered
+    }
+}
+
+fn underline_width(
+    source: &SourceFile,
+    span: Span,
+    line: usize,
+    column: usize,
+    text: &str,
+) -> usize {
+    let (end_line, end_column) = source.line_column(span.end as usize);
+    if end_line == line {
+        end_column.saturating_sub(column).max(1)
+    } else {
+        text.chars().count().saturating_sub(column - 1).max(1)
     }
 }
 
@@ -332,12 +391,26 @@ mod tests {
     }
 
     #[test]
+    fn locations_tolerate_offsets_inside_unicode_scalars() {
+        let source = SourceFile::new("test.thp", "éx");
+        assert_eq!(source.line_column(1), (1, 1));
+    }
+
+    #[test]
     fn renders_source_location_and_code() {
         let source = SourceFile::new("test.thp", "<?thp\n$x = nope;\n");
         let diagnostic = Diagnostic::error("typing", "T1001", Span::new(11, 15), "unknown name");
         let rendered = diagnostic.render(&source);
         assert!(rendered.contains("test.thp:2:6: error[T1001]"));
         assert!(rendered.contains("^^^^"));
+    }
+
+    #[test]
+    fn renders_unicode_spans_in_scalar_columns() {
+        let source = SourceFile::new("test.thp", "<?thp\nπ;\n");
+        let diagnostic = Diagnostic::error("typing", "T1001", Span::new(6, 8), "unknown name");
+        let rendered = diagnostic.render(&source);
+        assert!(rendered.contains("      | ^\n"), "{rendered}");
     }
 
     #[test]

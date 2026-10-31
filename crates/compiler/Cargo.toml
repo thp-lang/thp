@@ -15,6 +15,7 @@ thp-hir = { path = "../hir" }
 thp-metrics = { path = "../metrics" }
 thp-mir = { path = "../mir" }
 thp-modules = { path = "../modules" }
+thp-native = { path = "../native" }
 thp-opcache = { path = "../opcache" }
 thp-syntax = { path = "../syntax" }
 thp-config = { path = "../config" }

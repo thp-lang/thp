@@ -14,10 +14,9 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+availability: partial
+notice: Construction, keyed iteration, and option inspection execute. Recursive
+  traversal and glob expansion remain proposed.
 version: "0.1"
 ---
 

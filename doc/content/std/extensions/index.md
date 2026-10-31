@@ -2,18 +2,23 @@
 kind: module
 id: std.extensions
 title: Bundled extensions
-summary: Design placeholders for optional extensions shipped with PHP.
+summary: Bundled PCRE2 regex functions and proposed optional extensions.
 module: extensions
 order: 80
 status: experimental
-availability: proposed
-notice:
-  Bundled-extension support is not defined. These entries reserve documentation
-  space and do not promise implementation or compatibility.
+availability: partial
+notice: The PCRE2 regex functions are implemented. The other optional extension
+  entries below remain design placeholders.
 ---
 
-These routes catalog optional extensions distributed with PHP's source tree.
-They are design placeholders, not compatibility promises or implemented THP APIs.
+The bundled PCRE2 regex extension is always available without configuration:
+[`preg_match()`](thp:std.extensions.preg_match),
+[`preg_replace()`](thp:std.extensions.preg_replace), and
+[`preg_split()`](thp:std.extensions.preg_split). Offset results use
+[`RegexCapture`](thp:std.extensions.RegexCapture).
+
+The remaining entries catalog proposed optional extensions. They are design
+placeholders and do not promise PHP compatibility.
 
 | Extension               | Dependency model        | Status             |
 | ----------------------- | ----------------------- | ------------------ |

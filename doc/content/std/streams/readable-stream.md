@@ -11,11 +11,8 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: Reading executes on memory, temporary, readable-file, read-write-file, and request-input streams.
 version: "0.1"
 ---
 

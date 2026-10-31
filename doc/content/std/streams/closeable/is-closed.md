@@ -14,11 +14,8 @@ errors: []
 related:
   - std.streams.Closeable
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: The compiler and VM implement shared close-state inspection.
 version: "0.1"
 owner: std.streams.Closeable
 visibility: public

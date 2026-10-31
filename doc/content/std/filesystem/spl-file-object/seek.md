@@ -19,10 +19,8 @@ errors:
       underlying source cannot seek.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: partial
+notice: Seeks to a zero-based line number; the executable parameter name is offset.
 version: "0.1"
 owner: std.spl.SplFileObject
 visibility: public

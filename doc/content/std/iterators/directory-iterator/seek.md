@@ -19,10 +19,8 @@ errors:
       underlying source cannot seek.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: Moves to a zero-based entry position or throws OutOfBoundsException.
 version: "0.1"
 owner: std.spl.DirectoryIterator
 visibility: public

@@ -40,7 +40,7 @@ modifiers: []
 ## Behavior
 
 Copies the supplied map or public object properties. The iterator exposes keys
-through `key()` and values through `RecursiveEntry<V>` objects.
+through `key()` and values through `RecursiveEntry<K, V>` objects.
 
 This operation does not change receiver state unless the description explicitly states otherwise.
 

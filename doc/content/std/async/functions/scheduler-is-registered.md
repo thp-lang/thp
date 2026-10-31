@@ -16,20 +16,19 @@ errors:
   - description: This function does not throw for an unregistered scheduler. It returns false.
 related: []
 status: experimental
-availability: proposed
-notice: This function is proposed and is not implemented in this repository. The
-  scheduler lifecycle may change.
+availability: implemented
 version: "0.1"
 module: async
 ---
 
-`scheduler_is_registered()` reports whether the process has an active scheduler
+`scheduler_is_registered()` reports whether the request has an active scheduler
 registration.
 
 ## Behavior
 
-The function only inspects registration state. It does not create a scheduler,
-start the scheduler, enqueue work, or suspend the current execution context.
+It starts false in every request. The function only inspects registration
+state. It does not create a scheduler, enqueue work, or suspend the current
+execution context.
 
 A `true` result means a scheduler is available to [`async()`](thp:std.async.async) and
 [`await()`](thp:std.async.await). It does not indicate whether the scheduler currently has
@@ -46,9 +45,7 @@ if (!scheduler_is_registered()) {
 }
 ```
 
-The check and registration are separate operations. Perform this pattern during
-single-threaded application startup; it is not an atomic guard for competing
-registration attempts.
+The check and registration are separate operations in the same request.
 
 ## See also
 

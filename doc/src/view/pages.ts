@@ -72,30 +72,22 @@ function articleBody(model: SiteModel, page: ResolvedPage): TrustedHtml {
 
 export function renderHome(model: SiteModel, page: ResolvedPage): string {
   const body =
-    trusted(`<div class="announcement"><span class="status-dot"></span> THP is experimental. These docs describe a language in active design. ${availabilityBadge(page.source.data.availability)}</div>
+    trusted(`<div class="announcement"><span class="status-dot"></span> THP 0.9 is an experimental CLI release. <a href="${withBase(model.basePath, "/learn/implementation-status/")}">See what is implemented.</a></div>
   <section class="hero">
-    <div class="hero-grid"><div class="hero-copy"><p class="eyebrow">Static types · Familiar syntax · Standalone runtime</p><h1>Build typed programs with <span>familiar syntax.</span></h1><p class="hero-lead">${escapeHtml(page.source.data.summary)}</p>
-      <div class="hero-actions"><a class="button button-primary" href="${withBase(model.basePath, "/learn/getting-started/")}">Start with THP →</a><a class="button" href="${withBase(model.basePath, "/std/")}">Browse API reference</a></div>
-    </div><div class="code-window" data-code-tabs><div class="code-window-bar"><span>hello.thp</span><div role="tablist"><button role="tab" aria-selected="true" aria-controls="home-thp">THP</button><button role="tab" aria-selected="false" aria-controls="home-php">PHP</button></div></div>
-      <pre id="home-thp" role="tabpanel"><code><span class="comment">&lt;?thp</span>
-<span class="kw">final class</span> <span class="type">User</span> {
-  <span class="kw">private</span> <span class="type">string</span> <span class="var">$name</span>;
+    <div class="hero-grid"><div class="hero-copy"><p class="eyebrow">Generic collections · Static checks · Standalone runtime</p><h1>Familiar syntax. <span>Precise types.</span></h1><p class="hero-lead">${escapeHtml(page.source.data.summary)}</p>
+      <div class="hero-actions"><a class="button button-primary" href="${withBase(model.basePath, "/learn/getting-started/")}">Start with THP →</a><a class="button" href="${withBase(model.basePath, "/learn/implementation-status/")}">See what works today</a></div>
+    </div><div class="code-window"><div class="code-window-bar"><span>collections.thp</span><span>THP</span></div>
+      <pre><code><span class="comment">&lt;?thp</span>
 
-  <span class="kw">public function</span> __construct(<span class="type">string</span> <span class="var">$name</span>) {
-    <span class="var">$this</span>-&gt;name = <span class="var">$name</span>;
-  }
+<span class="var">$names</span>: <span class="type">vector&lt;string&gt;</span> = [<span class="string">"Ada"</span>, <span class="string">"Grace"</span>];
+<span class="var">$scores</span>: <span class="type">map&lt;string, int&gt;</span> = {
+  <span class="string">"Ada"</span> =&gt; 10,
+  <span class="string">"Grace"</span> =&gt; 9
+};
 
-  <span class="kw">public function</span> name(): <span class="type">string</span> {
-    <span class="kw">return</span> <span class="var">$this</span>-&gt;name;
-  }
-}
-
-<span class="kw">function</span> greet(<span class="type">User</span> <span class="var">$user</span>): <span class="type">string</span> {
-  <span class="kw">return</span> <span class="string">"Hello, "</span> . <span class="var">$user</span>-&gt;name() . <span class="string">"!"</span>;
-}</code></pre><pre id="home-php" role="tabpanel" hidden><code><span class="comment">&lt;?php</span>
-<span class="kw">final readonly class</span> <span class="type">User</span> {
-  <span class="kw">public function</span> __construct(<span class="kw">public</span> <span class="type">string</span> <span class="var">$name</span>) {}
-}</code></pre>
+<span class="kw">echo</span> <span class="var">$names</span>[0] . <span class="string">": "</span>;
+<span class="kw">echo</span> <span class="var">$scores</span>[<span class="var">$names</span>[0]] . <span class="string">"\\n"</span>;</code></pre>
+      <div class="code-window-command"><code><span>$ thp run collections.thp</span><strong>Ada: 10</strong></code></div>
     </div></div>
   </section>
   <section class="section prose home-prose" data-pagefind-body>${articleBody(model, page)}</section>`);

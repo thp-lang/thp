@@ -2,14 +2,14 @@
 kind: guide
 id: guide.projectConfiguration
 title: Project configuration
-summary: Define runtime limits, target overrides, and extension settings in project TOML.
+summary: Define package discovery, runtime limits, native libraries, and extension settings in project TOML.
 nav:
   section: learn
-  order: 20
+  order: 40
 status: experimental
 availability: implemented
 notice: >-
-  The configuration loader and lock format are implemented, but THP does not yet enforce these limits at runtime or validate extension-owned settings.
+  Project library loading and the lock format are implemented. Extension-owned settings remain opaque until an extension decodes them.
 ---
 
 THP project settings live beside the project source. The project root must
@@ -19,6 +19,85 @@ belong only to one checkout.
 The loader does not search for global or user configuration and does not read
 configuration overrides from the environment. The caller chooses the project
 root explicitly.
+
+If you are creating your first multi-file application, begin with
+[Start a project](thp:guide.startProject). Most projects initially need only an
+autoload mapping:
+
+```toml
+[autoload]
+"App\\" = "src/"
+```
+
+All runtime-limit tables are optional. An empty `thp.toml` is valid for a
+project that uses only its entry file, although a single-file command needs no
+project file at all.
+
+## Autoload mappings
+
+The `[autoload]` table maps a case-sensitive namespace prefix to one directory
+or an ordered list of directories:
+
+```toml
+[autoload]
+packages = "vendor/"
+"App\\" = "src/"
+```
+
+A non-empty prefix ends in `\` and contains valid THP name segments. The
+backslash is escaped inside a TOML basic string. Relative directories resolve
+from the selected project root.
+
+For a mapping from `App\` to `src/`, the path
+`src/Service/Client.thp` has module ID `App\Service\Client` and declares
+`namespace App\Service;`. The compiler discovers `.thp` files in mapped
+directories before type checking. This is not runtime autoloading: the
+mappings name source roots but do not invoke user callbacks.
+
+`thp.local.toml` may add mappings or replace a project mapping with the same
+prefix for that checkout. Discovery rejects ambiguous logical or physical
+module mappings.
+
+### Installed packages
+
+The reserved `packages` key accepts one project-relative directory or an
+ordered list:
+
+```toml
+[autoload]
+packages = ["vendor/", "generated-vendor/"]
+"App\\" = "src/"
+```
+
+THP scans exactly `<package-root>/<vendor>/<package>/thp.toml`, with packages
+ordered by `vendor/package` inside each configured root. Files at the vendor
+and package-name levels are ignored. Every package directory must contain a
+valid `thp.toml`.
+
+Package roots from `thp.local.toml` are appended to those from `thp.toml`.
+Exact duplicate paths keep their first position.
+
+A package contributes only its explicit namespace mappings. Their directories
+resolve relative to that package, so this package manifest:
+
+```toml
+[autoload]
+"Acme\\Clock\\" = ["src/", "generated/"]
+```
+
+installed at `vendor/acme/clock` contributes
+`vendor/acme/clock/src/` and `vendor/acme/clock/generated/`. THP does not read
+the package's `thp.local.toml` or follow its `autoload.packages` setting.
+Nested package trees therefore are not discovered.
+
+An exact namespace-prefix collision between the project and a package, or
+between two packages, is an error reported at the later package manifest's
+mapping. One manifest may still map its prefix to multiple ordered
+directories. Package roots cannot be absolute or escape the project through
+`..`; symlinked package directories remain usable.
+
+THP discovers already-installed source only. It does not download packages,
+select versions, access a registry, or replace a package manager.
 
 ## Project schema
 
@@ -40,11 +119,17 @@ max_execution = "30s"
 [extensions.example]
 custom_key = "value"
 
+[extension_libraries]
+example = "extensions/example.so"
+
 [targets.cli.memory]
 limit = "400M"
 
 [targets.cli.extensions.example]
 custom_key = "cli-value"
+
+[targets.cli.extension_libraries]
+example = "extensions/example-debug.so"
 ```
 
 All core tables and fields are optional, but `thp.toml` itself is required.
@@ -144,26 +229,63 @@ values. The core loader preserves and merges this data but does not apply an
 extension-owned schema. An extension can decode and validate its table only
 when it requests the configuration.
 
+## Native extension libraries
+
+`[extension_libraries]` maps validated extension names to paths for ABI-v1
+native libraries. Relative paths resolve from the project root. A target can
+replace a library path in `[targets.NAME.extension_libraries]`; local project
+configuration can replace the same name. Library paths are separate from
+opaque `[extensions.NAME]` settings. The bundled PCRE2 regex extension needs
+no entry.
+
+THP reads and loads selected libraries before compiling project source. Each
+library exports `thp_extension_entry`, declares the configured name, and
+registers fixed typed functions through the size-versioned host table in
+`crates/abi/include/thp.h`. A missing library, ABI mismatch, invalid signature,
+duplicate function, or failed initializer stops project preparation. Native
+functions participate in static calls and bytecode verification. Values cross
+the C boundary through checked opaque handles valid only during one callback;
+the callback returns a live handle, and THP checks its declared return type.
+Prepared projects retain their loaded libraries until released.
+
+Native calls run in the VM. An explicit JIT run rejects a project with native
+functions; automatic selection uses the VM. The library's file bytes and
+registered signatures contribute to cache and frozen-project identity, so
+rebuild frozen artifacts after replacing a library.
+The host table lends that library's canonical `[extensions.NAME]` TOML bytes
+during initialization. A library can parse its own schema without the lock
+reader parsing other extensions' settings.
+
 ## Generated lock file
 
-Configuration tooling generates `thp.lock` from the required project file and
-the exact presence and contents of the optional local file. The versioned text
-lock stores fully resolved common and target profiles. Core sizes are
-canonical byte counts, core durations are canonical seconds, and targets and
-extensions have deterministic lexical ordering.
+During deployment preparation, run `thp lock [--project=DIR]` to generate
+`thp.lock`. The fingerprint covers the required project file, the exact
+presence and contents of the optional local file, discovered package
+membership, and every package `thp.toml`. The versioned text lock stores
+configured package roots, every resolved namespace mapping, and fully resolved
+common and target profiles. Core sizes are canonical byte counts, core
+durations are canonical seconds, and mappings, targets, and extensions have
+deterministic lexical ordering.
+
+Lock format version 2 records native library names and paths separately from
+length-delimited extension settings. Version-1 lock files must be regenerated.
 
 Extension data is stored as length-delimited canonical TOML. Startup code can
 load core records and skip or retain these payloads without parsing them.
 
 Lock generation uses atomic replacement and does not rewrite identical output.
-On Unix, a generated lock is readable and writable only by its owner. This is
-important because merged local extension settings can contain credentials or
-other secrets.
+On Unix, a generated lock is readable and writable only by its owner.
 
-Loading a lock checks its source fingerprint. A missing, stale, corrupt, or
-unsupported lock is an error; the loader does not regenerate it automatically.
-Regenerate the lock explicitly after `thp.toml` changes, or after
-`thp.local.toml` appears, disappears, or changes.
+Without `thp.lock`, development commands scan installed manifests and keep the
+resolved mappings in memory. When the file exists, commands that compile or
+load a project require it to be valid and fresh, then use its mappings without
+parsing package manifests. A stale, corrupt, or unsupported lock is an error;
+these commands do not regenerate it automatically. `thp lock` itself always
+reads the live configuration and package manifests to create or replace the
+lock. Regenerate after either root configuration file changes or after a
+package is added, removed, or changes its manifest. Older locks using the
+previous version-1 layout must also be regenerated; the lock version remains 1
+while this format is experimental.
 
 Add both generated and checkout-local files to the project root `.gitignore`:
 

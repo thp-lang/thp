@@ -77,13 +77,22 @@ type SidebarSymbolKind =
   "class" | "interface" | "trait" | "enum" | "exception" | "function";
 
 function sidebarTypeKind(item: ResolvedType): SidebarSymbolKind {
-  if (
-    item.source.data.kind === "class" &&
-    (item.source.data.id === "std.baseTypes.Exception" ||
-      (item.parent && sidebarTypeKind(item.parent) === "exception"))
-  )
+  if (item.source.data.kind === "class" && isThrowableType(item))
     return "exception";
   return item.source.data.kind;
+}
+
+function isThrowableType(
+  item: ResolvedType,
+  visited = new Set<string>(),
+): boolean {
+  if (item.source.data.id === "std.baseTypes.Throwable") return true;
+  if (visited.has(item.source.data.id)) return false;
+  visited.add(item.source.data.id);
+  return (
+    (item.parent !== undefined && isThrowableType(item.parent, visited)) ||
+    item.interfaces.some((type) => isThrowableType(type, visited))
+  );
 }
 
 function symbolKindIcon(kind: SidebarSymbolKind): string {

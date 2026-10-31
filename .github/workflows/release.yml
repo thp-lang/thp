@@ -42,7 +42,13 @@ jobs:
         with:
           toolchain: 1.88.0
           targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@cargo-about
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.8.4
+          fallback: none
+      - name: Verify release tooling
+        run: cargo about --version
       - name: Build native CLI
         run: cargo build --locked --release --target ${{ matrix.target }} -p thp-cli
       - name: Exercise native public interface
@@ -124,10 +130,10 @@ jobs:
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
           SHA256SUMS
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          prerelease: true
-          generate_release_notes: true
+          prerelease: false
+          generate_release_notes: false
           files: |
             dist/thp-*
             dist/SHA256SUMS

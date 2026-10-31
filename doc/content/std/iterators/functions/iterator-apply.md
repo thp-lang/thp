@@ -9,30 +9,24 @@ typeParameters:
   - name: K
     description: The iterator key type.
   - name: T
-    description: The T type parameter.
+    description: The iterator value type.
 parameters:
   - name: iterator
     type: Iterator<K, T>
     description: Cursor iterator to advance through its remaining values.
   - name: callback
-    type: callable
-    description: Callable receiving the value, then $args.
-  - name: args
-    type: vector<mixed>
-    description: Additional arguments forwarded each time.
-    default: "[]"
+    type: callable<T, K, bool>
+    description: Receives the current value then key and decides whether to continue.
 returns:
   type: int
   description: The number of callback invocations.
 errors:
-  - description: Failures from cursor operations or $callback propagate and stop traversal.
+  - description: Cursor, callback, and allocation failures propagate and stop traversal.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This PHP-inspired function contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
-version: "0.1"
+availability: implemented
+notice: This experimental contract executes in the standalone compiler and reference VM.
+version: "0.6"
 module: iterators
 ---
 
@@ -40,15 +34,23 @@ module: iterators
 
 ## Behavior
 
-The function passes the current value followed by `$args` to the callback,
-advances the cursor, and stops when the callback returns `false` or `valid()`
-returns `false`. It never rewinds the iterator.
+The callback receives the current `T` value followed by its `K` key. The
+function counts the call, advances the cursor, then stops if the callback
+returned `false`; otherwise it continues while `valid()` is true. It never
+rewinds. An empty iterator returns zero without calling the callback. The
+iterator's declared `K` and `T` determine callback types; an untyped empty
+collection literal cannot establish an iterator shape without an expected type.
+No result keys are produced, and the underlying cursor keeps its own keys.
+
+A callback exception or cursor failure propagates without another advance of
+the failing entry. Allocation failure in the callback or cursor also
+propagates. The count is not returned after a failure.
 
 ## Example
 
 ```thp
-$calls = iterator_apply($iterator, function (string $value): bool {
-    print($value);
+$calls = iterator_apply($iterator, function (string $value, int $key): bool {
+    echo $value;
     return true;
 });
 ```

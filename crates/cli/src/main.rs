@@ -10,6 +10,7 @@ use thp_compiler::{
     Compilation, ProjectCompilation, ProjectRequest, cache_warm_project, compile_path,
     compile_path_cached, compile_project, load_frozen_project,
 };
+use thp_config::build_lock;
 use thp_metrics::{Metrics, Stage, TrackingAllocator};
 use thp_opcache::Store;
 use thp_vm::{ExecutionContext, Limits};
@@ -38,6 +39,23 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                 .map_err(|_| "arguments must be valid UTF-8".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Some(argument) = arguments.iter().find(|argument| {
+        !matches!(argument.as_str(), "--help" | "--version" | "--frozen")
+            && ![
+                "--metrics=",
+                "--project=",
+                "--emit=",
+                "--engine=",
+                "--opcache=",
+                "--max-instructions=",
+                "--max-bytes=",
+            ]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix))
+            && argument.starts_with("--")
+    }) {
+        return Err(format!("unknown option `{argument}`"));
+    }
     if arguments.is_empty() || arguments.iter().any(|argument| argument == "--help") {
         print_help();
         return Ok(());
@@ -58,12 +76,55 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
     let Some(command) = positional.first().copied() else {
         return Err("missing command; use `thp --help`".to_owned());
     };
+    let allowed_options: Option<&[&str]> = match command.as_str() {
+        "lock" => Some(&["--project"]),
+        "check" => Some(&["--project", "--metrics"]),
+        "inspect" => Some(&["--project", "--emit", "--metrics"]),
+        "run" => Some(&[
+            "--project",
+            "--engine",
+            "--opcache",
+            "--max-instructions",
+            "--metrics",
+            "--frozen",
+        ]),
+        "cache-warm" => Some(&["--project", "--opcache", "--metrics"]),
+        "cache-prune" => Some(&["--opcache", "--max-bytes", "--metrics"]),
+        _ => None,
+    };
+    if let Some(allowed_options) = allowed_options
+        && let Some(argument) = arguments.iter().find(|argument| {
+            argument.starts_with("--")
+                && !allowed_options.contains(
+                    &argument
+                        .split_once('=')
+                        .map_or(argument.as_str(), |(name, _)| name),
+                )
+        })
+    {
+        return Err(format!("option `{argument}` is not valid for `{command}`"));
+    }
     let path = positional.get(1).map(|value| PathBuf::from(*value));
+    if let Some(argument) = positional.get(2) {
+        return Err(format!("unexpected argument `{argument}`"));
+    }
     let project_root = option_value(&arguments, "--project")
         .map(PathBuf::from)
         .map_or_else(env::current_dir, Ok)
         .map_err(|error| format!("cannot determine project root: {error}"))?;
     match command.as_str() {
+        "lock" => {
+            if path.is_some() {
+                return Err("`thp lock` does not accept a source file".to_owned());
+            }
+            let result = build_lock(&project_root).map_err(|error| error.to_string())?;
+            println!(
+                "{} {}",
+                if result.changed { "wrote" } else { "unchanged" },
+                result.path.display()
+            );
+            Ok(())
+        }
         "check" => {
             let path = path.ok_or_else(|| "`thp check` requires a source file".to_owned())?;
             let compilation = load_selected_compilation(path, &project_root)?;
@@ -96,7 +157,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
             let opcache = option_value(&arguments, "--opcache").unwrap_or("off");
             let frozen = arguments.iter().any(|argument| argument == "--frozen");
             let project_mode = project_root.join("thp.toml").is_file();
-            let (source, bytecode, mut metrics) = if frozen {
+            let (source, bytecode, mut metrics, native_registry) = if frozen {
                 if !project_mode {
                     return Err("`run --frozen` requires a project `thp.toml`".to_owned());
                 }
@@ -113,7 +174,12 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                     .get(prepared.entry_source)
                     .expect("prepared entry source exists")
                     .clone();
-                (source, prepared.bytecode, Metrics::default())
+                (
+                    source,
+                    prepared.bytecode,
+                    Metrics::default(),
+                    Some(prepared.native_registry),
+                )
             } else if project_mode {
                 let request = ProjectRequest::new(&project_root, &path);
                 let compilation = if opcache == "off" {
@@ -137,6 +203,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                         .bytecode
                         .expect("successful compilation has bytecode"),
                     compilation.metrics,
+                    Some(compilation.native_registry),
                 )
             } else if opcache == "off" {
                 let compilation = load_compilation(path)?;
@@ -147,6 +214,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                         .bytecode
                         .expect("successful compilation has bytecode"),
                     compilation.metrics,
+                    None,
                 )
             } else {
                 let cached = compile_path_cached(path, &Store::new(opcache), b"")
@@ -160,10 +228,18 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
                         .bytecode
                         .expect("successful cached compilation has bytecode"),
                     cached.metrics,
+                    None,
                 )
             };
+            if engine == "jit" && !bytecode.native_functions.is_empty() {
+                return Err("native extension calls require the VM engine".to_owned());
+            }
+            let _native_scope = native_registry.as_ref().map(thp_native::Registry::activate);
             let use_jit = engine == "jit"
-                || (engine == "auto" && max_instructions.is_none() && thp_jit::supports(&bytecode));
+                || (engine == "auto"
+                    && max_instructions.is_none()
+                    && bytecode.native_functions.is_empty()
+                    && thp_jit::supports(&bytecode));
             let stdout = io::stdout();
             let mut output = stdout.lock();
             if use_jit {
@@ -245,6 +321,9 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), String> {
             print_metrics(&compilation.metrics, metrics_format)
         }
         "cache-prune" => {
+            if path.is_some() {
+                return Err("`thp cache-prune` does not accept a source file".to_owned());
+            }
             let cache = option_value(&arguments, "--opcache")
                 .ok_or_else(|| "`thp cache-prune` requires `--opcache=PATH`".to_owned())?;
             if cache == "off" {
@@ -455,6 +534,7 @@ fn print_help() {
 THP standalone compiler and interpreter
 
 Usage:
+  thp lock [--project=DIR]
   thp check [--project=DIR] [--metrics=off|human|json] FILE
   thp inspect [--project=DIR] [--emit=tokens|ast|interfaces|module-graph|hir|mir|bytecode] [--metrics=...] FILE
   thp run [--project=DIR] [--engine=auto|vm|jit] [--opcache=off|PATH] [--max-instructions=N] [--metrics=...] FILE

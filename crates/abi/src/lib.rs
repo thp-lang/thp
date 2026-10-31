@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::{c_char, c_void};
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -794,30 +794,10 @@ pub unsafe extern "C" fn thp_buffer_free(buffer: ThpBuffer) {
     }
 }
 
-pub type ThpLogFn =
-    unsafe extern "C" fn(level: u32, message: *const u8, length: usize, user_data: *mut c_void);
-
-#[repr(C)]
-pub struct ThpHost {
-    pub abi_version: u32,
-    pub struct_size: usize,
-    pub log: Option<ThpLogFn>,
-    pub user_data: *mut c_void,
-}
-
-pub type ThpExtensionInitFn = unsafe extern "C" fn(host: *const ThpHost) -> i32;
-pub type ThpExtensionShutdownFn = unsafe extern "C" fn();
-
-#[repr(C)]
-pub struct ThpExtension {
-    pub abi_version: u32,
-    pub struct_size: usize,
-    pub name: *const c_char,
-    pub initialize: Option<ThpExtensionInitFn>,
-    pub shutdown: Option<ThpExtensionShutdownFn>,
-}
-
-pub type ThpExtensionEntryFn = unsafe extern "C" fn() -> *const ThpExtension;
+pub use thp_native::{
+    ThpCall, ThpExtension, ThpExtensionEntryFn, ThpExtensionInitFn, ThpExtensionShutdownFn,
+    ThpHost, ThpLogFn, ThpNativeCallFn, ThpNativeFunction, ThpRegisterFunctionFn, ThpValue,
+};
 
 #[cfg(test)]
 mod tests {

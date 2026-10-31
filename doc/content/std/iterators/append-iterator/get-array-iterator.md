@@ -8,7 +8,7 @@ order: 4
 typeParameters: []
 parameters: []
 returns:
-  type: ArrayIterator<int, Iterator<K, V>>
+  type: VectorIterator<Iterator<K, V>>
   description: Returns a keyed iterator over the appended iterators.
 errors:
   - description:
@@ -16,10 +16,8 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This method is executable in the reference VM.
 version: "0.1"
 owner: std.spl.AppendIterator
 visibility: public
@@ -30,7 +28,7 @@ modifiers: []
 
 ## Behavior
 
-Returns a keyed iterator over the appended iterators.
+Returns a keyed iterator over a snapshot of the appended iterators.
 
 This operation does not change receiver state unless the description explicitly states otherwise.
 

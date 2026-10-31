@@ -10,8 +10,10 @@ fn project(source: &str) -> tempfile::TempDir {
 
 fn minimal_lock(body: &str) -> Vec<u8> {
     format!(
-        "THP-LOCK 1\n\
+        "THP-LOCK 2\n\
          fingerprint {}\n\
+         package-roots 0\n\
+         autoload 0\n\
          profile common\n\
          memory.limit 134217728\n\
          request.post_max_size 8388608\n\
@@ -19,6 +21,7 @@ fn minimal_lock(body: &str) -> Vec<u8> {
          request.max_open_handles 256\n\
          time.max_input 60\n\
          time.max_execution 30\n\
+         extension-libraries 0\n\
          {body}",
         "0".repeat(64)
     )
@@ -26,13 +29,13 @@ fn minimal_lock(body: &str) -> Vec<u8> {
 }
 
 #[test]
-fn deterministic_lock_matches_the_version_one_snapshot() {
+fn deterministic_lock_matches_the_version_two_snapshot() {
     let root = project("");
     let result = build_lock(root.path()).expect("build lock");
     assert!(result.changed);
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"THP-CONFIG-SOURCES\0\x01");
+    hasher.update(b"THP-CONFIG-SOURCES\0\x02");
     hasher.update(&(8_u64).to_le_bytes());
     hasher.update(b"thp.toml");
     hasher.update(&[1]);
@@ -42,8 +45,10 @@ fn deterministic_lock_matches_the_version_one_snapshot() {
     hasher.update(&[0]);
     let fingerprint = hasher.finalize().to_hex();
     let expected = format!(
-        "THP-LOCK 1\n\
+        "THP-LOCK 2\n\
          fingerprint {fingerprint}\n\
+         package-roots 0\n\
+         autoload 0\n\
          profile common\n\
          memory.limit 134217728\n\
          request.post_max_size 8388608\n\
@@ -51,6 +56,7 @@ fn deterministic_lock_matches_the_version_one_snapshot() {
          request.max_open_handles 256\n\
          time.max_input 60\n\
          time.max_execution 30\n\
+         extension-libraries 0\n\
          end-profile\n\
          end-lock\n"
     );
@@ -59,6 +65,82 @@ fn deterministic_lock_matches_the_version_one_snapshot() {
         expected
     );
     assert!(!build_lock(root.path()).expect("rebuild lock").changed);
+}
+
+#[test]
+fn lock_round_trips_discovered_autoload_and_detects_package_changes() {
+    let root = project("[autoload]\npackages = \"vendor/\"\n\"App\\\\\" = \"src/\"\n");
+    let package = root.path().join("vendor/acme/tool");
+    fs::create_dir_all(&package).expect("create package");
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\n\"Acme\\\\Tool\\\\\" = [\"src/\", \"generated/\"]\n",
+    )
+    .expect("write package manifest");
+
+    build_lock(root.path()).expect("build lock");
+    let bytes = fs::read(root.path().join("thp.lock")).expect("read lock");
+    let parsed = parse_lock(&bytes).expect("parse lock");
+    assert_eq!(parsed.package_roots, ["vendor/"]);
+    assert_eq!(parsed.autoload[0].prefix, "Acme\\Tool\\");
+    assert_eq!(
+        parsed.autoload[0].directories,
+        ["vendor/acme/tool/src/", "vendor/acme/tool/generated/"]
+    );
+    assert_eq!(
+        LockFile::load(root.path())
+            .expect("load")
+            .project()
+            .autoload["App\\"],
+        [std::path::PathBuf::from("src/")]
+    );
+
+    fs::write(
+        package.join("thp.toml"),
+        "[autoload]\n\"Changed\\\\\" = \"src/\"\n",
+    )
+    .expect("edit manifest");
+    assert_eq!(
+        LockFile::load(root.path()).unwrap_err().kind,
+        LockErrorKind::Stale
+    );
+    build_lock(root.path()).expect("rebuild");
+    fs::create_dir_all(root.path().join("vendor/other/new")).expect("add package");
+    fs::write(root.path().join("vendor/other/new/thp.toml"), "").expect("manifest");
+    assert_eq!(
+        LockFile::load(root.path()).unwrap_err().kind,
+        LockErrorKind::Stale
+    );
+    build_lock(root.path()).expect("rebuild");
+    fs::remove_dir_all(root.path().join("vendor/other/new")).expect("remove package");
+    assert_eq!(
+        LockFile::load(root.path()).unwrap_err().kind,
+        LockErrorKind::Stale
+    );
+}
+
+#[test]
+fn deleting_an_empty_package_root_invalidates_the_lock() {
+    let root = project("[autoload]\npackages = \"vendor/\"\n");
+    fs::create_dir(root.path().join("vendor")).expect("create package root");
+    build_lock(root.path()).expect("build lock");
+
+    fs::remove_dir(root.path().join("vendor")).expect("remove package root");
+    let error = LockFile::load(root.path()).expect_err("missing package root must invalidate lock");
+    assert!(
+        matches!(error.kind, LockErrorKind::Source | LockErrorKind::Stale),
+        "{error}"
+    );
+}
+
+#[test]
+fn old_version_one_layout_requires_regeneration() {
+    let old = format!(
+        "THP-LOCK 1\nfingerprint {}\nprofile common\n",
+        "0".repeat(64)
+    );
+    let error = parse_lock(old.as_bytes()).expect_err("old layout");
+    assert_eq!(error.kind, LockErrorKind::UnsupportedVersion);
 }
 
 #[test]
@@ -210,6 +292,7 @@ fn rejects_unknown_duplicate_missing_and_malformed_records() {
              request.max_open_handles 1\n\
              time.max_input 1\n\
              time.max_execution 1\n\
+             extension-libraries 0\n\
              end-profile\n\
              profile target cli\n",
         ),

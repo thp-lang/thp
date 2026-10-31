@@ -41,6 +41,9 @@ type. If it escapes the entry function, the runtime reports the class name,
 message, source span, and accumulated call trace rather than printing or
 terminating from a compiler phase.
 
+Dynamic API calls use `TypeError` for incompatible value types and
+`ArgumentCountError`, a `TypeError` subclass, for missing or excess arguments.
+
 The proposed public classes are listed under
 Predefined exceptions. Their names and inheritance
 remain experimental rather than a compatibility promise.

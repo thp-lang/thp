@@ -18,11 +18,8 @@ cases:
   - ReadWriteAppend
   - CreateExclusive
 status: experimental
-availability: partial
-notice:
-  The handle model, stream interfaces, factories, modes, and exceptions are a
-  design proposal. They are not implemented in this repository and may change as runtime
-  integration proceeds.
+availability: implemented
+notice: All seven cases execute for local files and memory or temporary URIs; thp:/input accepts Read only.
 version: "0.1"
 ---
 

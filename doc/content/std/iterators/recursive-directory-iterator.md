@@ -14,10 +14,10 @@ interfaces:
 constants: []
 properties: []
 status: experimental
-availability: proposed
+availability: partial
 notice:
-  This PHP-inspired class contract is proposed and is not implemented in this
-  repository. Types, inheritance, and failure behavior may change.
+  Recursive directory entries, child iterators, and subpath accessors execute.
+  Glob expansion and some convenience operations remain proposed.
 version: "0.1"
 ---
 
@@ -38,7 +38,7 @@ followed unless enabled because link cycles can make traversal unbounded.
 
 PHP uses `FilesystemIterator` flags and separate child-inspection methods.
 THP uses explicit booleans and carries an optional child iterator directly in
-each `RecursiveEntry<SplFileInfo>`; full pathnames are exposed as cursor keys.
+each `RecursiveEntry<string, SplFileInfo>`; full pathnames are exposed as cursor keys.
 
 ## Errors
 

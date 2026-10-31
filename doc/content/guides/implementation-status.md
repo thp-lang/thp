@@ -27,48 +27,113 @@ Cache lookup/publication and JIT compilation have separate metric stages.
 Project compilation additionally measures module discovery, interface
 extraction, incremental/cache work, linking, and prepared execution.
 
-## Executable core
+## Availability matrix
 
-The current parser, type checker, and VM support:
+`implemented` means the documented behavior is executable in this checkout.
+`partial` means only the limitation stated in the final column executes.
+`proposed` means the symbol is documentation-only and must be rejected by the
+compiler if used as though it were available.
 
-- the required `<?thp` opening tag, ASCII identifiers, comments, blocks, and
-  semicolon-terminated statements;
-- `int`, `float`, `bool`, arbitrary-byte runtime `string`, `null`, `void`,
-  `mixed`, `vector<T>`, `map<K, V>`, nullable types, and unions;
-- inferred or annotated variables, assignment, functions with typed parameters
-  and returns, constant defaults, named and variadic arguments, calls,
-  recursion, `return`, `echo`, `if`/`elseif`/`else`, `while`, full-clause
-  `for`, native-collection `foreach`, and level-one `break`/`continue`;
-- scalar arithmetic, comparison, boolean short-circuiting, concatenation, and
-  null coalescing; `echo` and concatenation share canonical output conversion
-  for `string`, `int`, `float`, and `bool`, while `null` requires an explicit
-  fallback;
-- vector and insertion-ordered map literals, typed indexing, nested
-  variable-rooted element assignment, direct native iteration, `count()`, and
-  `var_dump()`;
-- nominal classes and non-generic, methods-only interfaces with transitive
-  single inheritance, multiple implemented interfaces, strict overrides,
-  abstract/final validation, lexical visibility, flattened typed properties,
-  inherited and explicit parent constructors, virtual/interface dispatch,
-  direct `self::`/`parent::` calls, and late-static `static::` dispatch;
-- compile-time traits with nested use, properties, abstract/concrete
-  instance/static methods, conflict selection, aliases, visibility/finality
-  adaptation, and consumer-specialized bodies;
-- sealed `Throwable`, user-defined `Exception` descendants, subtype catches,
-  ordered handlers, `finally` unwinding and transfer replacement, common
-  message/code/previous/suppressed state, catchable `UnhandledMatchError`,
-  `match` expressions, and suppressed `using` cleanup failures;
-- semicolon-style namespaces, separate type/function imports, fully qualified
-  references, deterministic `[autoload]` project discovery, cross-file
-  functions and nominal declarations, legal declaration SCCs, frozen linked
-  programs, and reusable prepared projects;
-- binary-safe memory/temporary streams, shared cursor and close state,
-  capability `instanceof`, URI factories, read-only file opening, typed stream
-  failures, request-bound `thp:/input`, deterministic `using` cleanup, and
-  logical handle limits;
-- signed 64-bit checked integer arithmetic, structured compile diagnostics,
-  structured runtime failures, streamed host output, managed-heap/input/time/
-  stack/handle limits, and an optional VM instruction limit.
+| Symbol or syntax                                                                            | Availability | Executable boundary                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<?thp`, comments, blocks, statements                                                       | implemented  | UTF-8 source and ASCII identifiers                                                                                                                                                                                                                                                                                                    |
+| `int`, `float`, `bool`, `string`, `null`, `void`, `mixed`, nullable types, unions           | implemented  | `string` values are arbitrary bytes at runtime                                                                                                                                                                                                                                                                                        |
+| `vector<T>`, `map<K, V>`                                                                    | implemented  | Literals, indexing, variable-rooted element assignment, COW values, and direct traversal                                                                                                                                                                                                                                              |
+| Variables and functions                                                                     | implemented  | Typed parameters/returns, constant defaults, named and variadic arguments, calls, and recursion                                                                                                                                                                                                                                       |
+| Typed callables and closures                                                                | implemented  | Fixed `callable<P..., R>` signatures, named function values, value captures, arrow and block closures, and positional invocation                                                                                                                                                                                                      |
+| `yield`, generator functions, and `Generator<K, V>`                                         | implemented  | Lazy one-shot iterator cursors, explicit and automatic keys, final return values, explicit close, and suspension-aware cleanup; no send operation                                                                                                                                                                                     |
+| `if`, `match`, `while`, `for`, `return`, `echo`                                             | implemented  | Conditions require `bool`; output supports `string`, `int`, `float`, and `bool`                                                                                                                                                                                                                                                       |
+| `foreach (vector<T>)`, `foreach (map<K, V>)`                                                | implemented  | Direct collection lowering; the source is evaluated once and traversal uses its captured COW snapshot                                                                                                                                                                                                                                 |
+| `break`, `continue`                                                                         | partial      | Level one only; numeric levels are rejected                                                                                                                                                                                                                                                                                           |
+| Scalar operators                                                                            | partial      | Checked arithmetic, matching-type `==`, comparison, boolean short-circuiting, concatenation, and null coalescing                                                                                                                                                                                                                      |
+| Classes and interfaces                                                                      | partial      | Reified generic nominals implemented; generic functions, methods, traits, and interface state remain unsupported                                                                                                                                                                                                                      |
+| Dynamic `new`                                                                               | implemented  | Exact compiled canonical class lookup; no runtime loading or autoloading                                                                                                                                                                                                                                                              |
+| `is_*` guards and direct-positive narrowing                                                 | implemented  | Direct local guards in `if`/`elseif`; no negation, composition, loop, or branch-join inference                                                                                                                                                                                                                                        |
+| Traits                                                                                      | implemented  | Compile-time composition, conflict selection, aliases, and visibility/finality adaptation                                                                                                                                                                                                                                             |
+| Reflection descriptor constructors                                                          | implemented  | Linked-program discovery, deterministic metadata, checked access/invocation, and reflective construction                                                                                                                                                                                                                              |
+| `Throwable`, `Exception`, `Error`, `TypeError`, `ArgumentCountError`, `UnhandledMatchError` | implemented  | Sealed throwable root, typed catches, common accessors, suppression, and deterministic uncaught failures                                                                                                                                                                                                                              |
+| `Option<T>`, `Countable`, `Stringable`, `MapAccess<K, V>`                                   | implemented  | Native option factories, interface method checking, implicit Stringable, and non-negative Countable dispatch; MapAccess uses explicit methods                                                                                                                                                                                         |
+| `TraceLine`, throwable origin and trace APIs, exception categories                          | implemented  | Source file/line retained in bytecode, construction-time frames, typed trace values, textual traces, and native exception subclass catches                                                                                                                                                                                            |
+| `serialize()`, `unserialize()`                                                              | implemented  | Version-one bounded binary format supports scalars, vectors, and maps; object hooks remain proposed                                                                                                                                                                                                                                   |
+| `try`, `catch`, `finally`, `throw`, `using`                                                 | implemented  | Ordered subtype catches and cleanup-preserving control transfer                                                                                                                                                                                                                                                                       |
+| Namespaces, imports, and project/package autoload discovery                                 | implemented  | Semicolon namespaces and deterministic configured and installed-package source maps; no downloading, runtime source loading, or runtime include/autoload callbacks                                                                                                                                                                    |
+| OPcache, frozen projects, metrics, embedding, C ABI                                         | implemented  | Reified generic and reflection metadata is schema-versioned; the public C ABI remains version 1                                                                                                                                                                                                                                       |
+| Native extension libraries and fixed typed functions                                        | implemented  | Project libraries load before compilation; opaque call-scoped value handles, checked return types, and library-aware frozen identity run in the VM                                                                                                                                                                                    |
+| `preg_match()`, `preg_replace()`, `preg_split()`, `RegexCapture`                            | implemented  | PCRE2 patterns, named captures, byte offsets, constant result-changing flags, and runtime pattern errors                                                                                                                                                                                                                              |
+| Async API and coroutine-aware file streams                                                  | implemented  | Typed async calls, request-local scheduling and completion, cancellation, timers, deadlock detection, and drain run on resumable VM frames. File-backed stream and filesystem operations, temporary-file spill, iterator adapters, and reflected native methods use four bounded workers; synchronous host callbacks remain blocking. |
+| Cranelift JIT                                                                               | partial      | Safe scalar subset; automatic mode falls back to the VM                                                                                                                                                                                                                                                                               |
+| Language Server Protocol and detached docblocks                                             | implemented  | Independent 0.5.0 stdio server; workspace diagnostics, navigation, safe rename, symbols, semantic tokens, source-preserving formatting, and LSP-only local `@var` hints                                                                                                                                                               |
+
+### Collection and iterator symbols
+
+| Symbol                                                                                           | Availability | Input and cursor behavior                                                                                                                              |
+| ------------------------------------------------------------------------------------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `count(string\|vector<T>\|map<K, V>\|Countable): int`                                            | implemented  | Reads native length or dispatches `Countable::count()` and rejects negative results                                                                    |
+| `Traversable<K, V>`                                                                              | implemented  | Executable invariant marker interface; `K` has no additional constraint                                                                                |
+| `Iterator<K, V>`                                                                                 | implemented  | Executable cursor interface extending `Traversable<K, V>`                                                                                              |
+| `Generator<K, V>`                                                                                | implemented  | One-shot cursor with `getReturn()` and `close()`; uses the existing `Iterator<K, V>` protocol                                                          |
+| `IteratorAggregate<K, V>`                                                                        | implemented  | Executable aggregate interface; `getIterator()` returns `Traversable<K, V>`                                                                            |
+| `foreach (Traversable<K, V>)`                                                                    | implemented  | Resolves aggregate layers, rewinds the direct iterator, and dispatches `valid`, `value`, optional `key`, and `advance` virtually                       |
+| `VectorIterator<T>`, `MapIterator<K, V>`                                                         | implemented  | Rewindable cursors over COW collection snapshots; typed iterator targets create fresh cursors                                                          |
+| `EmptyIterator<K, V>`, `IteratorIterator<K, V>`, `OuterIterator<K, V>`                           | implemented  | Empty cursor and shared wrapper delegation through the outer iterator interface                                                                        |
+| `iterator_count<K, V>(Iterator<K, V>): int`                                                      | implemented  | Counts from the current cursor through exhaustion, advances it, and never rewinds                                                                      |
+| `iterator_apply()`                                                                               | implemented  | Consumes from the current cursor, passes value then key, advances after each callback, and stops after `false`                                         |
+| `iterator_to_vector()`, `iterator_to_map()`                                                      | implemented  | Consume remaining values; vector discards keys, map preserves first key position when keys repeat                                                      |
+| `vector_map()`, `vector_filter()`, `vector_slice()`, `vector_concat()`                           | implemented  | Dense vector results; typed value callbacks; negative slice offsets and lengths                                                                        |
+| `map_transform()`, `map_filter()`, `map_merge()`                                                 | implemented  | Insertion order and first key position preserved; typed value-then-key callbacks                                                                       |
+| `FilterIterator<K, V>`, `CallbackFilterIterator<K, V>`                                           | implemented  | Lazy filtering over an inner cursor with preserved keys; base `accept(V, K)` is abstract                                                               |
+| `RegexIterator<K, TIn, TOut>`, `RecursiveRegexIterator<K, TIn, TOut>`                            | implemented  | Constant modes and flags fix output type; recursive children retain the same regex policy                                                              |
+| `LimitIterator`, `InfiniteIterator`, `AppendIterator`, `SeekableIterator`                        | implemented  | Bounded windows, replay from an aggregate, sequential concatenation, and position seeking use the shared cursor protocol                               |
+| `CachingIterator<K, V>`                                                                          | implemented  | One-entry lookahead, keyed full cache, map access, scalar/Stringable formatting, and visited-entry count                                               |
+| `RecursiveIterator<K, T>`, `RecursiveEntry<K, T>`                                                | implemented  | Generic recursive cursor interface and immutable value/child pair                                                                                      |
+| `RecursiveIteratorIterator<K, T>`                                                                | implemented  | Lazy depth-first flattening in three modes, optional depth limit, and overridable boundary hooks                                                       |
+| `RecursiveCachingIterator<K, T>`                                                                 | implemented  | Recursive cursor with lookahead and optional keyed entry cache                                                                                         |
+| `RecursiveFilterIterator<K, T>`, `ParentIterator<K, T>`, `RecursiveCallbackFilterIterator<K, T>` | implemented  | Recursive filtering with copied child policy and typed callbacks                                                                                       |
+| [`NoRewindIterator<K, V>`](thp:std.spl.NoRewindIterator)                                         | proposed     | Shared inner cursor without repositioning at construction; rewind is a no-op, other operations delegate                                                |
+| [`RecursiveCollectionIterator`](thp:std.spl.RecursiveCollectionIterator)                         | proposed     | Non-generic `RecursiveIterator<mixed, mixed>` over vector/map snapshots; lazy independent children, object leaves, ancestor-cycle rejection on descent |
+| Other iterator adapters and recursive iterators                                                  | proposed     | Remaining iterator module classes are documentation-only                                                                                               |
+| `FixedSequence<T>`                                                                               | implemented  | Nullable indexed slots, explicit resize, checked offsets, and aggregate iterator snapshots                                                             |
+| `LinkedList<T>`, `Queue<T>`, `Stack<T>`                                                          | implemented  | Double-ended sequence operations, FIFO and LIFO adapters, and aggregate iterator snapshots                                                             |
+| `MaxHeap<T>`, `MinHeap<T>`, `PriorityQueue<T>`                                                   | implemented  | Ordered extraction and non-consuming aggregate iterator snapshots                                                                                      |
+| `ObjectStorage<T>`, `TypedMap<K, V>`                                                             | implemented  | Object-identity association and insertion-ordered mutable map wrapper                                                                                  |
+
+[`count()`](thp:std.baseTypes) and
+[`iterator_count()`](thp:std.spl.iterator_count) are separate functions, not
+aliases or overloads. The first inspects an existing native value without a
+cursor; the second consumes an explicit iterator from its current cursor.
+
+### Stream symbols
+
+| Symbol                                                            | Availability | Executable boundary                                                                       |
+| ----------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------- |
+| `MemoryStream::open()`, `TempStream::open()`                      | implemented  | Binary-safe memory streams and one-time temporary-file spill                              |
+| `Files::openRead()`, `openWrite()`, `openReadWrite()`             | implemented  | Local files with typed read, write, and read-write handles                                |
+| `ReadableStream::read()`, `readAll()`, `eof()`                    | implemented  | Includes argument, EOF, limit, and closed-handle behavior                                 |
+| `WritableStream::write()`, `writeAll()`, `flush()`                | implemented  | Memory, temporary, writable-file, and read-write-file streams                             |
+| `Closeable::close()`, `isClosed()`                                | implemented  | Shared, idempotent close state and deterministic `using` cleanup                          |
+| `SeekableStream::seek()`, `tell()`, `SeekFrom`                    | implemented  | Start, current, and end origins for memory, temporary, and regular files                  |
+| `WriteMode`                                                       | implemented  | All five creation and positioning cases                                                   |
+| `OpenMode`                                                        | implemented  | All seven cases for local files and memory or temporary URI streams                       |
+| `Streams::open()`                                                 | implemented  | Local paths and file://, memory/temp URIs, and read-only shared `thp:/input`              |
+| Stream exception classes                                          | implemented  | Runtime-produced typed stream failures                                                    |
+| `OpenStreamException::getTarget()`, `getSystemCode()`             | implemented  | Target and platform-code accessors                                                        |
+| `OpenStreamException::__construct()`                              | partial      | Runtime construction is supported; the documented public four-argument constructor is not |
+| `Stream::isReadable()`, `isWritable()`, `isSeekable()`            | implemented  | Native stream capabilities, including closed-state inspection                             |
+| `ReadableFileStream`, `WritableFileStream`, `ReadWriteFileStream` | implemented  | Statically typed regular-file operations and shared close state                           |
+
+### Filesystem symbols
+
+| Symbol                                                                                  | Availability | Executable boundary                                                                                 |
+| --------------------------------------------------------------------------------------- | ------------ | --------------------------------------------------------------------------------------------------- |
+| `SplFileInfo::__construct()`, path accessors, `__toString()`                            | implemented  | Paths are stored without an existence check; UTF-8 paths execute                                    |
+| `SplFileInfo` type, size, timestamps, owner, group, inode, permissions, and link target | implemented  | Metadata is queried on each call; unavailable values return `false`                                 |
+| `SplFileInfo::isReadable()`, `isWritable()`, `isExecutable()`                           | partial      | Basic host metadata checks; access-control lists and effective-user checks are not covered          |
+| `SplFileInfo` class selection and `openFile()`                                          | proposed     | No subclass selection or `openFile()` bridge                                                        |
+| `SplFileObject` line iterator, `fgets()`, `eof()`                                       | partial      | Read-only construction, line traversal, and line seeking execute                                    |
+| `SplFileObject` CSV, flags, locking, and writing; `SplTempFileObject`                   | proposed     | These file-object operations are not executable                                                     |
+| `DirectoryIterator`, `FilesystemIterator`                                               | partial      | Single-directory traversal and keyed file information execute                                       |
+| `RecursiveDirectoryIterator`                                                            | partial      | Child iterators feed the common recursive adapter; subpath accessors execute                        |
+| `GlobIterator`                                                                          | partial      | Final-component `*` and `?` patterns, iteration, and count execute; nested patterns remain proposed |
 
 Empty collection literals require an expected generic type:
 
@@ -107,20 +172,25 @@ execute with identical semantics and falls back to the VM for heap operations,
 control-flow graphs, checked arithmetic, output, objects, method dispatch,
 exception regions, cleanup instructions, or instruction limits.
 
+Dynamic construction, guards over `mixed`, and checked narrowing remain outside
+the JIT subset, so automatic mode executes them in the VM.
+
 ## Deliberately rejected or pending
 
 The current executable subset rejects unsupported syntax instead of inheriting
 PHP behavior. Pending work includes:
 
-- closures, call-site argument unpacking, by-reference parameters, general
-  assignment expressions, property-rooted collection mutation, iterator-object
-  `foreach`, and numeric `break`/`continue` levels;
-- generic and multiple-parent interfaces, interface state, trait constants,
-  static properties, property hooks, magic methods, anonymous classes, enums,
-  reflection, and flow narrowing after `instanceof`;
-- global constants, dynamic names, runtime includes/autoload callbacks,
-  attributes, generators, reflection, and cooperative async;
-- the broader standard library, extension registration/dispatch, concrete
+- call-site argument unpacking, by-reference parameters, general
+  assignment expressions, property-rooted collection mutation, and numeric
+  `break`/`continue` levels;
+- generic functions, methods, and traits, multiple-parent interfaces, interface
+  state, trait constants, static properties, property hooks, magic methods,
+  anonymous classes, enums, reflection attributes/source inspection, and flow
+  narrowing after `instanceof`;
+- global constants, general dynamic calls and member names, runtime
+  includes/autoload callbacks, attributes, and remaining indirect
+  coroutine suspension paths;
+- the broader standard library and bundled extensions beyond PCRE2, concrete
   FastCGI and web-server SAPI adapters, relocatable module code generation,
   dependency-minimal incremental invalidation, broader JIT coverage, hotness
   tiering, and shared native-code caching.
@@ -136,13 +206,21 @@ Bytecode is versioned, serialized, bounds checked, type checked, and verified
 before execution. Compile phases return diagnostics without printing or
 terminating. The CLI alone renders diagnostics and writes program output.
 
+`thp-lsp` collects `/** ... */` comments through lexer trivia and stores parsed
+documentation only in editor-owned indexes. Documentation never enters tokens,
+the AST, module interfaces, HIR, MIR, bytecode, runtime values, or reflection.
+A local `@var` hint can override hover, member completion, and receiver lookup
+after its matching assignment, but it never changes compiler diagnostics,
+typing, lowering, or generated code.
+
 `thp-embed` provides a safe in-process engine and request/response SAPI trait.
 `crates/abi/include/thp.h` exposes the version-one C embedding ABI with opaque
 engines and prepared projects, size-versioned runtime limits, synchronous
 input/output and module enumeration/loading callbacks, legacy captured output,
 binary-safe owned buffers, explicit release, panic containment, and versioned
-extension/host tables. Loading and invoking third-party extensions and concrete
-server adapters remain pending.
+extension/host tables. Project libraries register fixed typed functions before
+compilation. The VM validates native call results and retains libraries for
+prepared projects. Concrete server adapters remain pending.
 
 The resource and core-language PHPT files run through the THP compiler and VM
 as part of `cargo test --workspace`. They must not be passed to PHP.

@@ -8,7 +8,7 @@ order: 3
 typeParameters: []
 parameters: []
 returns:
-  type: ?Iterator<K, V>
+  type: Iterator<K, V>
   description: Returns the wrapped iterator.
 errors:
   - description:
@@ -16,11 +16,9 @@ errors:
       propagated by delegated operations is specified.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
-version: "0.1"
+availability: implemented
+notice: This experimental accessor executes in the standalone compiler and reference VM.
+version: "0.6"
 owner: std.spl.FilterIterator
 visibility: public
 modifiers: []

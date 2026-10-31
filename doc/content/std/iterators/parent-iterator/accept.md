@@ -7,9 +7,12 @@ name: accept
 order: 2
 typeParameters: []
 parameters:
-  - name: entry
-    type: RecursiveEntry<T>
-    description: Value supplied as $entry.
+  - name: value
+    type: RecursiveEntry<K, T>
+    description: Complete recursive entry.
+  - name: key
+    type: K
+    description: Key of the entry.
 returns:
   type: bool
   description: Returns whether the entry has children.
@@ -19,10 +22,8 @@ errors:
       being wrapped.
 related: []
 status: experimental
-availability: proposed
-notice:
-  This member belongs to an experimental API contract and is not implemented in
-  this repository.
+availability: implemented
+notice: This experimental recursive filtering member is implemented.
 version: "0.1"
 owner: std.spl.ParentIterator
 visibility: public

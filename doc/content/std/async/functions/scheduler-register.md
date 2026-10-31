@@ -14,40 +14,34 @@ returns:
   type: void
   description: This function does not return a value.
 errors:
-  - description: "The call fails when:"
-  - description: a scheduler has already been registered;
-  - description: asynchronous work started before registration completed; or
-  - description: the runtime cannot activate the supplied scheduler.
-  - description: The concrete error types are not yet finalized.
+  - description: A second registration throws Error at this call site.
 related: []
 status: experimental
-availability: proposed
-notice: This function is proposed and is not implemented in this repository. The
-  registration lifecycle and concrete error types are not finalized.
+availability: implemented
 version: "0.1"
 module: async
 ---
 
-`scheduler_register()` activates an application-provided scheduler for
-asynchronous work in the current process.
+`scheduler_register()` activates an application-provided scheduler for the
+current request.
 
 ## Behavior
 
-Registration is process-wide. After the function returns, [`async()`](thp:std.async.async)
-uses `$scheduler` to create and enqueue new coroutines, and [`await()`](thp:std.async.await)
-uses it when the current execution context must suspend.
+Registration starts false in every request and succeeds once per request.
+After registration THP owns coroutine creation, the ready queue, timers,
+I/O readiness, cancellation, and VM switching. It asks `$scheduler` only to
+select an ID from the current ready set.
 
-Register the scheduler once, during application startup, before creating any
-coroutines. The registered scheduler remains active for the lifetime of the
-process.
+Register before creating coroutines. A second call to either registration
+function throws `Error`. No scheduler or coroutine state crosses requests.
 
 ## Example
 
 ```thp
-final class ApplicationScheduler implements SchedulerInterface
-{
-
-    // SchedulerInterface methods omitted.
+final class ApplicationScheduler implements SchedulerInterface {
+    function chooseNext(vector<int> $ready): int {
+        return $ready[0];
+    }
 }
 
 scheduler_register(new ApplicationScheduler());

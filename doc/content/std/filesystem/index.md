@@ -6,10 +6,10 @@ summary: Object-oriented filesystem metadata, files, and temporary files.
 module: filesystem
 order: 50
 status: experimental
-availability: proposed
-notice: These PHP-inspired classes are not implemented. Paths, streams, platform
-  differences, and integration with THP's proposed typed stream model remain design
-  work.
+availability: partial
+notice: SplFileInfo path accessors and common metadata methods execute. The
+  read-only SplFileObject line iterator is partial; temporary-file objects,
+  CSV, locking, and advanced metadata operations remain proposed.
 ---
 
 | Class                                                | Purpose                                  |

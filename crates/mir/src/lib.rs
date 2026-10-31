@@ -5,9 +5,9 @@ use std::fmt;
 
 use thp_diagnostics::Span;
 use thp_hir::{
-    ArgumentTarget, BoundArguments, CalledClass, Callee, ClassId, FunctionId, LocalId, LoopClause,
-    LoopClauseKind, MethodSlot, PropertyId, Statement, StatementKind, Type, TypedExpr,
-    TypedExprKind,
+    ArgumentTarget, BoundArguments, CalledClass, Callee, ClassId, ForeachObjectProtocol,
+    FunctionId, LocalId, LoopClause, LoopClauseKind, MethodSlot, PropertyId, Statement,
+    StatementKind, Type, TypedExpr, TypedExprKind,
 };
 use thp_syntax::{BinaryOp, UnaryOp};
 
@@ -21,6 +21,7 @@ pub struct Register(pub u32);
 pub struct Module {
     pub functions: Vec<Function>,
     pub classes: Vec<thp_hir::Class>,
+    pub native_functions: Vec<thp_hir::NativeSignature>,
     pub entry: FunctionId,
 }
 
@@ -38,9 +39,12 @@ impl Module {
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub module_name: String,
     pub parameters: Vec<LocalId>,
+    pub parameter_metadata: Vec<thp_hir::ParameterMetadata>,
     pub local_types: Vec<Type>,
     pub return_type: Type,
+    pub generator: bool,
     pub owner: Option<ClassId>,
     pub static_method: bool,
     pub blocks: Vec<BasicBlock>,
@@ -120,6 +124,14 @@ pub enum InstructionKind {
         callee: Callee,
         arguments: Vec<Register>,
     },
+    Closure {
+        function: FunctionId,
+        captures: Vec<Register>,
+    },
+    CallValue {
+        callee: Register,
+        arguments: Vec<Register>,
+    },
     DirectMethod {
         callee: Callee,
         arguments: Vec<Register>,
@@ -136,6 +148,15 @@ pub enum InstructionKind {
         arguments: Vec<Register>,
     },
     NewObject(ClassId),
+    NewDynamic {
+        target: Register,
+        type_arguments: Vec<Type>,
+        arguments: Vec<DynamicArgument>,
+    },
+    CheckedNarrow {
+        value: Register,
+        narrowed: Type,
+    },
     GetProperty {
         object: Register,
         property: PropertyId,
@@ -167,6 +188,13 @@ pub enum InstructionKind {
     Print(Register),
 }
 
+#[derive(Clone, Debug)]
+pub struct DynamicArgument {
+    pub name: Option<String>,
+    pub value: Register,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
     Integer(i64),
@@ -185,6 +213,11 @@ pub enum Terminator {
         else_block: BlockId,
     },
     Return(Option<Register>),
+    Yield {
+        key: Option<Register>,
+        value: Register,
+        resume: BlockId,
+    },
     Throw(Register),
     Unreachable,
 }
@@ -193,6 +226,7 @@ pub fn lower(module: &thp_hir::Module) -> Module {
     Module {
         entry: module.entry,
         classes: module.classes.clone(),
+        native_functions: module.native_functions.clone(),
         functions: module.functions.iter().map(lower_function).collect(),
     }
 }
@@ -214,6 +248,7 @@ struct FunctionBuilder<'hir> {
     register_types: Vec<Type>,
     exception_handlers: Vec<ExceptionHandler>,
     cleanups: Vec<Cleanup>,
+    cleanup_exclusions: Vec<Vec<BlockId>>,
     loops: Vec<LoopTargets>,
 }
 
@@ -225,6 +260,7 @@ enum Cleanup {
         span: Span,
     },
     Finally {
+        id: usize,
         body: Vec<Statement>,
     },
 }
@@ -249,6 +285,7 @@ impl<'hir> FunctionBuilder<'hir> {
             register_types: Vec::new(),
             exception_handlers: Vec::new(),
             cleanups: Vec::new(),
+            cleanup_exclusions: Vec::new(),
             loops: Vec::new(),
         }
     }
@@ -256,11 +293,13 @@ impl<'hir> FunctionBuilder<'hir> {
     fn lower(mut self) -> Function {
         self.lower_statements(&self.hir.body);
         if !self.terminated() {
-            self.terminate(if self.hir.return_type == Type::Void {
-                Terminator::Return(None)
-            } else {
-                Terminator::Unreachable
-            });
+            self.terminate(
+                if self.hir.return_type == Type::Void || self.hir.generator {
+                    Terminator::Return(None)
+                } else {
+                    Terminator::Unreachable
+                },
+            );
         }
         let blocks = self
             .blocks
@@ -275,9 +314,12 @@ impl<'hir> FunctionBuilder<'hir> {
         Function {
             id: self.hir.id,
             name: self.hir.name.clone(),
+            module_name: self.hir.module_name.clone(),
             parameters: self.hir.parameters.clone(),
+            parameter_metadata: self.hir.parameter_metadata.clone(),
             local_types: self.local_types,
             return_type: self.hir.return_type.clone(),
+            generator: self.hir.generator,
             owner: self.hir.owner,
             static_method: self.hir.static_method,
             blocks,
@@ -323,6 +365,13 @@ impl<'hir> FunctionBuilder<'hir> {
                     self.terminate(Terminator::Return(value));
                 }
             }
+            StatementKind::Yield { key, value } => {
+                let key = key.as_ref().map(|key| self.lower_expression(key));
+                let value = self.lower_expression(value);
+                let resume = self.new_block();
+                self.terminate(Terminator::Yield { key, value, resume });
+                self.switch_to(resume);
+            }
             StatementKind::If {
                 branches,
                 otherwise,
@@ -340,6 +389,7 @@ impl<'hir> FunctionBuilder<'hir> {
                 value,
                 key_type,
                 value_type,
+                object_protocol,
                 body,
             } => self.lower_foreach(
                 source,
@@ -347,6 +397,7 @@ impl<'hir> FunctionBuilder<'hir> {
                 *value,
                 key_type,
                 value_type,
+                *object_protocol,
                 body,
                 statement.span,
             ),
@@ -472,7 +523,10 @@ impl<'hir> FunctionBuilder<'hir> {
         finally: &[Statement],
         span: Span,
     ) {
+        let id = self.cleanup_exclusions.len();
+        self.cleanup_exclusions.push(Vec::new());
         let cleanup = Cleanup::Finally {
+            id,
             body: finally.to_vec(),
         };
         self.cleanups.push(cleanup);
@@ -486,7 +540,7 @@ impl<'hir> FunctionBuilder<'hir> {
         if !self.terminated() {
             self.terminate(Terminator::Jump(normal_finally));
         }
-        let body_protected = (body_block.0..normal_finally.0)
+        let mut body_protected = (body_block.0..normal_finally.0)
             .map(BlockId)
             .collect::<Vec<_>>();
         let mut final_protected = body_protected.clone();
@@ -508,6 +562,9 @@ impl<'hir> FunctionBuilder<'hir> {
                 u32::try_from(self.blocks.len()).expect("block count is limited to u32::MAX");
             final_protected.extend((catch_start..catch_end).map(BlockId));
         }
+        let excluded = std::mem::take(&mut self.cleanup_exclusions[id]);
+        body_protected.retain(|block| !excluded.contains(block));
+        final_protected.retain(|block| !excluded.contains(block));
         if !handlers.is_empty() {
             self.exception_handlers.push(ExceptionHandler {
                 protected_blocks: body_protected,
@@ -683,9 +740,28 @@ impl<'hir> FunctionBuilder<'hir> {
 
     fn emit_cleanups_to(&mut self, depth: usize) {
         let cleanups = self.cleanups.clone();
+        let mut exited_finally = Vec::new();
         for index in (depth..cleanups.len()).rev() {
             self.cleanups.truncate(index);
-            self.emit_cleanup(&cleanups[index]);
+            let current_finally = match &cleanups[index] {
+                Cleanup::Finally { id, .. } => Some(*id),
+                Cleanup::Using { .. } => None,
+            };
+            if current_finally.is_some() || !exited_finally.is_empty() {
+                let start = self.new_block();
+                self.terminate(Terminator::Jump(start));
+                self.switch_to(start);
+                self.emit_cleanup(&cleanups[index]);
+                let end = u32::try_from(self.blocks.len()).expect("block count fits u32");
+                for id in exited_finally.iter().copied().chain(current_finally) {
+                    self.cleanup_exclusions[id].extend((start.0..end).map(BlockId));
+                }
+            } else {
+                self.emit_cleanup(&cleanups[index]);
+            }
+            if let Some(id) = current_finally {
+                exited_finally.push(id);
+            }
             if self.terminated() {
                 break;
             }
@@ -708,7 +784,7 @@ impl<'hir> FunctionBuilder<'hir> {
                     *span,
                 );
             }
-            Cleanup::Finally { body } => self.lower_statements(body),
+            Cleanup::Finally { body, .. } => self.lower_statements(body),
         }
     }
 
@@ -844,9 +920,16 @@ impl<'hir> FunctionBuilder<'hir> {
         value: LocalId,
         key_type: &Type,
         value_type: &Type,
+        object_protocol: Option<ForeachObjectProtocol>,
         body: &[Statement],
         span: Span,
     ) {
+        if let Some(protocol) = object_protocol {
+            self.lower_object_foreach(
+                source, key, value, key_type, value_type, protocol, body, span,
+            );
+            return;
+        }
         let source = self.lower_expression(source);
         let length = self.emit_value(InstructionKind::CollectionLen(source), Type::Int, span);
         let offset_local = LocalId(
@@ -955,6 +1038,225 @@ impl<'hir> FunctionBuilder<'hir> {
                 local: offset_local,
                 value: next,
             },
+            span,
+        );
+        self.terminate(Terminator::Jump(condition_block));
+        self.switch_to(end);
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn lower_object_foreach(
+        &mut self,
+        source: &TypedExpr,
+        key: Option<LocalId>,
+        value: LocalId,
+        key_type: &Type,
+        value_type: &Type,
+        protocol: ForeachObjectProtocol,
+        body: &[Statement],
+        span: Span,
+    ) {
+        let traversable_type = Type::Nominal {
+            name: "Traversable".to_owned(),
+            arguments: vec![key_type.clone(), value_type.clone()],
+        };
+        let aggregate_type = Type::Nominal {
+            name: "IteratorAggregate".to_owned(),
+            arguments: vec![key_type.clone(), value_type.clone()],
+        };
+        let iterator_type = Type::Nominal {
+            name: "Iterator".to_owned(),
+            arguments: vec![key_type.clone(), value_type.clone()],
+        };
+        let current_local = self.new_internal_local(traversable_type.clone());
+        let source = self.lower_expression(source);
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: current_local,
+                value: source,
+            },
+            span,
+        );
+
+        let aggregate_check = self.new_block();
+        let aggregate_body = self.new_block();
+        let iterator_setup = self.new_block();
+        let condition_block = self.new_block();
+        let body_block = self.new_block();
+        let advance_block = self.new_block();
+        let end = self.new_block();
+        self.terminate(Terminator::Jump(aggregate_check));
+
+        self.switch_to(aggregate_check);
+        let current = self.emit_value(
+            InstructionKind::LoadLocal(current_local),
+            traversable_type.clone(),
+            span,
+        );
+        let is_aggregate = self.emit_value(
+            InstructionKind::InstanceOf {
+                value: current,
+                class: protocol.aggregate,
+            },
+            Type::Bool,
+            span,
+        );
+        self.terminate(Terminator::Branch {
+            condition: is_aggregate,
+            then_block: aggregate_body,
+            else_block: iterator_setup,
+        });
+
+        self.switch_to(aggregate_body);
+        let current = self.emit_value(
+            InstructionKind::LoadLocal(current_local),
+            traversable_type.clone(),
+            span,
+        );
+        let aggregate = self.emit_value(
+            InstructionKind::CheckedNarrow {
+                value: current,
+                narrowed: aggregate_type.clone(),
+            },
+            aggregate_type,
+            span,
+        );
+        let next = self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: aggregate,
+                slot: protocol.get_iterator,
+                arguments: Vec::new(),
+            },
+            traversable_type.clone(),
+            span,
+        );
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: current_local,
+                value: next,
+            },
+            span,
+        );
+        self.terminate(Terminator::Jump(aggregate_check));
+
+        self.switch_to(iterator_setup);
+        let current = self.emit_value(
+            InstructionKind::LoadLocal(current_local),
+            traversable_type,
+            span,
+        );
+        let iterator = self.emit_value(
+            InstructionKind::CheckedNarrow {
+                value: current,
+                narrowed: iterator_type.clone(),
+            },
+            iterator_type.clone(),
+            span,
+        );
+        let iterator_local = self.new_internal_local(iterator_type.clone());
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: iterator_local,
+                value: iterator,
+            },
+            span,
+        );
+        self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.rewind,
+                arguments: Vec::new(),
+            },
+            Type::Void,
+            span,
+        );
+        self.terminate(Terminator::Jump(condition_block));
+
+        self.switch_to(condition_block);
+        let iterator = self.emit_value(
+            InstructionKind::LoadLocal(iterator_local),
+            iterator_type.clone(),
+            span,
+        );
+        let valid = self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.valid,
+                arguments: Vec::new(),
+            },
+            Type::Bool,
+            span,
+        );
+        self.terminate(Terminator::Branch {
+            condition: valid,
+            then_block: body_block,
+            else_block: end,
+        });
+
+        self.switch_to(body_block);
+        let iterator = self.emit_value(
+            InstructionKind::LoadLocal(iterator_local),
+            iterator_type.clone(),
+            span,
+        );
+        let entry_value = self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.value,
+                arguments: Vec::new(),
+            },
+            value_type.clone(),
+            span,
+        );
+        self.emit_effect(
+            InstructionKind::StoreLocal {
+                local: value,
+                value: entry_value,
+            },
+            span,
+        );
+        if let Some(key) = key {
+            let entry_key = self.emit_value(
+                InstructionKind::VirtualMethod {
+                    receiver: iterator,
+                    slot: protocol.key,
+                    arguments: Vec::new(),
+                },
+                key_type.clone(),
+                span,
+            );
+            self.emit_effect(
+                InstructionKind::StoreLocal {
+                    local: key,
+                    value: entry_key,
+                },
+                span,
+            );
+        }
+        self.loops.push(LoopTargets {
+            break_target: end,
+            continue_target: advance_block,
+            cleanup_depth: self.cleanups.len(),
+        });
+        self.lower_statements(body);
+        self.loops.pop();
+        if !self.terminated() {
+            self.terminate(Terminator::Jump(advance_block));
+        }
+
+        self.switch_to(advance_block);
+        let iterator = self.emit_value(
+            InstructionKind::LoadLocal(iterator_local),
+            iterator_type,
+            span,
+        );
+        self.emit_value(
+            InstructionKind::VirtualMethod {
+                receiver: iterator,
+                slot: protocol.advance,
+                arguments: Vec::new(),
+            },
+            Type::Void,
             span,
         );
         self.terminate(Terminator::Jump(condition_block));
@@ -1109,6 +1411,20 @@ impl<'hir> FunctionBuilder<'hir> {
                         callee: *callee,
                         arguments: self.lower_bound_arguments(arguments),
                     },
+                    TypedExprKind::Closure { function, captures } => InstructionKind::Closure {
+                        function: *function,
+                        captures: captures
+                            .iter()
+                            .map(|value| self.lower_expression(value))
+                            .collect(),
+                    },
+                    TypedExprKind::CallValue { callee, arguments } => InstructionKind::CallValue {
+                        callee: self.lower_expression(callee),
+                        arguments: arguments
+                            .iter()
+                            .map(|value| self.lower_expression(value))
+                            .collect(),
+                    },
                     TypedExprKind::DirectMethod {
                         callee,
                         receiver,
@@ -1185,6 +1501,28 @@ impl<'hir> FunctionBuilder<'hir> {
                             );
                         }
                         return object;
+                    }
+                    TypedExprKind::DynamicNew {
+                        target,
+                        type_arguments,
+                        arguments,
+                    } => InstructionKind::NewDynamic {
+                        target: self.lower_expression(target),
+                        type_arguments: type_arguments.clone(),
+                        arguments: arguments
+                            .iter()
+                            .map(|argument| DynamicArgument {
+                                name: argument.name.clone(),
+                                value: self.lower_expression(&argument.value),
+                                span: argument.span,
+                            })
+                            .collect(),
+                    },
+                    TypedExprKind::CheckedNarrow { value, narrowed } => {
+                        InstructionKind::CheckedNarrow {
+                            value: self.lower_expression(value),
+                            narrowed: narrowed.clone(),
+                        }
                     }
                     TypedExprKind::Property { object, property } => InstructionKind::GetProperty {
                         object: self.lower_expression(object),
@@ -1470,6 +1808,7 @@ pub fn eliminate_unreachable(function: &mut Function) {
         reachable[index] = true;
         match function.blocks[index].terminator {
             Terminator::Jump(target) => queue.push_back(target),
+            Terminator::Yield { resume, .. } => queue.push_back(resume),
             Terminator::Branch {
                 then_block,
                 else_block,
@@ -1506,6 +1845,7 @@ pub fn eliminate_unreachable(function: &mut Function) {
         }
         match &mut block.terminator {
             Terminator::Jump(target) => *target = remap[target.0 as usize],
+            Terminator::Yield { resume, .. } => *resume = remap[resume.0 as usize],
             Terminator::Branch {
                 then_block,
                 else_block,
@@ -1647,6 +1987,39 @@ foreach ($values as $index => $value) {
             instructions
                 .iter()
                 .any(|kind| matches!(kind, InstructionKind::Phi(_)))
+        );
+    }
+
+    #[test]
+    fn object_foreach_uses_virtual_dispatch_without_changing_native_lowering() {
+        let module = compile(
+            r#"<?thp
+class Cursor implements Iterator<int, string> {
+    public function rewind(): void {}
+    public function valid(): bool { return false; }
+    public function key(): int { return 0; }
+    public function value(): string { return ""; }
+    public function advance(): void {}
+}
+foreach (new Cursor() as $key => $value) {}
+foreach ([1] as $native) {}
+"#,
+        );
+        let instructions = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| &instruction.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            instructions
+                .iter()
+                .any(|kind| matches!(kind, InstructionKind::VirtualMethod { .. }))
+        );
+        assert!(
+            instructions
+                .iter()
+                .any(|kind| matches!(kind, InstructionKind::CollectionLen(_)))
         );
     }
 
